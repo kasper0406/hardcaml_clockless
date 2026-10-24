@@ -45,7 +45,9 @@
       not captured at all; the level check reports them (below).
     - {b Edge counters.} Per pin, a flop toggled on each rising edge and one
       toggled on each falling edge form a 2-bit Gray count of edges, clocked
-      by the pin itself.
+      by the pin itself. Both reset to 0 whatever the pin level, so the pair
+      steps through the Gray code forwards from a low pin and backwards from
+      a high one; the drain decodes it relative to the synchronised level.
 
     {2 Drain}
 
