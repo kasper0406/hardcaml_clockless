@@ -80,7 +80,7 @@ opam install . --deps-only --with-test
 dune runtest
 ```
 
-`dune exec test/gate/capture_gate.exe -- EDGES_PER_CORNER [SEED [NEAR [MIN_SAME_PIN_NS]]]`
+`dune exec test/gate/capture_gate.exe -- EDGES_PER_CORNER [SEED [NEAR [MIN_SAME_PIN_NS [SLOTS]]]]`
 is the long Pin_capture gate run (random edges on 4 pins at three corners,
 checked against the true edges); `test/yosys/yosys_capture.sh [SLOTS]`
 synthesises Pin_capture and reports its area and that every hand-placed

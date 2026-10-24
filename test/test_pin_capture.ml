@@ -539,7 +539,7 @@ let%expect_test "pins high at reset: edges counted forward, no false lost_edge" 
   let edges = List.init 12 ~f:(fun k -> { Ref.time = ((40 + (10 * k)) * spc) + 7; pin = k % 4 }) in
   let r = run ~initial ~edges ~cycles:200 () in
   print_events r;
-  print_status r.status;
+  print_status r.status r.counts;
   print_endline (Capture_oracle.pp (oracle ~initial ~edges r));
   [%expect {|
     cycle  46: timed   pins 4 changed 1 reconfig 0 stale 0 time  4255
@@ -572,7 +572,7 @@ let%expect_test "capture balance far below 0 between checks: merge_error, not wr
       List.map [ 0, 0; 1, 1; 3, 2; 4, 3; 7, 0 ] ~f:(fun (dt, pin) -> { Ref.time = t + dt; pin }))
   in
   let r = run ~edges ~cycles:500 () in
-  print_status r.status;
+  print_status r.status r.counts;
   print_endline (Capture_oracle.pp (oracle ~edges r));
   [%expect {|
     status: fault 0 (0) overflow 0 (0) lost_edge 1 (1) level_mismatch 0 (0) merge_error e (1) empty 0 stale 0 resyncing 0

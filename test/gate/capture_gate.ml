@@ -1,21 +1,30 @@
 (* Pin_capture gate run: random edges on 4 pins at typ/slow/fast with the
    real circuit, in chunks (each chunk a fresh simulation with its own seed,
    so the run can be split). Reports per corner: oracle summary (unflagged
-   errors), calibrated single-edge error, snapshot race margin, status. *)
+   errors), calibrated single-edge error, snapshot race margin, status.
+
+   Usage: capture_gate.exe [EDGES_PER_CORNER [SEED [NEAR [MIN_SAME_PIN_NS [SLOTS]]]]]
+   SLOTS is the slots per bank (2..4, default 2). *)
 
 open! Base
 open Stdio
 open Hardcaml_clockless
-module T = Hardcaml_clockless_test.Capture_timing
 
 let () =
   let argv = Sys.get_argv () in
+  let slots = if Array.length argv > 5 then Int.of_string argv.(5) else 2 in
+  let module T =
+    Hardcaml_clockless_test.Capture_timing.Make (struct
+      let slots = slots
+    end)
+  in
+  printf "slots per bank: %d\n" slots;
   let per_corner = if Array.length argv > 1 then Int.of_string argv.(1) else 30000 in
   let seed = if Array.length argv > 2 then Int.of_string argv.(2) else 1 in
   let near = if Array.length argv > 3 then Float.of_string argv.(3) else 0.1 in
   let min_same = if Array.length argv > 4 then Float.of_string argv.(4) else 5. in
   let chunk = 5000 in
-  List.iter T.corners ~f:(fun (corner, file) ->
+  List.iter Hardcaml_clockless_test.Capture_timing.corners ~f:(fun (corner, file) ->
     let path = "test/" ^ file in
     let t0 = Unix.gettimeofday () in
     let totals = Array.create ~len:8 0 in
