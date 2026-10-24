@@ -17,13 +17,6 @@ generates the timing constraints and delay-aware simulations needed to verify
 them. It sits on top of Hardcaml's public API, with no changes to Hardcaml
 itself, just as `hardcaml_waveterm` or `hardcaml_circuits` do.
 
-It is developed for [janestreet-bitbanger](https://github.com/kasper0406/janestreet-bitbanger),
-a protocol-emulator ASIC on IHP SG13CMOS5L via Tiny Tapeout. There, a TDC
-gives edge timestamps at ~0.1 ns resolution against a 20 ns clock. The design
-rationale and the survey of existing async tools (ACT, Workcraft, Balsa/Teak,
-click elements) are in that repo's
-[docs/CLOCKLESS.md](https://github.com/kasper0406/janestreet-bitbanger/blob/main/docs/CLOCKLESS.md).
-
 ## Status
 
 | Module | What | State |
