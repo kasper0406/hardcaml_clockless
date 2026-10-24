@@ -291,6 +291,9 @@ let heap_pop t =
 ;;
 
 let push t ~time kind =
+  if time < t.now
+  then
+    raise_s [%message "Event_sim: event scheduled in the past" (time : int) ~now:(t.now : int)];
   let seq_no = t.next_seq in
   t.next_seq <- seq_no + 1;
   heap_push t { time; seq_no; kind };
@@ -491,7 +494,10 @@ and decide_capture t c s ~edge_time ~clock_slew =
     let u = Random.State.float t.meta_rng 1.0 in
     let dt = of_ns (-.t.config.tau *. Float.log (1. -. u)) in
     let resolved = Random.State.int t.meta_rng 2 in
-    let resolve_time = edge_time + dt in
+    (* A decision deferred past a positive hold window is taken at [t.now],
+       which can be later than [edge_time + dt]; resolution cannot happen
+       before the decision, so it is clamped (and Q follows from there). *)
+    let resolve_time = Int.max t.now (edge_time + dt) in
     t.metastable
     <- { instance = c.inst_name
        ; edge_time
