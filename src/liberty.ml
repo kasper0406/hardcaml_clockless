@@ -174,3 +174,22 @@ let group_name (g : group) =
   | v :: _ -> value_to_string v
   | [] -> ""
 ;;
+
+(** The arguments of a complex attribute [name (v, ...);]. *)
+let complex (g : group) name =
+  List.find_map g.body ~f:(function
+    | Complex (n, vs) when String.equal n name -> Some vs
+    | _ -> None)
+;;
+
+(** All the numbers in a list of values, e.g. [index_1 ("0.1, 0.2")] or
+    [values ("1, 2", "3, 4")] (row by row). *)
+let floats (vs : value list) =
+  List.concat_map vs ~f:(fun v ->
+    String.split_on_chars (value_to_string v) ~on:[ ','; ' '; '\t'; '\n' ]
+    |> List.filter ~f:(fun s -> not (String.is_empty s))
+    |> List.map ~f:Float.of_string)
+;;
+
+(** The rows of a [values (...)] table: one row per value. *)
+let float_rows (vs : value list) = List.map vs ~f:(fun v -> floats [ v ])
