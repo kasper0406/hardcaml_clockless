@@ -41,7 +41,7 @@ itself, just as `hardcaml_waveterm` or `hardcaml_circuits` do.
 | Behavioural models | Cyclesim models so the rest of a design simulates normally | `Tdc.Model`, `Ring.Model` (driven by `Ring.Ideal`), `Pin_capture.Model` (driven by `Pin_capture.Reference` / `Model_driver`) |
 | `Event_sim` | Event-driven gate-level simulation of Hardcaml circuits of Liberty cells: fs time, 0/1/X, NLDM delays with slew propagation and loads, inertial/transport, flops/latches from Liberty with setup/hold-aperture metastability (exponential resolution), corner scale and seeded per-instance variation, Hardcaml registers on any clock net, loops (ring oscillators), VCD | done (minimal); SDF, adversarial delays, hazard/protocol monitors, Cyclesim co-simulation: planned |
 | `Sdc` | From the flattened circuit: protected instances (every `dont_touch` cell and kept register) and nets (driven by them, plus registered fork nets); LibreLane `RSZ_DONT_TOUCH_RX`, or `RSZ_DONT_TOUCH_LIST` resolved from a synthesised netlist (it names the flops yosys made of kept registers); SDC fragments: `set_disable_timing` at loop breaks, false paths into the TDC line, and for signoff only `create_clock` on ring counter, Pin_capture bank and edge-counter clocks with asynchronous groups (CTS ignores dont-touch, so they stay out of the PnR SDC) | done (generation); not yet run through LibreLane/OpenROAD. Relative-timing checks (snapshot race, hold, pulse width, reset recovery at 3 corners): planned |
-| Post-route check | `Netlist` parses gate-level Verilog (yosys, OpenROAD); `Sdc.check` re-extracts the islands: same cells, protected nets unbuffered, unrenamed and without extra loads (antenna diodes allowed), kept registers still flops on the right nets, inputs rebuffered only from their own source, constants possibly tie cells | done; checked on yosys output (`test/yosys/yosys_island.sh`), not yet on a routed netlist |
+| Post-route check | `Netlist` parses gate-level Verilog (yosys, OpenROAD); `Sdc.check` re-extracts the islands: same cells, protected nets unbuffered, unrenamed, still driving their outputs and without extra loads (antenna diodes allowed; loads from synthesised logic are not checked one by one), kept registers still plain D flops with their D, clock edge and source, reset tied off, inputs rebuffered only from their named source, constants possibly tie cells | done; checked on yosys output (`test/yosys/yosys_island.sh`), not yet on a routed netlist |
 | `Click`, `Bd_channel` | Bundled-data click handshake components with a synchronous reference | planned |
 | Workcraft export | Formal checks: deadlock freedom, hazard freedom, conformation | planned |
 
@@ -82,6 +82,7 @@ in
 Sdc.rsz_dont_touch_rx sdc (* LibreLane RSZ_DONT_TOUCH_RX *)
 Sdc.sdc sdc ~stage:Pnr ~system_clock:"clk" (* append to PNR_SDC_FILE *)
 Sdc.sdc sdc ~stage:Signoff ~system_clock:"clk" (* append to SIGNOFF_SDC_FILE *)
+(* library: a Timing_library.t *)
 Sdc.dont_touch_list sdc ~library (Netlist.load "synthesised.v") (* RSZ_DONT_TOUCH_LIST *)
 Sdc.check sdc ~library (Netlist.load "routed.nl.v") (* [] if the islands survived *)
 ```

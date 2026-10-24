@@ -72,7 +72,8 @@ module Net = struct
     { names : string list (** circuit names; bus bits as [name[i]] *)
     ; driver : Driver.t
     ; sinks : Endpoint.t list (** protected input pins *)
-    ; other_sinks : bool (** also feeds logic outside the island, or a port *)
+    ; logic_sinks : bool (** also feeds logic outside the island *)
+    ; ports : string list (** circuit outputs on it *)
     ; fork : bool
     }
   [@@deriving sexp_of]
@@ -100,6 +101,9 @@ module Register = struct
     { name : string
     ; q : int
     ; d : int
+    ; clock : int
+    ; rising : bool
+    ; has_reset : bool
     }
   [@@deriving sexp_of]
 end
@@ -196,7 +200,8 @@ let create ?(prefix = "") (circuit : Circuit.t) =
   let names = Array.create ~len:!count [] in
   let driver = Array.create ~len:!count Driver.Other in
   let sinks = Array.create ~len:!count [] in
-  let other = Array.create ~len:!count false in
+  let logic = Array.create ~len:!count false in
+  let ports = Array.create ~len:!count [] in
   List.iter signals ~f:(fun s ->
     let w = Signal.width s in
     List.iter (Signal.names s) ~f:(fun nm ->
@@ -205,12 +210,18 @@ let create ?(prefix = "") (circuit : Circuit.t) =
         let nm = if w = 1 then nm else Printf.sprintf "%s[%d]" nm i in
         if not (List.mem names.(n) nm ~equal:String.equal) then names.(n) <- nm :: names.(n)
       done));
-  let mark_other s =
+  let mark_logic s =
     for i = 0 to Signal.width s - 1 do
-      other.(net s i) <- true
+      logic.(net s i) <- true
     done
   in
-  List.iter (Circuit.outputs circuit) ~f:mark_other;
+  List.iter (Circuit.outputs circuit) ~f:(fun o ->
+    let w = Signal.width o in
+    List.iter (List.take (Signal.names o) 1) ~f:(fun nm ->
+      for i = 0 to w - 1 do
+        let n = net o i in
+        ports.(n) <- (if w = 1 then nm else Printf.sprintf "%s[%d]" nm i) :: ports.(n)
+      done));
   let instances = Queue.create () in
   let registers = Queue.create () in
   List.iter signals ~f:(fun s ->
@@ -235,23 +246,40 @@ let create ?(prefix = "") (circuit : Circuit.t) =
       Queue.enqueue
         instances
         { Instance.name = inst.instance_label; cell = inst.circuit_name; pins }
-    | Reg { d; _ } when is_dont_touch s ->
+    | Reg { d; register = r; _ } when is_dont_touch s ->
       let name =
         match Signal.names s with
         | nm :: _ -> nm
         | [] -> raise_s [%message "Sdc: kept register without a name"]
       in
-      if Signal.width s <> 1 then raise_s [%message "Sdc: kept registers must be 1 bit" (name : string)];
+      if Signal.width s <> 1
+      then raise_s [%message "Sdc: kept registers must be 1 bit" (name : string)];
+      if Option.is_some r.enable || Option.is_some r.clear
+      then raise_s [%message "Sdc: kept registers must be plain flops (no enable or clear)" name];
       driver.(net s 0) <- Register name;
-      Queue.enqueue registers { Register.name; q = net s 0; d = net d 0 };
-      Signal.Type.Deps.iter s ~f:mark_other
-    | _ -> Signal.Type.Deps.iter s ~f:mark_other);
+      Queue.enqueue
+        registers
+        { Register.name
+        ; q = net s 0
+        ; d = net d 0
+        ; clock = net r.clock.clock 0
+        ; rising =
+            (match r.clock.clock_edge with
+             | Rising -> true
+             | Falling -> false)
+        ; has_reset = Option.is_some r.reset
+        };
+      (* its D is checked as the flop's data pin; clock and reset are boundary *)
+      mark_logic r.clock.clock;
+      Option.iter r.reset ~f:(fun x -> mark_logic x.reset)
+    | _ -> Signal.Type.Deps.iter s ~f:mark_logic);
   let nets =
     Array.init !count ~f:(fun n ->
       { Net.names = List.sort names.(n) ~compare:String.compare
       ; driver = driver.(n)
       ; sinks = List.sort sinks.(n) ~compare:Endpoint.compare
-      ; other_sinks = other.(n)
+      ; logic_sinks = logic.(n)
+      ; ports = List.sort ports.(n) ~compare:String.compare
       ; fork = false
       })
   in
@@ -301,6 +329,10 @@ let fork t (e : Endpoint.t) =
 
 let clock t ~name ~source ?waveform ~period_ns ~group () =
   ignore (pin_net t source : int);
+  List.iter [ name; group ] ~f:(fun nm ->
+    if String.is_empty nm
+       || not (String.for_all nm ~f:(fun c -> Char.is_alphanum c || String.mem "_." c))
+    then raise_s [%message "Sdc.clock: names are [A-Za-z0-9_.]+" nm]);
   if List.exists t.clocks ~f:(fun c -> String.equal c.name name)
   then raise_s [%message "Sdc.clock: duplicate name" (name : string)];
   { t with clocks = t.clocks @ [ { Clock.name; source; period_ns; waveform; group } ] }
@@ -420,7 +452,12 @@ let rsz_dont_touch_rx t =
     (String.concat ~sep:"|" (List.map names ~f:rx_of_name))
 ;;
 
-let tcl_name nm = "{" ^ nm ^ "}"
+(* Names go into SDC braced; refuse what would break the braces. *)
+let tcl_name nm =
+  if String.exists nm ~f:(fun c -> Char.is_whitespace c || String.mem "{}\\" c)
+  then raise_s [%message "Sdc: name not usable in SDC" nm];
+  "{" ^ nm ^ "}"
+;;
 
 let sdc t ~(stage : Stage.t) ~system_clock =
   let b = Buffer.create 1024 in
@@ -476,55 +513,85 @@ let sdc t ~(stage : Stage.t) ~system_clock =
 (* Pin direction from the Liberty file. A protected instance that synthesis or
    P&R swapped for a cell the library does not know is read as the expected
    cell, so that one error reports it. *)
-let direction t (library : Cell_library.t) (i : Netlist.Instance.t) pin =
-  let cell =
-    match Cell_library.find library i.cell with
-    | Some c -> Some c
-    | None ->
-      Option.bind
-        (if String.is_prefix i.name ~prefix:t.prefix
-         then find_instance t (String.drop_prefix i.name (String.length t.prefix))
-         else None)
-        ~f:(fun (e : Instance.t) -> Cell_library.find library e.cell)
-  in
-  match cell with
-  | None -> None
-  | Some c -> Some (Option.map (Cell_library.Cell.pin c pin) ~f:(fun p -> p.direction))
+let lib_cell t (library : Timing_library.t) (i : Netlist.Instance.t) =
+  match Timing_library.find library i.cell with
+  | Some c -> Some c
+  | None ->
+    Option.bind
+      (if String.is_prefix i.name ~prefix:t.prefix
+       then find_instance t (String.drop_prefix i.name (String.length t.prefix))
+       else None)
+      ~f:(fun (e : Instance.t) -> Timing_library.find library e.cell)
 ;;
 
 (* Drivers and loads of every netlist net, by pin direction. Pins the library
-   does not list on a cell it knows (power) are ignored; every pin of a cell it
-   does not know counts as a load. *)
+   does not list on a cell it knows (power) are ignored; bidirectional pins
+   and every pin of a cell it does not know count as loads. *)
 let drivers_and_loads t library (nl : Netlist.t) =
   let drivers = Array.create ~len:(Netlist.num_nets nl) [] in
   let loads = Array.create ~len:(Netlist.num_nets nl) [] in
   List.iter (Netlist.instances nl) ~f:(fun i ->
+    let cell = lib_cell t library i in
     List.iter i.pins ~f:(fun (pin, c) ->
       match c with
       | Open -> ()
       | Net n ->
-        (match direction t library i pin with
-         | Some (Some Output) -> drivers.(n) <- (i, pin) :: drivers.(n)
-         | Some (Some Input) | None -> loads.(n) <- (i, pin) :: loads.(n)
-         | Some (Some (Inout | Internal)) | Some None -> ())));
+        (match cell with
+         | None -> loads.(n) <- (i, pin) :: loads.(n)
+         | Some c ->
+           (match Cell_library.Cell.pin c.logic pin with
+            | Some { direction = Output; _ } -> drivers.(n) <- (i, pin) :: drivers.(n)
+            | Some { direction = Input | Inout; _ } -> loads.(n) <- (i, pin) :: loads.(n)
+            | Some { direction = Internal; _ } | None -> ()))));
   drivers, loads
 ;;
 
-let check ?passive t ~(library : Cell_library.t) (nl : Netlist.t) =
+let pin_conn (i : Netlist.Instance.t) pin =
+  match List.Assoc.find i.pins pin ~equal:String.equal with
+  | Some (Net n) -> Some n
+  | Some Open | None -> None
+;;
+
+let single_var : Bool_expr.t -> (string * bool) option = function
+  | Var v -> Some (v, true)
+  | Not (Var v) -> Some (v, false)
+  | _ -> None
+;;
+
+(** [check t ~library netlist] lists every way [netlist] (yosys or OpenROAD
+    output) departs from the islands; [[]] if they survived:
+    - every protected instance exists with the same cell type;
+    - every protected net is a single netlist net with one driver, carries one
+      of its circuit names (so the dont-touch regex matched it), still drives
+      its circuit outputs, and, unless it also feeds synthesised logic, has no
+      loads but its island sinks and [passive] cells (default: Liberty cells
+      with only inputs, e.g. antenna diodes). Loads from synthesised logic are
+      not checked one by one;
+    - every kept register is a plain D flop with the right clock edge, its D on
+      the expected net, its clock from the circuit's clock and, if the
+      register had no reset, its clear/preset tied inactive;
+    - inputs entering the island may be rebuffered but must come from the net
+      that still carries their circuit name ([boundary] maps circuit names to
+      netlist names, e.g. after flattening). Named inputs whose names are all
+      gone are reported as unverifiable; unnamed ones only need a common
+      source. Constants may be literals or tie cells of the right value. *)
+let check ?passive ?(boundary = []) t ~(library : Timing_library.t) (nl : Netlist.t) =
   let errors = Queue.create () in
   let err fmt = Printf.ksprintf (Queue.enqueue errors) fmt in
   let p nm = t.prefix ^ nm in
-  let lib_cell name = Cell_library.find library name in
   let passive =
     match passive with
     | Some f -> f
     | None ->
       fun cell ->
-        (match lib_cell cell with
-         | Some c -> List.is_empty (Cell_library.Cell.outputs c)
+        (match Timing_library.find library cell with
+         | Some c ->
+           List.for_all c.logic.pins ~f:(fun pin ->
+             match pin.direction with
+             | Output | Inout -> false
+             | Input | Internal -> true)
          | None -> false)
   in
-  let direction i pin = Option.join (direction t library i pin) in
   let drivers, loads = drivers_and_loads t library nl in
   let net_str n =
     match Netlist.net_names nl n with
@@ -544,24 +611,15 @@ let check ?passive t ~(library : Cell_library.t) (nl : Netlist.t) =
     match Hashtbl.find found e.instance with
     | None -> None
     | Some i ->
-      (match List.Assoc.find i.pins e.pin ~equal:String.equal with
-       | Some (Net n) -> Some n
-       | Some Open | None ->
+      (match pin_conn i e.pin with
+       | Some n -> Some n
+       | None ->
          err "%s is not connected" (p (Endpoint.to_string e));
          None)
   in
-  let protected_instance (i : Netlist.Instance.t) =
+  let is_protected_instance (i : Netlist.Instance.t) =
     String.is_prefix i.name ~prefix:t.prefix
     && Hashtbl.mem found (String.drop_prefix i.name (String.length t.prefix))
-  in
-  let expected_name (net : Net.t) n =
-    let have = Netlist.net_names nl n in
-    if not (List.exists net.names ~f:(fun nm -> List.mem have (p nm) ~equal:String.equal))
-    then
-      err
-        "net %s is named %s in the netlist: the dont-touch names do not match it"
-        (p (List.hd_exn net.names))
-        (net_str n)
   in
   (* trace back through unprotected buffers *)
   let rec root n depth =
@@ -569,14 +627,11 @@ let check ?passive t ~(library : Cell_library.t) (nl : Netlist.t) =
     then n
     else (
       match drivers.(n) with
-      | [ (i, _) ] when not (protected_instance i) ->
-        (match lib_cell i.cell with
-         | Some c when Cell_library.Cell.is_buffer c ->
-           (match List.find_map i.pins ~f:(fun (pin, c) ->
-                    match c, direction i pin with
-                    | Net m, Some Input -> Some m
-                    | _ -> None)
-            with
+      | [ (i, _) ] when not (is_protected_instance i) ->
+        (match Timing_library.find library i.cell with
+         | Some c when Cell_library.Cell.is_buffer c.logic ->
+           let input = (List.hd_exn (Cell_library.Cell.inputs c.logic)).name in
+           (match pin_conn i input with
             | Some m -> root m (depth + 1)
             | None -> n)
          | _ -> n)
@@ -590,16 +645,104 @@ let check ?passive t ~(library : Cell_library.t) (nl : Netlist.t) =
     else (
       match drivers.(n) with
       | [ (i, pin) ] ->
-        (match lib_cell i.cell with
-         | Some c when Cell_library.Kind.equal c.kind Constant ->
-           (match Cell_library.Cell.pin c pin with
+        (match Timing_library.find library i.cell with
+         | Some c when Cell_library.Kind.equal c.logic.kind Constant ->
+           (match Cell_library.Cell.pin c.logic pin with
             | Some { function_ = Some (Const b); _ } -> Some b
             | _ -> None)
          | _ -> None)
       | _ -> None)
   in
-  Array.iteri t.nets ~f:(fun _ net ->
-    let label = match net.names with nm :: _ -> p nm | [] -> "<unnamed>" in
+  (* The netlist net a circuit net corresponds to, from its endpoints or, for
+     nets entering the island, a surviving name ([boundary] maps circuit names
+     to netlist names where flattening renamed them). *)
+  let by_name (net : Net.t) =
+    List.find_map net.names ~f:(fun nm ->
+      match List.Assoc.find boundary nm ~equal:String.equal with
+      | Some x -> Netlist.find_net nl x
+      | None -> Netlist.find_net nl (p nm))
+  in
+  let resolve (net : Net.t) =
+    let ends =
+      (match net.driver with
+       | Cell e -> [ e ]
+       | _ -> [])
+      @ net.sinks
+    in
+    match List.find_map ends ~f:netlist_net with
+    | Some n -> Some n
+    | None ->
+      (match net.driver with
+       | Register r -> Netlist.find_net nl (p r)
+       | _ -> by_name net)
+  in
+  let label (net : Net.t) =
+    match net.names with
+    | nm :: _ -> p nm
+    | [] -> "<unnamed>"
+  in
+  (* nets entering the island: [n] must come from the same source as [net] *)
+  let check_source (net : Net.t) what n =
+    match net.driver with
+    | Constant b ->
+      (match tie_value (root n 0) with
+       | Some v when Bool.equal v b -> ()
+       | _ -> err "%s should be constant %d, is on %s" what (Bool.to_int b) (net_str (root n 0)))
+    | _ ->
+      (match by_name net with
+       | Some m ->
+         if root m 0 <> root n 0
+         then err "%s is driven from %s, not from %s" what (net_str (root n 0)) (net_str m)
+       | None ->
+         if not (List.is_empty net.names)
+         then
+           err
+             "%s: cannot verify its source, none of %s survives (pass ~boundary)"
+             what
+             (String.concat ~sep:"," (List.map net.names ~f:p)))
+  in
+  (* flops synthesised from kept registers, by their D net *)
+  let reg_flops = Hashtbl.create (module Int) in
+  List.iter t.registers ~f:(fun r ->
+    let what = "kept register " ^ p r.name in
+    match Netlist.find_net nl (p r.name) with
+    | None -> err "%s: no net of that name" what
+    | Some q ->
+      (match drivers.(q) with
+       | [ (i, _) ] ->
+         (match Timing_library.find library i.cell with
+          | Some { seq = Some ({ kind = Ff { clocked_on; next_state }; _ } as seq); _ } ->
+            (match single_var next_state, single_var clocked_on with
+             | Some (dpin, true), Some (cpin, rising) ->
+               (match pin_conn i dpin with
+                | None -> err "%s: data pin %s/%s is not connected" what i.name dpin
+                | Some dn ->
+                  Hashtbl.add_multi reg_flops ~key:r.d ~data:(i.name, dpin);
+                  (match resolve t.nets.(r.d) with
+                   | Some expected when Net.is_protected t.nets.(r.d) ->
+                     if dn <> expected
+                     then err "%s: D is on %s, expected %s" what (net_str dn) (net_str expected)
+                   | _ -> check_source t.nets.(r.d) (what ^ " D") dn));
+               if Bool.( <> ) rising r.rising then err "%s: flop %s has the wrong clock edge" what i.name;
+               (match pin_conn i cpin with
+                | None -> err "%s: clock pin %s/%s is not connected" what i.name cpin
+                | Some cn -> check_source t.nets.(r.clock) (what ^ " clock") cn);
+               if not r.has_reset
+               then
+                 (* asynchronous clear/preset must be tied inactive *)
+                 List.iter (List.filter_opt [ seq.clear; seq.preset ]) ~f:(fun e ->
+                   let env v =
+                     match Option.bind (pin_conn i v) ~f:(fun n -> tie_value (root n 0)) with
+                     | Some b -> b
+                     | None ->
+                       err "%s: %s/%s is not tied" what i.name v;
+                       false
+                   in
+                   if Bool_expr.eval e ~env then err "%s: flop %s is held in reset" what i.name)
+             | _ -> err "%s: %s (%s) is not a plain D flop" what i.name i.cell)
+          | _ -> err "%s is driven by %s (%s), not a flop" what i.name i.cell)
+       | ds -> err "%s: net has %d drivers" what (List.length ds)));
+  Array.iteri t.nets ~f:(fun idx net ->
     let endpoints =
       (match net.driver with
        | Cell e -> [ e ]
@@ -611,142 +754,130 @@ let check ?passive t ~(library : Cell_library.t) (nl : Netlist.t) =
     in
     if Net.is_protected net
     then (
-      let ns = List.map mapped ~f:snd |> List.dedup_and_sort ~compare:Int.compare in
-      let ns =
-        match ns, net.driver with
-        | [], Register r ->
-          (match Netlist.find_net nl (p r) with
-           | Some n -> [ n ]
-           | None ->
-             err "kept register %s: no net of that name" (p r);
-             [])
-        | _ -> ns
-      in
-      match ns with
-      | [] -> ()
+      match List.dedup_and_sort (List.map mapped ~f:snd) ~compare:Int.compare with
       | _ :: _ :: _ ->
         err
           "net %s is split: %s"
-          label
+          (label net)
           (String.concat
              ~sep:"; "
              (List.map mapped ~f:(fun (e, n) -> Endpoint.to_string e ^ " on " ^ net_str n)))
-      | [ n ] ->
-        if not (List.is_empty net.names) then expected_name net n;
-        (match drivers.(n), net.driver with
-         | [ _ ], _ -> ()
-         | [], (Constant _ | Other) -> () (* an input port *)
-         | ds, _ ->
-           err
-             "net %s has %d drivers: %s"
-             label
-             (List.length ds)
-             (String.concat ~sep:", " (List.map ds ~f:(fun (i, pin) -> i.name ^ "/" ^ pin))));
-        (match net.driver with
-         | Register r ->
-           (match drivers.(n) with
-            | [ (i, _) ] ->
-              (match lib_cell i.cell with
-               | Some c when Cell_library.Kind.equal c.kind Flop -> ()
-               | _ -> err "kept register %s is driven by %s (%s), not a flop" (p r) i.name i.cell);
-              (* its D must come from the expected net, when that net is protected *)
-              let reg = List.find_exn t.registers ~f:(fun x -> String.equal x.name r) in
-              let dnet = t.nets.(reg.d) in
-              if Net.is_protected dnet
-              then (
-                let d_ends =
-                  (match dnet.driver with Cell e -> [ e ] | _ -> []) @ dnet.sinks
-                in
-                match List.find_map d_ends ~f:netlist_net with
-                | None -> ()
-                | Some dn ->
-                  if not
-                       (List.exists i.pins ~f:(fun (pin, c) ->
-                          Netlist.Conn.equal c (Net dn)
-                          && Poly.equal (direction i pin) (Some Cell_library.Direction.Input)))
-                  then err "kept register %s: D is not on net %s" (p r) (net_str dn))
-            | _ -> ())
-         | _ -> ());
-        if not net.other_sinks
-        then (
-          let expected =
-            List.filter_map net.sinks ~f:(fun e ->
-              Option.map (Hashtbl.find found e.instance) ~f:(fun i -> i.name, e.pin))
-          in
-          List.iter loads.(n) ~f:(fun (i, pin) ->
-            if not
-                 (List.mem expected (i.name, pin) ~equal:[%equal: string * string]
-                  || passive i.cell)
-            then err "net %s has an extra load %s/%s (%s)" label i.name pin i.cell)))
-    else (
+      | ns ->
+        let n =
+          match ns, net.driver with
+          | [ n ], _ -> Some n
+          | _, Register r -> Netlist.find_net nl (p r)
+          | _ -> None
+        in
+        Option.iter n ~f:(fun n ->
+          let have = Netlist.net_names nl n in
+          if (not (List.is_empty net.names))
+             && not (List.exists net.names ~f:(fun nm -> List.mem have (p nm) ~equal:String.equal))
+          then
+            err
+              "net %s is named %s in the netlist: the dont-touch names do not match it"
+              (label net)
+              (net_str n);
+          (match drivers.(n), net.driver with
+           | [ _ ], _ -> ()
+           | [], (Constant _ | Other) -> () (* an input port *)
+           | ds, _ ->
+             err
+               "net %s has %d drivers: %s"
+               (label net)
+               (List.length ds)
+               (String.concat ~sep:", " (List.map ds ~f:(fun (i, pin) -> i.name ^ "/" ^ pin))));
+          (* a fork fed from outside keeps its source *)
+          (match net.driver with
+           | Other | Constant _ -> check_source net ("net " ^ label net) n
+           | Cell _ | Register _ -> ());
+          (* circuit outputs (top level only: in a flattened hierarchy they are
+             the parent's logic) *)
+          let port_sinks = (not (String.is_empty t.prefix)) && not (List.is_empty net.ports) in
+          if String.is_empty t.prefix
+          then
+            List.iter net.ports ~f:(fun port ->
+              match Netlist.find_net nl port with
+              | Some m when root m 0 = n -> ()
+              | _ -> err "net %s no longer drives output %s" (label net) port);
+          if not (net.logic_sinks || port_sinks)
+          then (
+            let expected =
+              List.filter_map net.sinks ~f:(fun e ->
+                Option.map (Hashtbl.find found e.instance) ~f:(fun i -> i.name, e.pin))
+              @ Hashtbl.find_multi reg_flops idx
+            in
+            List.iter loads.(n) ~f:(fun (i, pin) ->
+              let port_buffer =
+                (* LibreLane's insbuf between a net and an output port *)
+                String.is_empty t.prefix
+                && (match Timing_library.find library i.cell with
+                    | Some c when Cell_library.Cell.is_buffer c.logic ->
+                      List.exists net.ports ~f:(fun port ->
+                        match Netlist.find_net nl port with
+                        | Some m -> List.exists drivers.(m) ~f:(fun (d, _) -> phys_equal d i)
+                        | None -> false)
+                    | _ -> false)
+              in
+              if not
+                   (List.mem expected (i.name, pin) ~equal:[%equal: string * string]
+                    || passive i.cell
+                    || port_buffer)
+              then err "net %s has an extra load %s/%s (%s)" (label net) i.name pin i.cell))))
+    else
       (* inputs from outside the island: sinks may be rebuffered, but must
          keep a common source; constants may become tie cells *)
-      let roots = List.map mapped ~f:(fun (e, n) -> e, root n 0) in
-      (match net.driver with
-       | Constant b ->
-         List.iter roots ~f:(fun (e, r) ->
-           match tie_value r with
-           | Some v when Bool.equal v b -> ()
-           | _ ->
-             err
-               "%s should be constant %d, is on %s"
-               (p (Endpoint.to_string e))
-               (Bool.to_int b)
-               (net_str r))
-       | _ ->
-         (match List.dedup_and_sort (List.map roots ~f:snd) ~compare:Int.compare with
-          | [] | [ _ ] -> ()
-          | _ ->
-            err
-              "net %s: its island loads no longer share a source: %s"
-              label
-              (String.concat
-                 ~sep:"; "
-                 (List.map roots ~f:(fun (e, r) -> Endpoint.to_string e ^ " from " ^ net_str r))));
-         (* anchor: a surviving circuit name must be that source *)
-         match roots with
-         | [] -> ()
-         | (_, r) :: _ ->
-           List.iter net.names ~f:(fun nm ->
-             match Netlist.find_net nl (p nm) with
-             | Some m when root m 0 <> r ->
-               err "net %s: island loads are driven from %s, not from %s" label (net_str r) (p nm)
-             | _ -> ()))));
+      List.iter mapped ~f:(fun (e, n) -> check_source net (p (Endpoint.to_string e)) n));
   Queue.to_list errors
 ;;
 
-let dont_touch_list t ~library (nl : Netlist.t) =
+(** Exact names for LibreLane's [RSZ_DONT_TOUCH_LIST], from a synthesised
+    netlist: protected instances, the netlist names of protected nets, and the
+    flops synthesised from kept registers. An error if any is missing. *)
+let dont_touch_list t ~(library : Timing_library.t) (nl : Netlist.t) =
   let p nm = t.prefix ^ nm in
   let drivers, _ = drivers_and_loads t library nl in
+  let missing = Queue.create () in
   let insts =
     List.filter_map t.instances ~f:(fun i ->
-      Option.map (Netlist.find_instance nl (p i.name)) ~f:(fun (x : Netlist.Instance.t) -> x.name))
+      match Netlist.find_instance nl (p i.name) with
+      | Some x -> Some x.name
+      | None ->
+        Queue.enqueue missing ("instance " ^ p i.name);
+        None)
   in
   let net_of_endpoint (e : Endpoint.t) =
-    match Netlist.find_instance nl (p e.instance) with
-    | None -> None
-    | Some i ->
-      (match List.Assoc.find i.pins e.pin ~equal:String.equal with
-       | Some (Net n) -> Some n
-       | Some Open | None -> None)
+    Option.bind (Netlist.find_instance nl (p e.instance)) ~f:(fun i -> pin_conn i e.pin)
   in
-  let resolved =
+  let nets =
     List.concat_map (protected_nets t) ~f:(fun net ->
       let n =
         match net.driver, net.sinks with
         | Cell e, _ -> net_of_endpoint e
         | _, e :: _ -> net_of_endpoint e
+        | Register r, [] -> Netlist.find_net nl (p r)
         | _ -> List.find_map net.names ~f:(fun nm -> Netlist.find_net nl (p nm))
       in
       match n with
-      | None -> []
+      | None ->
+        Queue.enqueue
+          missing
+          ("net " ^ Option.value_map (List.hd net.names) ~default:"<unnamed>" ~f:p);
+        []
       | Some n ->
         let flop =
           match net.driver, drivers.(n) with
           | Register _, [ ((i : Netlist.Instance.t), _) ] -> [ i.name ]
+          | Register r, _ ->
+            Queue.enqueue missing ("flop of kept register " ^ p r);
+            []
           | _ -> []
         in
         Netlist.net_names nl n @ flop)
   in
-  List.dedup_and_sort ~compare:String.compare (insts @ resolved)
+  if Queue.is_empty missing
+  then Ok (List.dedup_and_sort ~compare:String.compare (insts @ nets))
+  else
+    Or_error.error_s
+      [%message "Sdc.dont_touch_list: not in the netlist" ~_:(Queue.to_list missing : string list)]
 ;;

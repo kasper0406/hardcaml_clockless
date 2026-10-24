@@ -3,7 +3,8 @@ open Stdio
 open Hardcaml
 open Hardcaml_clockless
 
-let lib = lazy (Cell_library.load "data/sg13cmos5l_excerpt.lib")
+let tlib = lazy (Timing_library.load "data/sg13cmos5l_excerpt.lib")
+let lib = lazy (force tlib).library
 
 module R = Ring.Make (struct
     let lengths = [ 3 ]
@@ -98,14 +99,14 @@ module top(clk, en, hit, x, node0, sampled, y);
   sg13cmos5l_tiehi _14_ (.L_HI(_2_));
   sg13cmos5l_nand2_1 gate (.A(x), .B(_2_), .Y(y));
   assign node0 = ring_nand__Y;
-  assign sampled = { tdc_sample2, tdc_sample1, \tdc_sample0  };
+  assign { sampled[2], \sampled\[1\] , sampled[0] } = { tdc_sample2, tdc_sample1, \tdc_sample0  };
 endmodule
 |}
 ;;
 
 let check netlist =
   let t = island () in
-  match Sdc.check t ~library:(force lib) (Netlist.of_string netlist) with
+  match Sdc.check t ~library:(force tlib) (Netlist.of_string netlist) with
   | [] -> print_endline "ok"
   | errors -> List.iter errors ~f:print_endline
 ;;
@@ -176,13 +177,25 @@ let%expect_test "constraints: dont-touch regex and SDC fragments" =
 
 let%expect_test "check: an intact netlist passes; dont_touch list resolved from it" =
   check good;
-  print_s
-    [%sexp (Sdc.dont_touch_list (island ()) ~library:(force lib) (Netlist.of_string good) : string list)];
+  let list netlist =
+    print_s
+      [%sexp
+        (Sdc.dont_touch_list (island ()) ~library:(force tlib) (Netlist.of_string netlist)
+         : string list Or_error.t)]
+  in
+  list good;
+  (* incomplete resolution is an error, not a shorter list *)
+  list (edit ~from:"sg13cmos5l_inv_1 ring_inv2" ~to_:"sg13cmos5l_inv_1 _96_");
   [%expect {|
     ok
-    (_10_ _11_ _12_ gate hit node0 ring_inv1 ring_inv1__Y ring_inv2 ring_inv2__Y
-     ring_nand ring_nand__Y sampled[0] sampled[1] sampled[2] tdc_sample0
-     tdc_sample1 tdc_sample2 tdc_stage0 tdc_stage0__X tdc_stage1 tdc_stage1__X y)
+    (Ok
+     (_10_ _11_ _12_ gate hit node0 ring_inv1 ring_inv1__Y ring_inv2 ring_inv2__Y
+      ring_nand ring_nand__Y sampled[0] sampled[1] sampled[2] tdc_sample0
+      tdc_sample1 tdc_sample2 tdc_stage0 tdc_stage0__X tdc_stage1 tdc_stage1__X
+      y))
+    (Error
+     ("Sdc.dont_touch_list: not in the netlist"
+      ("instance ring_inv2" "net ring_inv2__Y")))
     |}]
 ;;
 
@@ -207,13 +220,14 @@ let%expect_test "check: resized, missing or extra cells" =
       (Sdc.check
          (island ())
          ~passive:(String.equal "sg13cmos5l_antennanp")
-         ~library:(force lib)
+         ~library:(force tlib)
          (Netlist.of_string with_diode)
        : string list)];
   [%expect {|
     instance ring_inv2 is sg13cmos5l_inv_2, expected sg13cmos5l_inv_1
     instance tdc_stage1 is sg13cmos5l_dlygate4sd1_1, expected sg13cmos5l_buf_1
     missing instance tdc_stage1 (sg13cmos5l_buf_1)
+    net tdc_stage0__X has an extra load _99_/A (sg13cmos5l_buf_1)
     net ring_inv1__Y has an extra load _98_/A (sg13cmos5l_inv_1)
     net ring_inv1__Y has an extra load ANTENNA_1/A (sg13cmos5l_antennanp)
     ()
@@ -238,12 +252,20 @@ let%expect_test "check: buffers" =
        ~to_:"sg13cmos5l_buf_1 _97_ (.A(en), .X(_4_));\n  sg13cmos5l_nand2_1 ring_nand (.A(_4_)");
   (* ... but not from another source *)
   check (edit ~from:"ring_nand (.A(en)" ~to_:"ring_nand (.A(x)");
+  (* a load on node 0, which otherwise only drives an output; the output lost *)
+  check
+    (edit
+       ~from:"  sg13cmos5l_tiehi _13_"
+       ~to_:"  sg13cmos5l_inv_1 _98_ (.A(ring_nand__Y), .Y(_3_));\n  sg13cmos5l_tiehi _13_");
+  check (edit ~from:"  assign node0 = ring_nand__Y;\n" ~to_:"");
   [%expect {|
     net ring_inv1__Y is split: ring_inv1/Y on ring_inv1__Y; ring_inv2/A on _4_
-    kept register tdc_sample0: D is not on net _4_
+    kept register tdc_sample0: D is on hit, expected _4_
     net hit is named _4_ in the netlist: the dont-touch names do not match it
     ok
-    net en: island loads are driven from x, not from en
+    ring_nand/A is driven from x, not from en
+    net node0 has an extra load _98_/A (sg13cmos5l_inv_1)
+    net node0 no longer drives output node0
     |}]
 ;;
 
@@ -257,13 +279,28 @@ let%expect_test "check: names, registers and constants" =
        ~to_:"sg13cmos5l_buf_1 _11_ (.A(tdc_stage0__X), .X(tdc_sample1))");
   (* sampling the wrong tap *)
   check (edit ~from:".D(tdc_stage0__X)" ~to_:".D(tdc_stage1__X)");
+  (* the sampling flop: D and clock swapped, another clock, held in reset *)
+  check
+    (edit
+       ~from:".CLK(clk), .D(tdc_stage0__X)"
+       ~to_:".CLK(tdc_stage0__X), .D(clk)");
+  check (edit ~from:"_11_ (.CLK(clk)" ~to_:"_11_ (.CLK(x)");
+  check (edit ~from:".RESET_B(_1_), .Q(tdc_sample1)" ~to_:".RESET_B(1'b0), .Q(tdc_sample1)");
   (* the constant input: a literal is fine, the wrong value is not *)
   check (edit ~from:".B(_2_)" ~to_:".B(1'b1)");
   check (edit ~from:".B(_2_)" ~to_:".B(1'b0)");
   [%expect {|
     net ring_inv1__Y is named _5_ in the netlist: the dont-touch names do not match it
     kept register tdc_sample1 is driven by _11_ (sg13cmos5l_buf_1), not a flop
-    kept register tdc_sample1: D is not on net tdc_stage0__X
+    net sampled[1] no longer drives output sampled[1]
+    net tdc_stage0__X has an extra load _11_/A (sg13cmos5l_buf_1)
+    kept register tdc_sample1: D is on tdc_stage1__X, expected tdc_stage0__X
+    net tdc_stage1__X has an extra load _11_/D (sg13cmos5l_dfrbpq_1)
+    kept register tdc_sample1: D is on clk, expected tdc_stage0__X
+    kept register tdc_sample1 clock is driven from tdc_stage0__X, not from clk
+    net tdc_stage0__X has an extra load _11_/CLK (sg13cmos5l_dfrbpq_1)
+    kept register tdc_sample1 clock is driven from x, not from clk
+    kept register tdc_sample1: flop _11_ is held in reset
     ok
     gate/B should be constant 1, is on 1'b0
     |}]
@@ -271,18 +308,53 @@ let%expect_test "check: names, registers and constants" =
 
 let%expect_test "check: prefix" =
   let t = one_buffer ~prefix:"u_island." in
-  let run text =
-    match Sdc.check t ~library:(force lib) (Netlist.of_string text) with
+  let run ?boundary text =
+    match Sdc.check t ?boundary ~library:(force tlib) (Netlist.of_string text) with
     | [] -> print_endline "ok"
     | errors -> List.iter errors ~f:print_endline
   in
+  (* flattening renamed the island's input [i] to the parent's [i] *)
   run
+    ~boundary:[ "i", "i" ]
     {|module top(i, o); input i; output o; wire \u_island.b__X ;
       sg13cmos5l_buf_1 \u_island.b  (.A(i), .X(\u_island.b__X ));
       assign o = \u_island.b__X ; endmodule|};
   run "module top(i, o); input i; output o; sg13cmos5l_buf_1 b (.A(i), .X(o)); endmodule";
+  (* flattening dropped the island's input name: unverifiable unless mapped *)
+  let moved =
+    {|module top(i, x, o); input i; input x; output o; wire \u_island.b__X ;
+      sg13cmos5l_buf_1 \u_island.b  (.A(x), .X(\u_island.b__X ));
+      assign o = \u_island.b__X ; endmodule|}
+  in
+  run moved;
+  run ~boundary:[ "i", "i" ] moved;
   [%expect {|
     ok
     missing instance u_island.b (sg13cmos5l_buf_1)
+    u_island.b/A: cannot verify its source, none of u_island.i survives (pass ~boundary)
+    u_island.b/A is driven from x, not from i
+    |}]
+;;
+
+let%expect_test "netlist: a vector bit and an escaped scalar of the same name are refused" =
+  (match Netlist.of_string "module m(a); input [1:0] a; wire \\a[0] ; endmodule" with
+   | _ -> print_endline "accepted"
+   | exception Netlist.Parse_error e -> print_endline e);
+  [%expect {| module m declares both vector a and scalar a[0] |}]
+;;
+
+let%expect_test "sdc: names that would break SDC are refused" =
+  let t = island () in
+  (match
+     Sdc.clock t ~name:"aux[0]" ~source:{ instance = "ring_nand"; pin = "Y" } ~period_ns:1. ~group:"g" ()
+   with
+   | _ -> print_endline "accepted"
+   | exception e -> print_s [%sexp (e : exn)]);
+  (match Sdc.sdc t ~stage:Signoff ~system_clock:"clk two" with
+   | _ -> print_endline "accepted"
+   | exception e -> print_s [%sexp (e : exn)]);
+  [%expect {|
+    ("Sdc.clock: names are [A-Za-z0-9_.]+" aux[0])
+    ("Sdc: name not usable in SDC" "clk two")
     |}]
 ;;

@@ -2,7 +2,10 @@
     -noexpr]) and OpenROAD ([write_verilog]): one flat module of cell
     instances with named port connections, wire declarations and [assign]
     aliases. Enough to re-extract hand-instantiated cells after synthesis or
-    place-and-route ({!Sdc.check}); behavioural Verilog is rejected. *)
+    place-and-route ({!Sdc.check}); behavioural Verilog is rejected.
+
+    Bit [i] of a vector [a] and an escaped scalar [\a[i] ] (or [\a\[i\] ])
+    are the same net, [a[i]]: synthesis splits buses into such scalars. *)
 
 open! Base
 
@@ -48,7 +51,14 @@ let tokenize s =
         while !j < n && not (Char.is_whitespace s.[!j]) do
           Int.incr j
         done;
-        Queue.enqueue toks (Id (String.sub s ~pos:(i + 1) ~len:(!j - i - 1)));
+        (* OpenSTA escapes bus brackets inside escaped names ([\a\[3\] ]); read
+           [a[3]] either way *)
+        let id = String.sub s ~pos:(i + 1) ~len:(!j - i - 1) in
+        let id =
+          String.substr_replace_all id ~pattern:"\\[" ~with_:"["
+          |> String.substr_replace_all ~pattern:"\\]" ~with_:"]"
+        in
+        Queue.enqueue toks (Id id);
         go !j)
       else if is_id_start c
       then (
@@ -382,6 +392,15 @@ let parse_modules text =
       | t -> fail "unexpected %s in module %s" (describe t) m.name
     in
     items ();
+    (* an escaped scalar [\a[i] ] would be read as bit [i] of a vector [a] *)
+    Hashtbl.iteri m.widths ~f:(fun ~key ~data ->
+      match data, String.lsplit2 key ~on:'[' with
+      | [], Some (base, idx) ->
+        (match Hashtbl.find m.widths base, Int.of_string_opt (String.chop_suffix_if_exists idx ~suffix:"]") with
+         | Some (_ :: _ as ix), Some i when List.mem ix i ~equal:Int.equal ->
+           fail "module %s declares both vector %s and scalar %s" m.name base key
+         | _ -> ())
+      | _ -> ());
     m.assigns <- List.rev m.assigns;
     m.insts <- List.rev m.insts;
     m

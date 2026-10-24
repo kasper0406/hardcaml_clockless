@@ -127,8 +127,8 @@ let () =
     Stdio.print_string (Sdc.sdc sdc ~stage:Pnr ~system_clock:"clk");
     Stdio.print_string (Sdc.sdc sdc ~stage:Signoff ~system_clock:"clk")
   | [| _; liberty; "check"; netlist |] ->
-    let library = Cell_library.load liberty in
-    let _, sdc = constraints library in
+    let library = Timing_library.load liberty in
+    let _, sdc = constraints library.library in
     let nl = Netlist.load netlist in
     (match Sdc.check sdc ~library nl with
      | [] ->
@@ -138,7 +138,7 @@ let () =
          (List.length (Sdc.protected_nets sdc));
        Stdio.printf
          "RSZ_DONT_TOUCH_LIST resolved from the netlist: %d names\n"
-         (List.length (Sdc.dont_touch_list sdc ~library nl))
+         (List.length (Or_error.ok_exn (Sdc.dont_touch_list sdc ~library nl)))
      | errors ->
        List.iter errors ~f:Stdio.print_endline;
        Stdio.printf "%d violations\n" (List.length errors);
