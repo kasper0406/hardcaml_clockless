@@ -75,7 +75,9 @@
     uniformly random 0/1 after a delay drawn from an exponential with mean
     [Config.tau], so Q is X from edge + clk->Q to resolution + clk->Q.
     Transitions before their aperture are captured, later ones are not (the
-    decision waits until the latest hold time has passed). Every metastable
+    decision waits until the latest hold time has passed; a resolution that
+    would fall before that decision is clamped to it, so simulation time
+    never runs backwards). Every metastable
     capture is logged ({!metastable_events}). This is deliberately
     pessimistic: any aperture violation goes metastable. Recovery/removal and
     minimum pulse width are not checked.

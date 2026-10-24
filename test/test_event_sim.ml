@@ -531,6 +531,28 @@ let%expect_test "flop setup/hold: X only inside the liberty aperture" =
     |}]
 ;;
 
+let%expect_test "metastability with positive hold: time never runs backwards" =
+  (* Slow clock: a falling D lands in the aperture after the edge (about
+     64-111 ps), so the capture decision is deferred to edge + hold. A
+     resolution drawn shorter than that must not be scheduled in the past
+     ([push] raises if it is). Even cycles load a clean 1 first. *)
+  let n = 400 in
+  let deltas = List.init n ~f:(fun k -> if k % 2 = 0 then Sim.of_ps (-500.) else Sim.of_ps 90.) in
+  let results = run_flop ~d_slew:0.02 ~clk_slew:1.0 deltas in
+  let metas = List.filter_map results ~f:(fun (_, _, m, _, _, _) -> m) in
+  let early =
+    List.count metas ~f:(fun m -> m.resolve_time < m.edge_time + Sim.of_ps 90.)
+  in
+  let backwards =
+    List.count results ~f:(fun (_, _, _, _, _, qs) ->
+      let times = List.map qs ~f:fst in
+      not (List.equal Int.equal times (List.sort times ~compare:Int.compare)))
+  in
+  printf "metastable captures: %d of %d; resolved before the D transition: %d; Q times out of order: %d\n"
+    (List.length metas) (n / 2) early backwards;
+  [%expect {| metastable captures: 200 of 200; resolved before the D transition: 0; Q times out of order: 0 |}]
+;;
+
 let%expect_test "metastability: resolution times exponential with tau, values fair" =
   let ol = force olib in
   let n = 4000 in
