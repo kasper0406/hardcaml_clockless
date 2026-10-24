@@ -346,18 +346,34 @@ let%expect_test "cells mode: hand-placed loop, loop-break pin, counters on ring 
         wire [1:0] signal_wire_3;
         wire [3:0] ring_count_a;
         wire signal_inst;
+        (* stable_name=1 *)
+        wire ring_mux0__X;
         wire signal_wire_4;
-        wire signal_wire_5;
         wire signal_inst_1;
+        (* stable_name=1 *)
         wire ring_node0;
+        (* stable_name=1 *)
+        wire ring_nand__Y;
         wire signal_inst_2;
+        (* stable_name=1 *)
         wire ring_node1;
+        (* stable_name=1 *)
+        wire ring_inv1__Y;
         wire signal_inst_3;
+        (* stable_name=1 *)
         wire ring_node2;
+        (* stable_name=1 *)
+        wire ring_inv2__Y;
         wire signal_inst_4;
+        (* stable_name=1 *)
         wire ring_node3;
+        (* stable_name=1 *)
+        wire ring_inv3__Y;
         wire signal_inst_5;
+        (* stable_name=1 *)
         wire ring_node4;
+        (* stable_name=1 *)
+        wire ring_inv4__Y;
         wire [4:0] signal_cat_10;
         assign signal_const = 1'b0;
         assign signal_select = signal_mux[0:0];
@@ -475,13 +491,13 @@ let%expect_test "cells mode: hand-placed loop, loop-break pin, counters on ring 
               .A0(ring_node2),
               .A1(ring_node4),
               .X(signal_inst) );
-        assign signal_wire_4 = signal_inst;
-        assign signal_wire_5 = signal_wire_4;
+        assign ring_mux0__X = signal_inst;
+        assign signal_wire_4 = ring_mux0__X;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_nand2_1
             ring_nand
             ( .A(enable),
-              .B(signal_wire_5),
+              .B(signal_wire_4),
               .Y(signal_inst_1) );
         assign ring_node0 = signal_inst_1;
         (* keep=1,dont_touch=1 *)
@@ -513,6 +529,11 @@ let%expect_test "cells mode: hand-placed loop, loop-break pin, counters on ring 
                                  ring_node2,
                                  ring_node1,
                                  ring_node0 };
+        assign ring_nand__Y = ring_node0;
+        assign ring_inv1__Y = ring_node1;
+        assign ring_inv2__Y = ring_node2;
+        assign ring_inv3__Y = ring_node3;
+        assign ring_inv4__Y = ring_node4;
         assign nodes = signal_cat_10;
         assign count_a = ring_count_a;
         assign count_b = ring_count_b;
