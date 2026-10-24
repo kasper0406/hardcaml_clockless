@@ -1,0 +1,5 @@
+(executable
+ (name ring_bench)
+ (libraries hardcaml_clockless hardcaml stdio unix)
+ (preprocess
+  (pps ppx_jane ppx_hardcaml)))

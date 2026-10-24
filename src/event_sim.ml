@@ -542,8 +542,10 @@ and eval_word t w =
 and eval_reg t r =
   let v n = t.value.(n) in
   let c = v r.r_clock in
+  (* last known clock level; X at power-up, so the first resolution of the
+     clock net is not an edge *)
   let c_old = r.r_prev_clock in
-  r.r_prev_clock <- c;
+  if c <> vx then r.r_prev_clock <- c;
   let set_bits f =
     Array.iteri r.r_state ~f:(fun i q ->
       let nv = f i q in
@@ -594,7 +596,7 @@ and eval_reg t r =
     then (
       let f = next () in
       set_bits f)
-    else if c <> c_old && (c = vx || c_old = vx)
+    else if c = vx && c_old = active_old
     then (
       let f = next () in
       set_bits (fun i q -> merge q (f i q)))
@@ -606,7 +608,7 @@ and eval_cell t c ~trig =
   done;
   (match c.seq with
    | None -> ()
-   | Some s -> update_seq t c s ~trig);
+   | Some s -> update_seq t c s);
   eval_cell_outputs t c ~trig ~base:t.now
 
 and eval_cell_outputs t c ~trig ~base =
@@ -629,11 +631,12 @@ and eval_cell_outputs t c ~trig ~base =
       let d, slew = cell_delay t c ~o ~trig ~value in
       schedule t drv ~time:(base + d) ~value ~slew))
 
-and update_seq t c s ~trig =
+and update_seq t c s =
   let vals = c.vals in
   let tr = s.trigger_fn vals in
+  (* last known level, as for registers *)
   let tr_old = s.prev_trigger in
-  s.prev_trigger <- tr;
+  if tr <> vx then s.prev_trigger <- tr;
   let clr = Option.value_map s.clear_fn ~default:0 ~f:(fun f -> f vals) in
   let pre = Option.value_map s.preset_fn ~default:0 ~f:(fun f -> f vals) in
   let set_iq v =
@@ -661,12 +664,12 @@ and update_seq t c s ~trig =
     then set_iq (s.data_fn vals)
     else if tr_old = 1 && tr = 0
     then capture t c s ~edge_time:t.now
-    else if tr = vx || (tr_old = vx && tr <> tr_old)
+    else if tr = vx
     then (if s.data_fn vals <> s.iq then set_iq vx)
     else ()
   else if tr_old = 0 && tr = 1
   then capture t c s ~edge_time:t.now
-  else if tr <> tr_old && (tr = vx || tr_old = vx) && trig >= 0
+  else if tr = vx && tr_old = 0
   then if s.data_fn vals <> s.iq then set_iq vx
 ;;
 
@@ -858,7 +861,11 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
     driven.(n) <- who;
     { d_net = n; transport; pending = [] }
   in
-  let what s = Sexp.to_string_hum (Signal.sexp_of_t s) in
+  let what s =
+    match Signal.names s with
+    | [] -> "uid " ^ Signal.Type.Uid.to_string (Signal.uid s)
+    | names -> String.concat ~sep:"," names
+  in
   let elements = Queue.create () in
   let consts = Queue.create () in
   let regs_init = Queue.create () in
