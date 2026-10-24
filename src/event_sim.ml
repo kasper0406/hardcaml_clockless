@@ -71,6 +71,26 @@ module Config = struct
     | Init_zero
   [@@deriving sexp_of]
 
+  type wire_load =
+    | Flat
+    | Per_fanout of float
+    | Liberty_default
+    | Liberty_named of string
+    | Liberty_by_area of float option
+  [@@deriving sexp_of]
+
+  type untimed_logic =
+    | Allow
+    | Warn
+    | Fail
+  [@@deriving sexp_of]
+
+  type check =
+    | Ignore
+    | Log
+    | Log_and_metastable
+  [@@deriving sexp_of]
+
   type t =
     { delay_mode : delay_mode
     ; pulse_mode : pulse_mode
@@ -79,11 +99,22 @@ module Config = struct
     ; variation_sigma : float
     ; seed : int
     ; wire_cap : float
+    ; wire_load : wire_load
+    ; prim_input_cap : float
     ; input_slew : float
     ; prim_delay : int
     ; reg_clock_to_q : int
+    ; untimed_logic : untimed_logic
     ; metastability : bool
     ; tau : float
+    ; tau_scales_with_corner : bool
+    ; pulse_width_check : check
+    ; min_pulse_width : float option
+    ; recovery_removal_check : check
+    ; clock_insertion : float
+    ; clock_skew_sigma : float
+    ; factor_overrides : (string * float) list
+    ; clock_delay_overrides : (string * float) list
     ; flop_init : init
     ; reg_init : init
     }
@@ -97,11 +128,22 @@ module Config = struct
     ; variation_sigma = 0.
     ; seed = 0
     ; wire_cap = 0.001
+    ; wire_load = Flat
+    ; prim_input_cap = 0.
     ; input_slew = 0.05
     ; prim_delay = 0
     ; reg_clock_to_q = 0
+    ; untimed_logic = Allow
     ; metastability = true
     ; tau = 0.030
+    ; tau_scales_with_corner = false
+    ; pulse_width_check = Ignore
+    ; min_pulse_width = None
+    ; recovery_removal_check = Ignore
+    ; clock_insertion = 0.
+    ; clock_skew_sigma = 0.
+    ; factor_overrides = []
+    ; clock_delay_overrides = []
     ; flop_init = Init_x
     ; reg_init = Init_zero
     }
@@ -138,9 +180,13 @@ type seq_state =
   ; clock_pin : int (* input index used for clock -> output arcs and constraints *)
   ; data_pins : (int * Timing_library.Arc.t list * Timing_library.Arc.t list) list
     (* input index, setup arcs, hold arcs *)
+  ; async_pins : (int * Timing_library.Arc.t list * Timing_library.Arc.t list) list
+    (* input index, recovery arcs, removal arcs *)
   ; mutable iq : int
   ; mutable prev_trigger : int
   ; mutable gen : int
+  ; mutable last_edge : int (* time of the last active trigger edge; min_int: none *)
+  ; mutable last_edge_slew : float
   }
 
 type cell_inst =
@@ -156,6 +202,7 @@ type cell_inst =
   ; vals : int array (* inputs, then state, state_n *)
   ; factor : float
   ; seq : seq_state option
+  ; pulse_widths : Timing_library.Pulse_width.t option array (* [input] *)
   }
 
 type word_op =
@@ -163,6 +210,7 @@ type word_op =
   ; w_outputs : driver array
   ; w_eval : int array -> int array
   ; w_buf : int array
+  ; w_desc : string * string (* kind, signal *)
   }
 
 type reg_inst =
@@ -175,12 +223,23 @@ type reg_inst =
   ; r_state : int array
   ; r_drivers : driver array
   ; mutable r_prev_clock : int
+  ; r_desc : string
+  }
+
+(* Clock insertion delay in front of a flop/latch trigger pin: the pin reads
+   [dl_out]'s net, a transport-delayed copy of [dl_src]. *)
+type delay_el =
+  { dl_src : int
+  ; dl_out : driver
+  ; dl_delay : int
+  ; dl_pin_cap : float (* charged to [dl_src] *)
   }
 
 type element =
   | Cell_e of cell_inst
   | Word_e of word_op
   | Reg_e of reg_inst
+  | Delay_e of delay_el
 
 module Metastable_event = struct
   type t =
@@ -188,6 +247,38 @@ module Metastable_event = struct
     ; edge_time : int
     ; resolve_time : int
     ; resolved_to : Value.t
+    }
+  [@@deriving sexp_of]
+end
+
+module Timing_violation = struct
+  type kind =
+    | Pulse_width of
+        { level : Value.t
+        ; width : int
+        ; min_width : int
+        }
+    | Recovery_removal of
+        { edge_time : int
+        ; window : int * int
+        }
+  [@@deriving sexp_of]
+
+  type t =
+    { instance : string
+    ; pin : string
+    ; time : int
+    ; kind : kind
+    }
+  [@@deriving sexp_of]
+end
+
+module Untimed = struct
+  type t =
+    { element : string
+    ; signal : string
+    ; from_cell : string option
+    ; to_cell : string option
     }
   [@@deriving sexp_of]
 end
@@ -239,6 +330,9 @@ type t =
   ; mutable events_processed : int
   ; mutable same_instant : int
   ; mutable metastable : Metastable_event.t list
+  ; mutable violations : Timing_violation.t list
+  ; untimed : Untimed.t list
+  ; clock_delays : (string * int) list
   ; mutable trace : (int * int * int) list option (* time, net, value; newest first *)
   }
 
@@ -423,13 +517,37 @@ let aperture t c (setup, hold) ~clock_slew ~value ~d_slew =
   of_ns (-.s *. f), of_ns (h *. f)
 ;;
 
-let rec capture t c s ~edge_time =
-  let liberty =
-    match t.config.delay_mode with
-    | Liberty -> true
-    | Zero | Unit _ -> false
+let liberty_mode t =
+  match t.config.delay_mode with
+  | Liberty -> true
+  | Zero | Unit _ -> false
+;;
+
+(* The state goes X and resolves to a uniformly random value an
+   exponentially distributed time after [edge_time]. *)
+let go_metastable t c s ~edge_time =
+  s.gen <- s.gen + 1;
+  s.iq <- vx;
+  let tau =
+    if t.config.tau_scales_with_corner
+    then t.config.tau *. t.config.corner *. c.factor
+    else t.config.tau
   in
-  if (not t.config.metastability) || (not liberty) || List.is_empty s.data_pins
+  let u = Random.State.float t.meta_rng 1.0 in
+  let dt = of_ns (-.tau *. Float.log (1. -. u)) in
+  let resolved = Random.State.int t.meta_rng 2 in
+  (* A decision deferred past a positive hold window is taken at [t.now],
+     which can be later than [edge_time + dt]; resolution cannot happen
+     before the decision, so it is clamped (and Q follows from there). *)
+  let resolve_time = Int.max t.now (edge_time + dt) in
+  t.metastable
+  <- { instance = c.inst_name; edge_time; resolve_time; resolved_to = Value.of_int resolved }
+     :: t.metastable;
+  ignore (push t ~time:resolve_time (Resolve (c, s.gen, resolved)) : int)
+;;
+
+let rec capture t c s ~edge_time =
+  if (not t.config.metastability) || (not (liberty_mode t)) || List.is_empty s.data_pins
   then (
     s.gen <- s.gen + 1;
     s.iq <- s.data_fn c.vals)
@@ -487,26 +605,147 @@ and decide_capture t c s ~edge_time ~clock_slew =
     c.vals.(i) <- !captured);
   let next = s.data_fn c.vals in
   Array.blit ~src:saved ~src_pos:0 ~dst:c.vals ~dst_pos:0 ~len:n;
-  s.gen <- s.gen + 1;
   if !violation
-  then (
-    s.iq <- vx;
-    let u = Random.State.float t.meta_rng 1.0 in
-    let dt = of_ns (-.t.config.tau *. Float.log (1. -. u)) in
-    let resolved = Random.State.int t.meta_rng 2 in
-    (* A decision deferred past a positive hold window is taken at [t.now],
-       which can be later than [edge_time + dt]; resolution cannot happen
-       before the decision, so it is clamped (and Q follows from there). *)
-    let resolve_time = Int.max t.now (edge_time + dt) in
-    t.metastable
-    <- { instance = c.inst_name
-       ; edge_time
-       ; resolve_time
-       ; resolved_to = Value.of_int resolved
-       }
-       :: t.metastable;
-    ignore (push t ~time:resolve_time (Resolve (c, s.gen, resolved)) : int))
-  else s.iq <- next
+  then go_metastable t c s ~edge_time
+  else (
+    s.gen <- s.gen + 1;
+    s.iq <- next)
+;;
+
+(* --- Pulse width and recovery/removal checks ------------------------------ *)
+
+let log_violation t c ~pin ~time kind =
+  t.violations
+  <- { Timing_violation.instance = c.inst_name; pin = c.in_pins.(pin); time; kind } :: t.violations
+;;
+
+(* Input [i] of [c] just changed: was the pulse it ends too short? A pulse
+   counts only if it began with a 0/1 transition (not a net leaving its
+   power-up X). The minimum is looked up at the slew of the leading edge. *)
+let check_pulse_width t c i =
+  match c.pulse_widths.(i) with
+  | None -> false
+  | Some (pw : Timing_library.Pulse_width.t) ->
+    let net = c.in_nets.(i) in
+    let cnt = t.hist_count.(net) in
+    let at k = (net * hist_depth) + (k % hist_depth) in
+    if cnt < 3
+    then false
+    else (
+      let cur = at (cnt - 1)
+      and lead = at (cnt - 2)
+      and before = at (cnt - 3) in
+      let level = t.hist_value.(lead) in
+      if t.hist_time.(cur) <> t.now
+         || level = vx
+         || t.hist_value.(cur) = vx
+         || t.hist_value.(before) = vx
+      then false
+      else (
+        match if level = 1 then pw.high else pw.low with
+        | None -> false
+        | Some tbl ->
+          let f = t.config.corner *. c.factor in
+          let min_width =
+            of_ns (Timing_library.Pulse_width.lookup tbl ~slew:t.hist_slew.(lead) *. f)
+          in
+          let width = t.now - t.hist_time.(lead) in
+          if width < min_width
+          then (
+            log_violation
+              t
+              c
+              ~pin:i
+              ~time:t.now
+              (Pulse_width { level = Value.of_int level; width; min_width });
+            true)
+          else false))
+;;
+
+(* (edge - recovery, edge + removal) for a transition of an asynchronous pin,
+   relative to the edge, as the setup/hold aperture. *)
+let recovery_window t c arcs ~value ~slew ~clock_slew =
+  let lo, hi = aperture t c arcs ~clock_slew ~value ~d_slew:slew in
+  if lo < hi then lo, hi else (lo + hi) / 2, (lo + hi) / 2
+;;
+
+(* At an active edge: asynchronous-pin transitions up to now that fall in
+   their window. *)
+let check_recovery_at_edge t c s =
+  let edge_time = t.now in
+  List.fold s.async_pins ~init:false ~f:(fun acc (i, recovery, removal) ->
+    let net = c.in_nets.(i) in
+    let cnt = t.hist_count.(net) in
+    let hit = ref acc in
+    for k = Int.max 0 (cnt - hist_depth) to cnt - 1 do
+      let idx = (net * hist_depth) + (k % hist_depth) in
+      let td = t.hist_time.(idx) - edge_time in
+      let window =
+        recovery_window
+          t
+          c
+          (recovery, removal)
+          ~value:t.hist_value.(idx)
+          ~slew:t.hist_slew.(idx)
+          ~clock_slew:s.last_edge_slew
+      in
+      if td > fst window && td < snd window
+      then (
+        log_violation t c ~pin:i ~time:t.hist_time.(idx) (Recovery_removal { edge_time; window });
+        hit := true)
+    done;
+    !hit)
+;;
+
+(* Asynchronous pin [i] just changed: is it inside the window of the last
+   active edge? (Transitions processed before that edge was are checked by
+   [check_recovery_at_edge].) *)
+let check_recovery_after_edge t c s i arcs =
+  if s.last_edge = Int.min_value
+  then false
+  else (
+    let net = c.in_nets.(i) in
+    let td = t.now - s.last_edge in
+    let window =
+      recovery_window t c arcs ~value:t.value.(net) ~slew:t.slew.(net) ~clock_slew:s.last_edge_slew
+    in
+    if td > fst window && td < snd window
+    then (
+      log_violation t c ~pin:i ~time:t.now (Recovery_removal { edge_time = s.last_edge; window });
+      true)
+    else false)
+;;
+
+let run_checks t c ~trig ~edge =
+  let metastable_on = function
+    | Config.Log_and_metastable -> true
+    | Ignore | Log -> false
+  in
+  let pw =
+    match t.config.pulse_width_check with
+    | Ignore -> false
+    | Log | Log_and_metastable -> trig >= 0 && check_pulse_width t c trig
+  in
+  let rr =
+    match t.config.recovery_removal_check, c.seq with
+    | Ignore, _ | _, None -> false
+    | (Log | Log_and_metastable), Some s ->
+      let at_edge = edge && check_recovery_at_edge t c s in
+      let after =
+        trig >= 0
+        &&
+        match List.find s.async_pins ~f:(fun (i, _, _) -> i = trig) with
+        | Some (i, recovery, removal) -> check_recovery_after_edge t c s i (recovery, removal)
+        | None -> false
+      in
+      at_edge || after
+  in
+  match c.seq with
+  | Some s
+    when (pw && metastable_on t.config.pulse_width_check)
+         || (rr && metastable_on t.config.recovery_removal_check) ->
+    go_metastable t c s ~edge_time:t.now
+  | _ -> ()
 ;;
 
 let rec set_net t net value slew =
@@ -526,6 +765,8 @@ and eval t e ~trig =
   | Word_e w -> eval_word t w
   | Reg_e r -> eval_reg t r
   | Cell_e c -> eval_cell t c ~trig
+  | Delay_e d ->
+    schedule t d.dl_out ~time:(t.now + d.dl_delay) ~value:t.value.(d.dl_src) ~slew:t.slew.(d.dl_src)
 
 and eval_word t w =
   Array.iteri w.w_inputs ~f:(fun i n -> w.w_buf.(i) <- t.value.(n));
@@ -600,9 +841,12 @@ and eval_cell t c ~trig =
   for i = 0 to n - 1 do
     c.vals.(i) <- t.value.(c.in_nets.(i))
   done;
-  (match c.seq with
-   | None -> ()
-   | Some s -> update_seq t c s);
+  let edge =
+    match c.seq with
+    | None -> false
+    | Some s -> update_seq t c s
+  in
+  if liberty_mode t then run_checks t c ~trig ~edge;
   eval_cell_outputs t c ~trig ~base:t.now
 
 and eval_cell_outputs t c ~trig ~base =
@@ -625,19 +869,26 @@ and eval_cell_outputs t c ~trig ~base =
       let d, slew = cell_delay t c ~o ~trig ~value in
       schedule t drv ~time:(base + d) ~value ~slew))
 
+(* Returns whether this was an active trigger edge (rising clock, closing
+   latch enable), whether or not clear/preset let it act. *)
 and update_seq t c s =
   let vals = c.vals in
   let tr = s.trigger_fn vals in
   (* last known level, as for registers *)
   let tr_old = s.prev_trigger in
   if tr <> vx then s.prev_trigger <- tr;
+  let edge = if s.is_latch then tr_old = 1 && tr = 0 else tr_old = 0 && tr = 1 in
+  if edge
+  then (
+    s.last_edge <- t.now;
+    s.last_edge_slew <- t.slew.(c.in_nets.(s.clock_pin)));
   let clr = Option.value_map s.clear_fn ~default:0 ~f:(fun f -> f vals) in
   let pre = Option.value_map s.preset_fn ~default:0 ~f:(fun f -> f vals) in
   let set_iq v =
     s.gen <- s.gen + 1;
     s.iq <- v
   in
-  if clr = 1 && pre = 1
+  (if clr = 1 && pre = 1
   then
     set_iq
       (match s.spec.clear_preset_var1 with
@@ -664,7 +915,8 @@ and update_seq t c s =
   else if tr_old = 0 && tr = 1
   then capture t c s ~edge_time:t.now
   else if tr = vx && tr_old = 0
-  then if s.data_fn vals <> s.iq then set_iq vx
+  then if s.data_fn vals <> s.iq then set_iq vx);
+  edge
 ;;
 
 
@@ -872,6 +1124,11 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
     | [] -> "<unnamed>"
     | names -> String.concat ~sep:"," names
   in
+  let desc s =
+    match Signal.names s with
+    | [] -> Printf.sprintf "<unnamed %s>" (Sexp.to_string [%sexp (Signal.uid s : Signal.Type.Uid.t)])
+    | names -> String.concat ~sep:"," names
+  in
   let elements = Queue.create () in
   let consts = Queue.create () in
   let regs_init = Queue.create () in
@@ -899,6 +1156,7 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
            ; w_outputs = Array.map (nets s) ~f:(new_driver ~who:"not" ~transport:pulse_transport)
            ; w_eval = (fun a -> Array.init w ~f:(fun i -> v_not a.(i)))
            ; w_buf = Array.create ~len:w 0
+           ; w_desc = "not", desc s
            })
     | Op2 { op; arg_a; arg_b; _ } ->
       let wa = Signal.width arg_a
@@ -930,6 +1188,18 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
            ; w_outputs = Array.map (nets s) ~f:(new_driver ~who:"op2" ~transport:pulse_transport)
            ; w_eval = eval
            ; w_buf = Array.create ~len:(wa + wb) 0
+           ; w_desc =
+               ( (match op with
+                  | And -> "and"
+                  | Or -> "or"
+                  | Xor -> "xor"
+                  | Add -> "add"
+                  | Sub -> "sub"
+                  | Mulu -> "mulu"
+                  | Muls -> "muls"
+                  | Eq -> "eq"
+                  | Lt -> "lt")
+               , desc s )
            })
     | Mux { select; cases; _ } ->
       let ws = Signal.width select
@@ -956,6 +1226,7 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
            ; w_outputs = Array.map (nets s) ~f:(new_driver ~who:"mux" ~transport:pulse_transport)
            ; w_eval = eval
            ; w_buf = Array.create ~len:(Array.length inputs) 0
+           ; w_desc = "mux", desc s
            })
     | Cases { select; cases; default; _ } ->
       let ws = Signal.width select
@@ -991,6 +1262,7 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
            ; w_outputs = Array.map (nets s) ~f:(new_driver ~who:"cases" ~transport:pulse_transport)
            ; w_eval = eval
            ; w_buf = Array.create ~len:(Array.length inputs) 0
+           ; w_desc = "cases", desc s
            })
     | Reg { register; d; _ } ->
       let w = Signal.width s in
@@ -1023,6 +1295,7 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
         ; r_state = Array.copy init
         ; r_drivers = Array.map (nets s) ~f:(new_driver ~who:"reg" ~transport:true)
         ; r_prev_clock = vx
+        ; r_desc = desc s
         }
       in
       Queue.enqueue regs_init (r, init);
@@ -1124,6 +1397,24 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
               let hold = List.filter cs ~f:(fun a -> String.is_prefix a.timing_type ~prefix:"hold_") in
               if List.is_empty setup && List.is_empty hold then None else Some (i, setup, hold))
           in
+          let async_pins =
+            Array.to_list in_pins
+            |> List.filter_mapi ~f:(fun i p ->
+              let cs =
+                Timing_library.Cell.constraints tcell ~input:p
+                |> List.filter ~f:(fun (a : Timing_library.Arc.t) ->
+                  String.equal a.related_pin clock_name)
+              in
+              let recovery =
+                List.filter cs ~f:(fun a -> String.is_prefix a.timing_type ~prefix:"recovery_")
+              in
+              let removal =
+                List.filter cs ~f:(fun a -> String.is_prefix a.timing_type ~prefix:"removal_")
+              in
+              if List.is_empty recovery && List.is_empty removal
+              then None
+              else Some (i, recovery, removal))
+          in
           { spec = sq
           ; trigger_fn = compile trigger ~idx
           ; data_fn = compile data ~idx
@@ -1132,13 +1423,44 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
           ; is_latch
           ; clock_pin
           ; data_pins
+          ; async_pins
           ; iq =
               (match config.flop_init with
                | Init_x -> vx
                | Init_zero -> 0)
           ; prev_trigger = vx
           ; gen = 0
+          ; last_edge = Int.min_value
+          ; last_edge_slew = config.input_slew
           })
+      in
+      (* pins checked for minimum pulse width: those with Liberty data, else
+         (with [min_pulse_width]) the clock/enable, clear and preset pins *)
+      let pulse_widths =
+        let fallback =
+          match config.min_pulse_width, seq with
+          | Some w, Some s ->
+            let tbl = { Timing_library.Table.index_1 = [| 0. |]; index_2 = [| 0. |]; values = [| [| w |] |] } in
+            let trigger =
+              match s.spec.kind with
+              | Ff { clocked_on; _ } -> clocked_on
+              | Latch { enable; _ } -> enable
+            in
+            let vars =
+              List.concat_map
+                ((trigger :: Option.to_list s.spec.clear) @ Option.to_list s.spec.preset)
+                ~f:Bool_expr.vars
+            in
+            fun p ->
+              if List.mem vars p ~equal:String.equal
+              then Some { Timing_library.Pulse_width.high = Some tbl; low = Some tbl }
+              else None
+          | _ -> fun _ -> None
+        in
+        Array.map in_pins ~f:(fun p ->
+          match Timing_library.Cell.pulse_width tcell ~input:p with
+          | Some pw -> Some pw
+          | None -> fallback p)
       in
       let transport = pulse_transport || Option.is_some seq in
       let who = inst.instance_label in
@@ -1158,21 +1480,91 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
         ; vals = Array.create ~len:(n + 2) vx
         ; factor = 1.
         ; seq
+        ; pulse_widths
         });
   (* per-instance variation, drawn in instance-name order so it is stable *)
-  let cells =
-    Queue.to_list cells
-    |> List.sort ~compare:(fun a b -> String.compare a.inst_name b.inst_name)
-    |> List.map ~f:(fun c ->
-      if Float.( > ) config.variation_sigma 0.
-      then { c with factor = Float.max 0.05 (1. +. (config.variation_sigma *. gaussian var_rng)) }
-      else c)
+  let cells = Queue.to_list cells |> List.sort ~compare:(fun a b -> String.compare a.inst_name b.inst_name) in
+  let check_overrides what overrides ~among =
+    List.iter overrides ~f:(fun (name, x) ->
+      if not (List.exists among ~f:(fun c -> String.equal c.inst_name name))
+      then raise_s [%message "Event_sim: override for an unknown instance" what (name : string)];
+      if Float.( < ) x 0. then raise_s [%message "Event_sim: negative override" what (name : string) (x : float)])
   in
+  check_overrides "factor_overrides" config.factor_overrides ~among:cells;
+  let cells =
+    List.map cells ~f:(fun c ->
+      let drawn =
+        if Float.( > ) config.variation_sigma 0.
+        then Float.max 0.05 (1. +. (config.variation_sigma *. gaussian var_rng))
+        else 1.
+      in
+      { c with
+        factor =
+          List.Assoc.find config.factor_overrides c.inst_name ~equal:String.equal
+          |> Option.value ~default:drawn
+      })
+  in
+  (* clock insertion delay per flop/latch trigger pin, from its own random
+     stream (so the variation factors above do not depend on it); a pin with
+     a positive delay reads a private, transport-delayed copy of its net *)
+  let seq_cells = List.filter cells ~f:(fun c -> Option.is_some c.seq) in
+  check_overrides "clock_delay_overrides" config.clock_delay_overrides ~among:seq_cells;
+  let skew_rng = Random.State.make [| config.seed; 3 |] in
+  let next_net = ref num_nets in
+  let clock_delays, delay_els =
+    List.map seq_cells ~f:(fun c ->
+      let drawn =
+        if Float.( > ) config.clock_skew_sigma 0.
+        then config.clock_insertion +. (config.clock_skew_sigma *. gaussian skew_rng)
+        else config.clock_insertion
+      in
+      let d =
+        List.Assoc.find config.clock_delay_overrides c.inst_name ~equal:String.equal
+        |> Option.value ~default:(Float.max 0. drawn)
+        |> of_ns
+      in
+      let el =
+        if d <= 0
+        then None
+        else (
+          let s = Option.value_exn c.seq in
+          let src = c.in_nets.(s.clock_pin) in
+          let n' = !next_net in
+          Int.incr next_net;
+          c.in_nets.(s.clock_pin) <- n';
+          Some
+            (Delay_e
+               { dl_src = src
+               ; dl_out = { d_net = n'; transport = true; pending = [] }
+               ; dl_delay = d
+               ; dl_pin_cap = Timing_library.Cell.pin_cap c.tcell c.in_pins.(s.clock_pin)
+               }))
+      in
+      (c.inst_name, d), el)
+    |> List.unzip
+  in
+  let pin_nets = num_nets in
+  let num_nets = !next_net in
   List.iter cells ~f:(fun c -> Queue.enqueue elements (Cell_e c));
+  List.iter (List.filter_opt delay_els) ~f:(Queue.enqueue elements);
   let elements = Queue.to_array elements in
-  (* fanout and load *)
+  let reg_inputs r =
+    Array.concat
+      ([ [| r.r_clock |]; r.r_d ]
+       @ Option.value_map r.r_enable ~default:[] ~f:(fun e -> [ [| e |] ])
+       @ Option.value_map r.r_clear ~default:[] ~f:(fun (c, ct) -> [ [| c |]; ct ])
+       @ Option.value_map r.r_reset ~default:[] ~f:(fun (c, _, rt) -> [ [| c |]; rt ]))
+  in
+  (* fanout (for scheduling, one entry per Hardcaml element) and load: pin
+     capacitances plus the wire model at the net's pin count; a clock pin
+     behind an insertion delay loads the original net *)
   let fanout = Array.create ~len:num_nets [] in
-  let load = Array.create ~len:num_nets config.wire_cap in
+  let pins = Array.create ~len:num_nets 0 in
+  let pin_cap = Array.create ~len:num_nets 0. in
+  let add_pin n cap =
+    pins.(n) <- pins.(n) + 1;
+    pin_cap.(n) <- pin_cap.(n) +. cap
+  in
   Array.iteri elements ~f:(fun e el ->
     let add_unique ns =
       Array.to_list ns
@@ -1183,16 +1575,115 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
     | Cell_e c ->
       Array.iteri c.in_nets ~f:(fun i n ->
         fanout.(n) <- (e, i) :: fanout.(n);
-        load.(n) <- load.(n) +. Timing_library.Cell.pin_cap c.tcell c.in_pins.(i))
-    | Word_e w -> add_unique w.w_inputs
+        if n < pin_nets then add_pin n (Timing_library.Cell.pin_cap c.tcell c.in_pins.(i)))
+    | Word_e w ->
+      add_unique w.w_inputs;
+      Array.iter w.w_inputs ~f:(fun n -> add_pin n config.prim_input_cap)
     | Reg_e r ->
-      add_unique
-        (Array.concat
-           ([ [| r.r_clock |]; r.r_d ]
-            @ Option.value_map r.r_enable ~default:[] ~f:(fun e -> [ [| e |] ])
-            @ Option.value_map r.r_clear ~default:[] ~f:(fun (c, ct) -> [ [| c |]; ct ])
-            @ Option.value_map r.r_reset ~default:[] ~f:(fun (c, _, rt) -> [ [| c |]; rt ]))));
+      let ins = reg_inputs r in
+      add_unique ins;
+      Array.iter ins ~f:(fun n -> add_pin n config.prim_input_cap)
+    | Delay_e d ->
+      fanout.(d.dl_src) <- (e, -1) :: fanout.(d.dl_src);
+      add_pin d.dl_src d.dl_pin_cap);
   let fanout = Array.map fanout ~f:(fun l -> Array.of_list (List.rev l)) in
+  let wire =
+    let liberty (m : Timing_library.Wire_load.t) k = Timing_library.Wire_load.cap_pf m ~fanout:k in
+    match config.wire_load with
+    | Flat -> fun _ -> config.wire_cap
+    | Per_fanout c -> fun k -> config.wire_cap +. (c *. Float.of_int k)
+    | Liberty_default -> liberty (Timing_library.default_wire_load lib)
+    | Liberty_named name -> liberty (Timing_library.find_wire_load_exn lib name)
+    | Liberty_by_area area ->
+      let area =
+        match area with
+        | Some a -> a
+        | None -> List.sum (module Float) cells ~f:(fun c -> c.tcell.logic.area)
+      in
+      liberty (Timing_library.wire_load_for_area lib area)
+  in
+  let load = Array.init num_nets ~f:(fun n -> wire pins.(n) +. pin_cap.(n)) in
+  (* Hardcaml elements next to Liberty cells: forward from cell outputs and
+     backward from cell inputs through Hardcaml elements, remembering the
+     first cell (in instance-name order) that reaches each *)
+  let untimed =
+    let ne = Array.length elements in
+    let from_cell = Array.create ~len:ne None
+    and to_cell = Array.create ~len:ne None in
+    let driver_of = Array.create ~len:num_nets (-1) in
+    let outputs e =
+      match elements.(e) with
+      | Cell_e c -> Array.map c.out_drivers ~f:(fun d -> d.d_net)
+      | Word_e w -> Array.map w.w_outputs ~f:(fun d -> d.d_net)
+      | Reg_e r -> Array.map r.r_drivers ~f:(fun d -> d.d_net)
+      | Delay_e d -> [| d.dl_out.d_net |]
+    in
+    let inputs e =
+      match elements.(e) with
+      | Cell_e c -> c.in_nets
+      | Word_e w -> w.w_inputs
+      | Reg_e r -> reg_inputs r
+      | Delay_e d -> [| d.dl_src |]
+    in
+    for e = 0 to ne - 1 do
+      Array.iter (outputs e) ~f:(fun n -> driver_of.(n) <- e)
+    done;
+    let is_hardcaml e =
+      match elements.(e) with
+      | Word_e _ | Reg_e _ -> true
+      | Cell_e _ | Delay_e _ -> false
+    in
+    let fwd = Queue.create ()
+    and bwd = Queue.create () in
+    Array.iter elements ~f:(function
+      | Cell_e c ->
+        Array.iter c.out_drivers ~f:(fun d -> Queue.enqueue fwd (d.d_net, c.inst_name));
+        Array.iter c.in_nets ~f:(fun n -> Queue.enqueue bwd (n, c.inst_name))
+      | _ -> ());
+    while not (Queue.is_empty fwd) do
+      let n, cell = Queue.dequeue_exn fwd in
+      Array.iter fanout.(n) ~f:(fun (e, _) ->
+        if is_hardcaml e && Option.is_none from_cell.(e)
+        then (
+          from_cell.(e) <- Some cell;
+          Array.iter (outputs e) ~f:(fun n -> Queue.enqueue fwd (n, cell))))
+    done;
+    while not (Queue.is_empty bwd) do
+      let n, cell = Queue.dequeue_exn bwd in
+      let e = driver_of.(n) in
+      if e >= 0
+      then (
+        match elements.(e) with
+        | Delay_e d -> Queue.enqueue bwd (d.dl_src, cell)
+        | _ ->
+          if is_hardcaml e && Option.is_none to_cell.(e)
+          then (
+            to_cell.(e) <- Some cell;
+            Array.iter (inputs e) ~f:(fun n -> Queue.enqueue bwd (n, cell))))
+    done;
+    List.filter_map (List.init ne ~f:Fn.id) ~f:(fun e ->
+      if Option.is_none from_cell.(e) && Option.is_none to_cell.(e)
+      then None
+      else (
+        let element, signal =
+          match elements.(e) with
+          | Word_e w -> w.w_desc
+          | Reg_e r -> "reg", r.r_desc
+          | Cell_e _ | Delay_e _ -> assert false
+        in
+        Some { Untimed.element; signal; from_cell = from_cell.(e); to_cell = to_cell.(e) }))
+  in
+  (match config.delay_mode, config.untimed_logic, untimed with
+   | _, Allow, _ | (Zero | Unit _), _, _ | Liberty, _, [] -> ()
+   | Liberty, Warn, l ->
+     Stdio.eprintf
+       "Event_sim warning: %d Hardcaml primitives/registers next to Liberty cells are untimed (fixed \
+        delay, no Liberty load):\n"
+       (List.length l);
+     List.iter (List.take l 20) ~f:(fun u -> Stdio.eprintf "  %s\n" (Sexp.to_string [%sexp (u : Untimed.t)]))
+   | Liberty, Fail, l ->
+     unsupported
+       [%message "Hardcaml primitives/registers next to Liberty cells are untimed" ~_:(l : Untimed.t list)]);
   (* names *)
   let names = Hashtbl.create (module String) in
   let buses = Hashtbl.create (module String) in
@@ -1239,6 +1730,9 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
     ; events_processed = 0
     ; same_instant = 0
     ; metastable = []
+    ; violations = []
+    ; untimed
+    ; clock_delays
     ; trace = None
     }
   in
@@ -1251,7 +1745,7 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
     match e with
     | Reg_e _ -> ()
     | Cell_e c -> eval_cell t c ~trig:(-1)
-    | Word_e _ -> eval t e ~trig:(-1));
+    | Word_e _ | Delay_e _ -> eval t e ~trig:(-1));
   t
 ;;
 
@@ -1339,6 +1833,9 @@ let on_change t name f =
 ;;
 
 let metastable_events t = List.rev t.metastable
+let timing_violations t = List.rev t.violations
+let untimed_logic t = t.untimed
+let clock_delays t = t.clock_delays
 
 let instance_factors t =
   Array.to_list t.elements

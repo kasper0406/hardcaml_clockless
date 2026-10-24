@@ -29,6 +29,11 @@
       [clear], [enable] and [initialize_to], with delay
       [Config.reg_clock_to_q] and no timing checks.
 
+    Hardcaml primitives and registers are untimed: a fixed delay (zero by
+    default) whatever their load, and each input bit loads its net with only
+    [Config.prim_input_cap]. {!untimed_logic} lists those connected to Liberty
+    cells; [Config.untimed_logic] can warn about them or reject the circuit.
+
     Rejected with {!Unsupported}: memories, instantiations of anything that is
     not a library cell (hierarchical designs must be flattened), multi-bit
     cell pins, undriven non-input wires, nets with several drivers.
@@ -50,12 +55,20 @@
     interpolation in (input slew, load), linearly extrapolated outside the
     table. Going to X uses the smaller of the two. The input slew is the slew
     the input net was last driven with (primary inputs: [Config.input_slew]
-    or the slew given to {!set_input}). The load of a net is
-    [Config.wire_cap] plus the [capacitance] of every cell input pin on it.
-    Each delay is multiplied by [Config.corner] and by the instance's
-    variation factor, then rounded to 1 fs; output slews are scaled the same
-    way when [Config.corner_scales_slew]. With [Zero] or [Unit d] every cell
-    has that delay and timing checks are off.
+    or the slew given to {!set_input}). Each delay is multiplied by
+    [Config.corner] and by the instance's variation factor, then rounded to
+    1 fs; output slews are scaled the same way when
+    [Config.corner_scales_slew]. With [Zero] or [Unit d] every cell has that
+    delay and timing checks are off.
+
+    The load of a net is the [capacitance] of every cell input pin on it,
+    [Config.prim_input_cap] per Hardcaml primitive/register input bit on it,
+    and a wire capacitance set by [Config.wire_load]: [Flat] is
+    [Config.wire_cap] on every net; [Per_fanout c] adds [c] per load pin; the
+    [Liberty_*] models replace [wire_cap] by the Liberty [wire_load] model's
+    capacitance at the net's fanout (load pins: cell inputs and Hardcaml input
+    bits; output ports do not count), as OpenSTA estimates it (see
+    {!Timing_library.Wire_load}). Wire resistance is ignored.
 
     Combinational outputs use inertial delay by default: a pending output
     change is cancelled if the output's newly evaluated value differs from it
@@ -79,8 +92,50 @@
     would fall before that decision is clamped to it, so simulation time
     never runs backwards). Every metastable
     capture is logged ({!metastable_events}). This is deliberately
-    pessimistic: any aperture violation goes metastable. Recovery/removal and
-    minimum pulse width are not checked.
+    pessimistic: any aperture violation goes metastable. With
+    [Config.tau_scales_with_corner], tau is multiplied by [Config.corner] and
+    the instance's factor (tau is set by the latch pair's C/gm, which scales
+    roughly like a gate delay); with a real corner library ([corner = 1])
+    scale [Config.tau] yourself, e.g. by the ratio of the flop's clk->Q
+    delays. Resolution is timed from the clock edge, not from D arrival, and
+    Q never shows a runt.
+
+    {2 Pulse width and recovery/removal checks}
+
+    Off by default ([Ignore]); [Log] records violations
+    ({!timing_violations}) without changing the simulation;
+    [Log_and_metastable] also makes the flop/latch state X and resolves it as
+    for a metastable capture, starting when the violation is detected
+    (whatever [Config.metastability]). Liberty delay mode only.
+
+    [Config.pulse_width_check]: when an input pin with minimum pulse widths
+    (see {!Timing_library.Pulse_width}; or, with [Config.min_pulse_width], any
+    clock/enable, clear or preset pin of a flop or latch without them, both
+    levels) ends a pulse shorter than the minimum at the slew of its leading
+    edge, times [corner] and the instance factor. A pulse is checked only if
+    it began with a 0/1 transition.
+
+    [Config.recovery_removal_check]: [recovery_*]/[removal_*] arcs of an
+    asynchronous pin against the clock give, like setup/hold, a window
+    (edge - recovery, edge + removal) for each transition of the pin
+    ([rise_constraint] for rising transitions, e.g. [RESET_B] deasserting) at
+    (pin slew, clock slew); a transition strictly inside the window of an
+    active clock edge is a violation, whether or not the reset was still
+    active at the edge. Transitions are checked at the edge against the pin's
+    recent history and afterwards against the last edge only.
+
+    {2 Clock insertion delay and skew}
+
+    With [Config.clock_insertion] or [Config.clock_skew_sigma] positive, the
+    clock (or enable) pin of every Liberty flop and latch sees its net
+    delayed by [max 0 (insertion + sigma * N(0,1))] (static skew, not
+    jitter; keep insertion well above sigma or the clipping at 0 biases it),
+    drawn per instance in instance-name order from its own seeded stream;
+    [Config.clock_delay_overrides] sets it per instance. The pin then reads a
+    private, transport-delayed copy of the net (named ["<instance>/<pin>"]),
+    its capacitance still loads the original net, and setup/hold, metastable
+    edge times and checks refer to the delayed edge ({!clock_delays}).
+    Hardcaml registers see their clock undelayed.
 
     A clock (or latch enable) changing from 0 to X, while it is X, makes the
     state X where the data differs from it; a net resolving from its
@@ -132,6 +187,28 @@ module Config : sig
     | Init_zero
   [@@deriving sexp_of]
 
+  type wire_load =
+    | Flat (** [wire_cap] on every net *)
+    | Per_fanout of float (** [wire_cap] plus this many pF per load pin *)
+    | Liberty_default (** the library's [default_wire_load] *)
+    | Liberty_named of string (** a [wire_load] group by name *)
+    | Liberty_by_area of float option
+    (** the library's [default_wire_load_selection] for this design area
+        (library area units; [None]: the circuit's total cell area) *)
+  [@@deriving sexp_of]
+
+  type untimed_logic =
+    | Allow
+    | Warn (** print {!untimed_logic} to stderr in {!create} *)
+    | Fail (** {!create} raises {!Unsupported} if {!untimed_logic} is not empty *)
+  [@@deriving sexp_of]
+
+  type check =
+    | Ignore
+    | Log (** record in {!timing_violations} *)
+    | Log_and_metastable (** and make the flop/latch state metastable *)
+  [@@deriving sexp_of]
+
   type t =
     { delay_mode : delay_mode
     ; pulse_mode : pulse_mode (** for combinational cells and primitives *)
@@ -141,20 +218,37 @@ module Config : sig
     (** per-instance factor [max 0.05 (1 + sigma * N(0,1))], seeded, drawn in
         instance-name order *)
     ; seed : int
-    ; wire_cap : float (** pF per net *)
+    ; wire_cap : float (** pF per net ([Flat] and [Per_fanout]) *)
+    ; wire_load : wire_load
+    ; prim_input_cap : float (** pF per Hardcaml primitive/register input bit *)
     ; input_slew : float (** ns, for primary inputs *)
     ; prim_delay : int (** fs, Hardcaml combinational primitives *)
     ; reg_clock_to_q : int (** fs, Hardcaml registers *)
+    ; untimed_logic : untimed_logic (** Liberty mode only *)
     ; metastability : bool (** off: liberty flops sample ideally at the edge *)
     ; tau : float (** ns, mean metastability resolution time *)
+    ; tau_scales_with_corner : bool (** tau times [corner] and instance factor *)
+    ; pulse_width_check : check
+    ; min_pulse_width : float option
+    (** ns, both levels, for flop/latch clock and async pins without Liberty data *)
+    ; recovery_removal_check : check
+    ; clock_insertion : float (** ns, mean delay to every flop/latch clock pin *)
+    ; clock_skew_sigma : float (** ns, per-pin spread around [clock_insertion] *)
+    ; factor_overrides : (string * float) list
+    (** instance -> variation factor, replacing the drawn one (the draws are
+        still made, so other instances keep theirs) *)
+    ; clock_delay_overrides : (string * float) list
+    (** flop/latch instance -> clock insertion delay (ns), replacing the drawn one *)
     ; flop_init : init
     ; reg_init : init (** Hardcaml registers without [initialize_to] *)
     }
   [@@deriving sexp_of]
 
-  (** Liberty delays, inertial, corner 1, no variation, seed 0, 1 fF wire,
-      50 ps input slew, zero-delay primitives and registers, metastability on
-      with tau = 30 ps, flops start X, registers start 0. *)
+  (** Liberty delays, inertial, corner 1, no variation, seed 0, [Flat] 1 fF
+      wire, Hardcaml inputs free, 50 ps input slew, zero-delay primitives and
+      registers allowed, metastability on with tau = 30 ps (not scaled),
+      pulse width and recovery/removal checks off, ideal clocks, flops start
+      X, registers start 0. *)
   val default : t
 end
 
@@ -164,6 +258,42 @@ module Metastable_event : sig
     ; edge_time : int
     ; resolve_time : int (** internal state resolves; Q follows after clk->Q *)
     ; resolved_to : Value.t
+    }
+  [@@deriving sexp_of]
+end
+
+module Timing_violation : sig
+  type kind =
+    | Pulse_width of
+        { level : Value.t (** the level held too briefly *)
+        ; width : int
+        ; min_width : int
+        }
+    | Recovery_removal of
+        { edge_time : int (** the clock edge (at the pin) *)
+        ; window : int * int (** relative to the edge; the transition was inside *)
+        }
+  [@@deriving sexp_of]
+
+  type t =
+    { instance : string
+    ; pin : string
+    ; time : int (** of the transition: end of the pulse, or the async pin's *)
+    ; kind : kind
+    }
+  [@@deriving sexp_of]
+end
+
+(** A Hardcaml primitive or register connected to Liberty cells: reachable
+    from a cell output ([from_cell]) and/or reaching a cell input
+    ([to_cell]) through Hardcaml logic only (the first cell found, in
+    instance-name order). *)
+module Untimed : sig
+  type t =
+    { element : string (** [reg], [mux], [cases], [not], or the [Op2] ([xor], [add], ...) *)
+    ; signal : string (** its names, or [<unnamed uid>] *)
+    ; from_cell : string option
+    ; to_cell : string option
     }
   [@@deriving sexp_of]
 end
@@ -221,8 +351,19 @@ val on_change : t -> string -> (time:int -> Value.t -> unit) -> unit
 (** Oldest first. *)
 val metastable_events : t -> Metastable_event.t list
 
+(** Oldest first (by detection). *)
+val timing_violations : t -> Timing_violation.t list
+
+(** Hardcaml primitives and registers connected to Liberty cells, whatever
+    the delay mode; in Liberty mode these are the untimed parts of a timed
+    netlist. *)
+val untimed_logic : t -> Untimed.t list
+
 (** Variation factor of every cell instance. *)
 val instance_factors : t -> (string * float) list
+
+(** Clock insertion delay (fs) of every flop and latch instance. *)
+val clock_delays : t -> (string * int) list
 
 val events_processed : t -> int
 val num_nets : t -> int
