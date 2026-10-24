@@ -8,4 +8,4 @@
   (deps
    (glob_files data/*.lib)))
  (preprocess
-  (pps ppx_jane)))
+  (pps ppx_jane ppx_hardcaml)))

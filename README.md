@@ -33,9 +33,9 @@ click elements) are in that repo's
 | `Cell_library` | Typed cells: kind (combinational/latch/flop/tristate/constant/physical), pins, functions, area | done |
 | `Cell` | Hand-placed cell instantiation with `dont_touch`/`keep`, pin checking, stable instance names | done |
 | `Delay_line` | Tapped chain of buffer/delay cells | done |
-| `Tdc` | Delay line + latch bank + synchronous thermometer decoder with bubble correction | next |
+| `Tdc` | Delay line + first-stage sampling flops (kept, stably named) + synchronous decoder: bubble filter, fine code, overflow and multi-edge flags, coarse counter. `Cells` (Verilog) or behavioural `Model` (Cyclesim) | done |
 | `Tdc_calibration` | Code-density calibration against the system clock | next |
-| Behavioural models | Cyclesim models of TDC/delay lines so the rest of a design simulates normally | planned |
+| Behavioural models | Cyclesim models of TDC/delay lines so the rest of a design simulates normally | partial: TDC (`Tdc.Model`, uniform stage delays) |
 | `Event_sim` | Event-driven gate-level simulation with Liberty/SDF delays, random and adversarial | planned |
 | `Sdc` | Timing constraints and LibreLane config (dont-touch, loop breaks, relative timing) | planned |
 | Post-route check | Re-extract islands from the routed netlist; check cells survived unchanged | planned |
@@ -57,6 +57,10 @@ opam repo add janestreet-bleeding https://github.com/janestreet/opam-repository.
 opam install . --deps-only --with-test
 dune runtest
 ```
+
+`test/yosys/yosys_tdc.sh` is a synthesis smoke check outside `dune runtest`
+(it needs yosys and the full SG13CMOS5L liberty): it synthesises a TDC with
+yosys + abc and checks that every delay cell and sampling flop survives.
 
 Test data in `test/data/` is an excerpt of the IHP Open PDK Liberty file
 (Apache-2.0).
