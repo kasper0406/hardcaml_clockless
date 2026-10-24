@@ -36,10 +36,10 @@ click elements) are in that repo's
 | `Delay_line` | Tapped chain of buffer/delay cells | done |
 | `Ring` | Free-running ring oscillator: NAND enable + inverters, selectable lengths, ring-clocked Johnson+Gray period counters (two copies half a period apart), loop-break metadata. `Clk_sampler` decodes the system-clock-sampled state to ring time `k*2n+p`, choosing the stable counter by phase. `Ideal` is a unit-delay reference ring in plain OCaml that drives the behavioural `Model` | done. Verified in Cyclesim, and in `Event_sim` with Liberty delays at three corners: exact median per-cycle time, no pattern errors; fixed 17-stage ring gives 16-114 ps bins and 27-72 ps rms error on calibrated 20 ns intervals. Use a fixed length (the length-select mux widens bins ~4x) |
 | `Tdc` | Delay line + first-stage sampling flops (kept, stably named) + synchronous decoder: bubble filter, fine code, overflow and multi-edge flags, coarse counter. `Cells` (Verilog) or behavioural `Model` (Cyclesim). Fallback design: a line of buf_1 does not span a 20 ns cycle at the fast corner | done |
-| `Pin_capture` | XOR-merged input pins clock a shared async FIFO of (ring phase, counts, pin snapshot); edge counters and level checks flag lost or merged edges | next |
+| `Pin_capture` | XOR-merged input pins clock a dual-edge asynchronous FIFO: two banks (merged rising/falling) of flop-cell slots loaded through enable muxes (clock never gated), Johnson write pointers; each record holds ring nodes, counters A/B, the pin snapshot and a delayed snapshot. A synchronous drain reads banks in turn, attributes pins by snapshot diff, decodes ring time (`Ring.S.decode`) and flags everything it cannot vouch for: lost edges (per-pin Gray edge counters), level mismatches, stale and unbalanced attributions (edges that cancelled in the XOR), overwrites, runts, invalid pointers (auto-reset), enable changes. `Model` + `Reference`/`Model_driver` for Cyclesim | done. Event_sim with Liberty delays at typ/slow/fast, 105k random edges on 4 pins (10% within 2 ns of the previous edge): zero unflagged errors; calibrated single-edge error 0.8 bin rms (24/37/59 ps fast/typ/slow), worst <= 2.8 bins except rare multi-pin-burst outliers (worst 0.79 ns, followed by a pin flag); snapshot race margin >= 190 ps; two-pin collisions merge (attributed to both) below 250/350/600 ps, cancel (reported untimed, flagged) below ~125-300 ps. Area (yosys, 4 pins, 2 slots/bank, ring excluded): 48.6k µm², of which 14.6k hand-placed front |
 | `Strobe_sampler` | Vernier-delayed strobe samples every pin: equivalent-time sampling for repetitive signals | planned |
 | Calibration | Code-density histogram of the `clk`-sampled ring; ring periods per cycle | next |
-| Behavioural models | Cyclesim models so the rest of a design simulates normally | `Tdc.Model`, `Ring.Model` (driven by `Ring.Ideal`) |
+| Behavioural models | Cyclesim models so the rest of a design simulates normally | `Tdc.Model`, `Ring.Model` (driven by `Ring.Ideal`), `Pin_capture.Model` (driven by `Pin_capture.Reference` / `Model_driver`) |
 | `Event_sim` | Event-driven gate-level simulation of Hardcaml circuits of Liberty cells: fs time, 0/1/X, NLDM delays with slew propagation and loads, inertial/transport, flops/latches from Liberty with setup/hold-aperture metastability (exponential resolution), corner scale and seeded per-instance variation, Hardcaml registers on any clock net, loops (ring oscillators), VCD | done (minimal); SDF, adversarial delays, hazard/protocol monitors, Cyclesim co-simulation: planned |
 | `Sdc` | Timing constraints and LibreLane config (dont-touch, loop breaks, relative timing) | planned |
 | Post-route check | Re-extract islands from the routed netlist; check cells survived unchanged | planned |
@@ -86,6 +86,12 @@ opam repo add janestreet-bleeding https://github.com/janestreet/opam-repository.
 opam install . --deps-only --with-test
 dune runtest
 ```
+
+`dune exec test/gate/capture_gate.exe -- EDGES_PER_CORNER [SEED [NEAR [MIN_SAME_PIN_NS]]]`
+is the long Pin_capture gate run (random edges on 4 pins at three corners,
+checked against the true edges); `test/yosys/yosys_capture.sh [SLOTS]`
+synthesises Pin_capture and reports its area and that every hand-placed
+cell survived.
 
 `test/yosys/yosys_tdc.sh` is a synthesis smoke check outside `dune runtest`
 (it needs yosys and the full SG13CMOS5L liberty): it synthesises a TDC with

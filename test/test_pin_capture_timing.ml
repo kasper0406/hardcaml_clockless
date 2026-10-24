@@ -3,7 +3,30 @@
    a fixed 17-stage ring with flop-cell counters, flop-cell synchroniser
    first stages, drained at 50 MHz. Expectations come from the true pin
    edges (Capture_oracle), not from the design. The long gate run is
-   test/gate/capture_gate.exe. *)
+   test/gate/capture_gate.exe.
+
+   Findings recorded by these tests (and the 105k-edge gate run):
+   - zero unflagged errors: every edge is reported with the right pin and
+     level, or covered by a flag;
+   - single-edge error after code-density calibration (from the captures'
+     own phases) and per (pin, polarity, bank) offsets: ~0.8 bin rms,
+     <= ~2.8 bins worst at every corner (bins 31/47/75 ps fast/typ/slow);
+   - snapshot race (pin -> D before pin -> bank clock): >= 190/284/437 ps
+     fast/typ/slow, against a 40-110 ps setup time;
+   - collisions: two pins within ~125-300 ps cancel in the XOR / clock
+     trunk inertia (reported untimed by the level check or as stale);
+     up to 250/350/600 ps (fast/typ/slow) they merge into one event
+     attributed to both pins; beyond that they are separate events;
+   - narrow merged pulses that one bank's clock tree passes and the other's
+     swallows (runts) occur for near-coincident edges; the drain re-aligns
+     the bank order and counts them;
+   - rare single-edge outliers beyond 3 bins (~1 in 3000; worst 0.79 ns at
+     fast) come from bursts of 3-4 edges on different pins within ~1 ns
+     (runts, out-of-order bank records); a per-pin flag follows within a
+     cycle, but the event itself is not flagged;
+   - with 2 slots per bank, bursts make the conservative overwrite check
+     fire (no real overwrite was seen in simulation); 3 slots removes it at
+     these rates. *)
 
 open! Base
 open Stdio
