@@ -4,7 +4,7 @@ Sub-clock and clockless circuit support for [Hardcaml](https://github.com/janest
 
 Hardcaml describes synchronous logic, and its tool flow (logic synthesis,
 static timing) assumes the same. Some structures only work if specific
-standard cells are placed exactly as written:
+standard cells are instantiated exactly as written:
 - delay lines;
 - time-to-digital converters (TDCs) that timestamp edges far below the clock
   period;
@@ -12,9 +12,15 @@ standard cells are placed exactly as written:
 - clockless handshake pipelines.
 
 This library builds those structures from cells read out of the PDK's Liberty
-file. It protects them from synthesis and place-and-route, and (in progress)
-generates the timing constraints and delay-aware simulations needed to verify
-them. It sits on top of Hardcaml's public API, with no changes to Hardcaml
+file. It protects them from synthesis (`keep`) and generates what
+place-and-route needs to leave them alone (dont-touch lists, loop breaks,
+island clocks), checks synthesised and routed netlists against them, and runs
+delay-aware simulations. Relative-timing checks on the routed netlist are in
+progress.
+
+"Hand-placed" below means hand-*instantiated*: the cells and their
+connections are fixed, but nothing constrains placement or routing, so wire
+delay, load and skew are whatever the placer makes of them. It sits on top of Hardcaml's public API, with no changes to Hardcaml
 itself, just as `hardcaml_waveterm` or `hardcaml_circuits` do.
 
 ## Status
@@ -25,7 +31,7 @@ itself, just as `hardcaml_waveterm` or `hardcaml_circuits` do.
 | `Bool_expr` | Liberty boolean functions: parse, evaluate, lower to Hardcaml logic | done |
 | `Timing_library` | Liberty timing view: NLDM delay/slew tables per arc (bilinear interpolation, extrapolation), pin capacitances, `ff`/`latch` groups, setup/hold tables | done |
 | `Cell_library` | Typed cells: kind (combinational/latch/flop/tristate/constant/physical), pins, functions, area | done |
-| `Cell` | Hand-placed cell instantiation with `dont_touch`/`keep`, pin checking, stable instance names | done |
+| `Cell` | Hand-placed cell instantiation with `dont_touch`/`keep` (honoured by yosys, not by OpenROAD: see `Sdc`), pin checking, stable instance and output net names | done |
 | `Delay_line` | Tapped chain of buffer/delay cells | done |
 | `Ring` | Free-running ring oscillator: NAND enable + inverters, selectable lengths, ring-clocked Johnson+Gray period counters (two copies half a period apart), loop-break metadata. `Clk_sampler` decodes the system-clock-sampled state to ring time `k*2n+p`, choosing the stable counter by phase. `Ideal` is a unit-delay reference ring in plain OCaml that drives the behavioural `Model` | done. Verified in Cyclesim, and in `Event_sim` with Liberty delays at three corners: exact median per-cycle time, no pattern errors; fixed 17-stage ring gives 16-114 ps bins and 27-72 ps rms error on calibrated 20 ns intervals. Use a fixed length (the length-select mux widens bins ~4x) |
 | `Tdc` | Delay line + first-stage sampling flops (kept, stably named) + synchronous decoder: bubble filter, fine code, overflow and multi-edge flags, coarse counter. `Cells` (Verilog) or behavioural `Model` (Cyclesim). Fallback design: a line of buf_1 does not span a 20 ns cycle at the fast corner | done |
@@ -34,8 +40,8 @@ itself, just as `hardcaml_waveterm` or `hardcaml_circuits` do.
 | Calibration | Code-density histogram of the `clk`-sampled ring; ring periods per cycle | next |
 | Behavioural models | Cyclesim models so the rest of a design simulates normally | `Tdc.Model`, `Ring.Model` (driven by `Ring.Ideal`), `Pin_capture.Model` (driven by `Pin_capture.Reference` / `Model_driver`) |
 | `Event_sim` | Event-driven gate-level simulation of Hardcaml circuits of Liberty cells: fs time, 0/1/X, NLDM delays with slew propagation and loads, inertial/transport, flops/latches from Liberty with setup/hold-aperture metastability (exponential resolution), corner scale and seeded per-instance variation, Hardcaml registers on any clock net, loops (ring oscillators), VCD | done (minimal); SDF, adversarial delays, hazard/protocol monitors, Cyclesim co-simulation: planned |
-| `Sdc` | Timing constraints and LibreLane config (dont-touch, loop breaks, relative timing) | planned |
-| Post-route check | Re-extract islands from the routed netlist; check cells survived unchanged | planned |
+| `Sdc` | From the flattened circuit: protected instances (every `dont_touch` cell and kept register) and nets (driven by them, plus registered fork nets); LibreLane `RSZ_DONT_TOUCH_RX`, or `RSZ_DONT_TOUCH_LIST` resolved from a synthesised netlist (it names the flops yosys made of kept registers); SDC fragments: `set_disable_timing` at loop breaks, false paths into the TDC line, and for signoff only `create_clock` on ring counter, Pin_capture bank and edge-counter clocks with asynchronous groups (CTS ignores dont-touch, so they stay out of the PnR SDC) | done (generation); not yet run through LibreLane/OpenROAD. Relative-timing checks (snapshot race, hold, pulse width, reset recovery at 3 corners): planned |
+| Post-route check | `Netlist` parses gate-level Verilog (yosys, OpenROAD); `Sdc.check` re-extracts the islands: same cells, protected nets unbuffered, unrenamed and without extra loads (antenna diodes allowed), kept registers still flops on the right nets, inputs rebuffered only from their own source, constants possibly tie cells | done; checked on yosys output (`test/yosys/yosys_island.sh`), not yet on a routed netlist |
 | `Click`, `Bd_channel` | Bundled-data click handshake components with a synchronous reference | planned |
 | Workcraft export | Formal checks: deadlock freedom, hazard freedom, conformation | planned |
 
@@ -64,6 +70,26 @@ reproduces these is about 1.40 and 0.71 (slews scaled too, the default), not the
 ring-clocked 16-bit counter simulates 10 µs in about 0.1 s
 (`dune exec bench/ring_bench.exe`).
 
+## Physical flow
+
+```ocaml
+let sdc =
+  Sdc.create circuit (* flattened; ~prefix:"u_island." if yosys flattens it *)
+  |> Sdc.ring ~name:"ring" ~loop_breaks ~period_ns:1.0 (* fastest corner *)
+  |> Sdc.pin_capture ~name:"pin_capture" ~pins:4 ~min_edge_spacing_ns:2.0
+  |> Sdc.tdc ~name:"tdc"
+in
+Sdc.rsz_dont_touch_rx sdc (* LibreLane RSZ_DONT_TOUCH_RX *)
+Sdc.sdc sdc ~stage:Pnr ~system_clock:"clk" (* append to PNR_SDC_FILE *)
+Sdc.sdc sdc ~stage:Signoff ~system_clock:"clk" (* append to SIGNOFF_SDC_FILE *)
+Sdc.dont_touch_list sdc ~library (Netlist.load "synthesised.v") (* RSZ_DONT_TOUCH_LIST *)
+Sdc.check sdc ~library (Netlist.load "routed.nl.v") (* [] if the islands survived *)
+```
+
+LibreLane applies the dont-touch settings only in its resizer steps, so
+island clocks are left out of the PnR SDC (clock tree synthesis would buffer
+them) and only appear at signoff. See `src/sdc.ml`.
+
 ## Testing
 
 Tests never use the library's own output as the expectation where an
@@ -85,6 +111,10 @@ is the long Pin_capture gate run (random edges on 4 pins at three corners,
 checked against the true edges); `test/yosys/yosys_capture.sh [SLOTS]`
 synthesises Pin_capture and reports its area and that every hand-placed
 cell survived.
+
+`test/yosys/yosys_island.sh` synthesises a stub island (ring, sampler,
+Pin_capture, TDC) with the passes LibreLane's synthesis runs and checks the
+netlist with `Sdc.check`.
 
 `test/yosys/yosys_tdc.sh` is a synthesis smoke check outside `dune runtest`
 (it needs yosys and the full SG13CMOS5L liberty): it synthesises a TDC with

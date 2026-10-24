@@ -2,7 +2,7 @@
 ; yosys_capture.sh). Not run by `dune runtest`: yosys is not a build
 ; dependency.
 (executables
- (names gen_tdc gen_capture)
+ (names gen_tdc gen_capture gen_island)
  (libraries hardcaml_clockless hardcaml stdio)
  (preprocess
   (pps ppx_jane)))
