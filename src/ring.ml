@@ -271,6 +271,24 @@ module type S = sig
       -> Signal.t State.t * loop_break list
   end
 
+  (** The decoded time of a settled ring state (see the module doc). *)
+  module Decoded : sig
+    type 'a t =
+      { phase : 'a (** [p] in [0, 2n) *)
+      ; periods : 'a (** [k] *)
+      ; time : 'a (** [k * 2n + p], modulo [2 ^ time_width] *)
+      ; pattern_error : 'a (** the node pattern was not a single wavefront *)
+      }
+    [@@deriving hardcaml]
+  end
+
+  (** Combinational decode of a ring state that has already been captured and
+      settled (e.g. synchronised to a clock, or held in a capture register):
+      majority filter, phase, counter selection by phase, time. [length_sel]
+      selects the loop length as in {!Analog.create}. Shared by
+      {!Clk_sampler} and [Pin_capture]. *)
+  val decode : length_sel:Signal.t -> Signal.t State.t -> Signal.t Decoded.t
+
   (** The system-clock sampler: registers the state on [clock] (first stage
       named [<name>_sample_*] with dont_touch/keep), then decodes. *)
   module Clk_sampler : sig
@@ -537,6 +555,68 @@ module Make (C : Config) : S = struct
     ;;
   end
 
+  module Decoded = struct
+    type 'a t =
+      { phase : 'a [@bits phase_width]
+      ; periods : 'a [@bits count_width]
+      ; time : 'a [@bits time_width]
+      ; pattern_error : 'a
+      }
+    [@@deriving hardcaml]
+  end
+
+  let decode ~length_sel (s : Signal.t State.t) : Signal.t Decoded.t =
+    if Signal.width length_sel <> select_width
+    then raise_s [%message "Ring.decode: length_sel width" (select_width : int)];
+    State.Of_signal.assert_widths s;
+    (* Per selected length n: phase, error, periods. Results muxed by length. *)
+    let per_length n =
+      let odd = concat_lsb (List.init max_length ~f:(fun j -> if j % 2 = 1 then vdd else gnd)) in
+      let u = s.nodes ^: odd in
+      (* The pattern continues around the loop inverted: virtual position
+         -1 is [not u (n-1)] and virtual position n is [not u 0]. So every
+         position, ends included, is filtered with its true neighbours. *)
+      let ub j = if j < 0 then ~:(u.:(n - 1)) else if j >= n then ~:(u.:(0)) else u.:(j) in
+      let maj a b c = a &: b |: (a &: c) |: (b &: c) in
+      let f = List.init n ~f:(fun j -> maj (ub (j - 1)) (ub j) (ub (j + 1))) in
+      let u0 = List.hd_exn f in
+      let same = concat_lsb (List.map f ~f:(fun b -> ~:(b ^: u0))) in
+      let run = trailing_ones same in
+      let pw = phase_width in
+      let phase =
+        uresize run ~width:pw -:. 1
+        +: mux2 u0 (zero pw) (of_int_trunc ~width:pw n)
+      in
+      (* Pattern check: at most one change along 0..n-1 after filtering. *)
+      let changes =
+        List.init (n - 1) ~f:(fun j -> List.nth_exn f j ^: List.nth_exn f (j + 1))
+        |> concat_lsb |> popcount
+      in
+      let pattern_error = changes >:. 1 in
+      let thr = select_threshold n in
+      let use_a = phase >=:. thr &: (phase <:. n + thr) in
+      let a = Counter.decode ~johnson_bits ~gray_width s.count_a in
+      let b = Counter.decode ~johnson_bits ~gray_width s.count_b in
+      let periods = mux2 use_a a (b -: uresize (phase >=:. n) ~width:count_width) in
+      let time =
+        (uresize periods ~width:time_width *: of_int_trunc ~width:phase_width (2 * n)
+         |> uresize ~width:time_width)
+        +: uresize phase ~width:time_width
+      in
+      phase, periods, time, pattern_error
+    in
+    let results = List.map lengths ~f:per_length in
+    let pick f =
+      let xs = List.map results ~f in
+      mux length_sel (xs @ List.init ((1 lsl select_width) - List.length xs) ~f:(fun _ -> List.last_exn xs))
+    in
+    { Decoded.phase = pick (fun (p, _, _, _) -> p)
+    ; periods = pick (fun (_, k, _, _) -> k)
+    ; time = pick (fun (_, _, t, _) -> t)
+    ; pattern_error = pick (fun (_, _, _, e) -> e)
+    }
+  ;;
+
   module Clk_sampler = struct
     module I = struct
       type 'a t =
@@ -591,53 +671,13 @@ module Make (C : Config) : S = struct
       let s = State.map s1 ~f:(reg spec) in
       let length_sel = reg spec (reg spec i.length_sel) in
       let enabled = reg spec (reg spec (i.enable &: ~:(i.clear))) in
-      (* Per selected length n: phase, error, periods. Results muxed by length. *)
-      let per_length n =
-        let odd = concat_lsb (List.init max_length ~f:(fun j -> if j % 2 = 1 then vdd else gnd)) in
-        let u = s.nodes ^: odd in
-        (* The pattern continues around the loop inverted: virtual position
-           -1 is [not u (n-1)] and virtual position n is [not u 0]. So every
-           position, ends included, is filtered with its true neighbours. *)
-        let ub j = if j < 0 then ~:(u.:(n - 1)) else if j >= n then ~:(u.:(0)) else u.:(j) in
-        let maj a b c = a &: b |: (a &: c) |: (b &: c) in
-        let f = List.init n ~f:(fun j -> maj (ub (j - 1)) (ub j) (ub (j + 1))) in
-        let u0 = List.hd_exn f in
-        let same = concat_lsb (List.map f ~f:(fun b -> ~:(b ^: u0))) in
-        let run = trailing_ones same in
-        let pw = phase_width in
-        let phase =
-          uresize run ~width:pw -:. 1
-          +: mux2 u0 (zero pw) (of_int_trunc ~width:pw n)
-        in
-        (* Pattern check: at most one change along 0..n-1 after filtering. *)
-        let changes =
-          List.init (n - 1) ~f:(fun j -> List.nth_exn f j ^: List.nth_exn f (j + 1))
-          |> concat_lsb |> popcount
-        in
-        let pattern_error = changes >:. 1 in
-        let thr = select_threshold n in
-        let use_a = phase >=:. thr &: (phase <:. n + thr) in
-        let a = Counter.decode ~johnson_bits ~gray_width s.count_a in
-        let b = Counter.decode ~johnson_bits ~gray_width s.count_b in
-        let periods = mux2 use_a a (b -: uresize (phase >=:. n) ~width:count_width) in
-        let time =
-          (uresize periods ~width:time_width *: of_int_trunc ~width:phase_width (2 * n)
-           |> uresize ~width:time_width)
-          +: uresize phase ~width:time_width
-        in
-        phase, periods, time, pattern_error
-      in
-      let results = List.map lengths ~f:per_length in
-      let pick f =
-        let xs = List.map results ~f in
-        mux length_sel (xs @ List.init ((1 lsl select_width) - List.length xs) ~f:(fun _ -> List.last_exn xs))
-      in
+      let d = decode ~length_sel s in
       let r x = reg spec x in
       { O.valid = r enabled -- "valid"
-      ; phase = r (pick (fun (p, _, _, _) -> p))
-      ; periods = r (pick (fun (_, k, _, _) -> k))
-      ; time = r (pick (fun (_, _, t, _) -> t))
-      ; pattern_error = r (pick (fun (_, _, _, e) -> e) &: enabled)
+      ; phase = r d.phase
+      ; periods = r d.periods
+      ; time = r d.time
+      ; pattern_error = r (d.pattern_error &: enabled)
       }
     ;;
   end

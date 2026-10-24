@@ -1,6 +1,6 @@
 (library
  (name hardcaml_clockless_test)
- (libraries hardcaml_clockless hardcaml stdio)
+ (libraries hardcaml_clockless hardcaml stdio unix)
  (inline_tests
   ; ppx_expect v0.18 preview resolves files as <source-tree-root>/<basename>;
   ; see janestreet-bitbanger test_hw/dune.
