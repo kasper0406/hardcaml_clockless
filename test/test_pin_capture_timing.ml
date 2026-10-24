@@ -79,3 +79,37 @@ let%expect_test "collision window: two pins delta apart, at three corners" =
          delta(ps):merged/separate/flagged/other 0:0/0/6/0 25:0/0/6/0 50:0/0/6/0 75:0/0/6/0 100:0/0/6/0 125:1/0/5/0 150:5/0/1/0 175:5/1/0/0 200:4/2/0/0 225:2/4/0/0 250:2/4/0/0 275:0/6/0/0 300:0/6/0/0 325:0/6/0/0 350:0/6/0/0 375:0/6/0/0 400:0/6/0/0 425:0/6/0/0 450:0/6/0/0 475:0/6/0/0 500:0/6/0/0 525:0/6/0/0 550:0/6/0/0 575:0/6/0/0 600:0/6/0/0 700:0/6/0/0 800:0/6/0/0 900:0/6/0/0 1000:0/6/0/0 1100:0/6/0/0 1200:0/6/0/0 1300:0/6/0/0 1400:0/6/0/0 1500:0/6/0/0 1600:0/6/0/0 1700:0/6/0/0 1800:0/6/0/0 1900:0/6/0/0 2000:0/6/0/0
     |}]
 ;;
+
+(* The other slot counts (one-hot decode of a 3- or 4-flop Johnson pointer)
+   with the real cells, typical corner. *)
+module type Slots = sig
+  val slots : int
+end
+
+let%expect_test "slots = 3 and 4 per bank (typ)" =
+  let run (module M : Slots) =
+    let module T = Capture_timing.Make (M) in
+    let edges =
+      T.random_edges ~min_same_pin_ns:5. ~seed:11 ~count:2000 ~start_ns:800. ~mean_gap_ns:60.
+        ~near:0.1 ()
+    in
+    let cycles = (List.last_exn edges |> fst) / T.clock_period + 450 in
+    let r = T.simulate ~path:"data/sg13cmos5l_excerpt.lib" ~edges ~cycles () in
+    let t = T.analyse r ~edges in
+    printf "slots %d: %s\n" M.slots (T.pp_timing ~corner:"typ" t);
+    printf "     status: %s\n"
+      (String.concat ~sep:" " (List.map r.status ~f:(fun (k, v) -> Printf.sprintf "%s=%d" k v)))
+  in
+  run (module struct let slots = 3 end);
+  run (module struct let slots = 4 end);
+  [%expect {|
+    slots 3: typ  edges 2000: timed 1933, untimed 56, lost+flagged 11, bad+flagged 18 | UNFLAGGED: lost 0, phantom 0 | pending 0
+         ring 1598 ps (mean bin 47.0 ps, calibrated bins 30..89 ps), delay pin->capture -1880 ps
+         single-edge error: 1901 events, rms 49.6 ps (1.06 bins), worst 152.1 ps (3.24 bins); per-class offsets: rms 39.5 ps (0.84 bins), worst 110.4 ps (2.35 bins); >3 bins: 1
+         status: capture_fault=1 fault_count=1 overflow=0 overflow_count=0 lost_edge=15 lost_edge_count=13 level_mismatch=15 level_mismatch_count=31 merge_error=14 merge_error_count=1 empty_count=14 stale_count=41 runt_count=3 resyncing=0
+    slots 4: typ  edges 2000: timed 1933, untimed 58, lost+flagged 9, bad+flagged 13 | UNFLAGGED: lost 0, phantom 0 | pending 0
+         ring 1598 ps (mean bin 47.0 ps, calibrated bins 32..94 ps), delay pin->capture -1892 ps
+         single-edge error: 1903 events, rms 50.6 ps (1.08 bins), worst 153.4 ps (3.26 bins); per-class offsets: rms 40.7 ps (0.87 bins), worst 131.0 ps (2.79 bins); >3 bins: 3
+         status: capture_fault=0 fault_count=0 overflow=0 overflow_count=0 lost_edge=15 lost_edge_count=10 level_mismatch=15 level_mismatch_count=34 merge_error=0 merge_error_count=0 empty_count=13 stale_count=35 runt_count=2 resyncing=0
+    |}]
+;;

@@ -57,6 +57,8 @@ let pp s =
 (* [cycle_of_time t]: first output cycle at or after [t]. [pin_flags]:
    (cycle, mask). [global_flags]: cycles with a fault/overflow pulse or in
    resync. *)
+let untimed_lag = 4
+
 let check
   ~pins
   ~(edges : edge list)
@@ -116,13 +118,20 @@ let check
           List.range head.(i) (Array.length q)
           |> List.filter ~f:(fun k -> q.(k).time < t_out && Bool.equal q.(k).level v)
         in
+        let latest_before t =
+          List.filter candidates ~f:(fun k -> q.(k).time <= t) |> List.last
+        in
         let pick =
-          match untimed_pin, ev.est with
-          | true, _ ->
-            (* A level-check report is for the oldest edge not captured. *)
-            List.hd candidates
-          | false, None -> List.last candidates
-          | false, Some est ->
+          match ev.untimed, untimed_pin, ev.est with
+          | true, _, _ ->
+            (* The level check samples the pins about [untimed_lag] cycles
+               before its report leaves. *)
+            latest_before (cycle_time (ev.cycle - untimed_lag))
+          | false, true, Some est ->
+            (* Stale: the latest change before this capture. *)
+            latest_before (est + match_tol)
+          | false, _, None -> List.last candidates
+          | false, false, Some est ->
             List.min_elt candidates ~compare:(fun a b ->
               Int.compare (abs (q.(a).time - est)) (abs (q.(b).time - est)))
             |> Option.filter ~f:(fun k -> abs (q.(k).time - est) <= match_tol)
