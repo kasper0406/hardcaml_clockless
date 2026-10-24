@@ -112,7 +112,7 @@ let run
     if Bits.to_bool ev.valid then outs := { cycle = c; ev } :: !outs;
     let pf = Bits.(to_int_trunc (st.lost_edge_now |: st.level_mismatch_now |: st.merge_error_now)) in
     if pf <> 0 then pin_flags := (c, pf) :: !pin_flags;
-    if Bits.(to_bool (st.fault_now |: st.overflow_now |: st.resyncing)) && k >= 2
+    if Bits.(to_bool (st.fault_now |: st.runt_now |: st.overflow_now |: st.resyncing)) && k >= 2
     then global_flags := c :: !global_flags;
     if Bits.to_bool st.ptr_reset then Int.incr ptr_resets
   done;
@@ -366,9 +366,9 @@ let%expect_test "corrupted pointer: capture_fault, auto-reset, resync, then corr
        ~f:(fun (o, (e : Ref.event)) ->
          b o.ev.changed <> e.changed || b o.ev.time <> (e.time + n - 1) % modulus || flagged o.ev));
   [%expect {|
-    status: fault 1 (2) overflow 0 (0) lost_edge 9 (2) level_mismatch 9 (2) merge_error 0 (0) empty 0 stale 2 resyncing 0
+    status: fault 1 (1) overflow 0 (0) lost_edge 9 (2) level_mismatch 9 (2) merge_error 0 (0) empty 0 stale 2 resyncing 0
     pointer reset asserted for 9 cycles
-    edges 600: timed 590, untimed 1, lost+flagged 9, bad+flagged 5 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    edges 600: timed 594, untimed 1, lost+flagged 5, bad+flagged 5 | UNFLAGGED: lost 0, phantom 0 | pending 0
     after recovery: 344 events, 344 expected, mismatches 0
     |}]
 ;;

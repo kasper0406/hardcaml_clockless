@@ -134,7 +134,7 @@ type run =
 let status_names =
   [ "capture_fault"; "fault_count"; "overflow"; "overflow_count"; "lost_edge"; "lost_edge_count"
   ; "level_mismatch"; "level_mismatch_count"; "merge_error"; "merge_error_count"; "empty_count"
-  ; "stale_count"
+  ; "stale_count"; "runt_count"
   ; "resyncing"
   ]
 ;;
@@ -202,6 +202,7 @@ let simulate ?(seed = 0) ?(setup = fun (_ : Event_sim.t) -> ()) ~path ~(edges : 
       if pf <> 0 then Queue.enqueue pin_flags (c, pf);
       if flag "status_fault_now" <> 0
          || flag "status_overflow_now" <> 0
+         || flag "status_runt_now" <> 0
          || flag "status_resyncing" <> 0
       then Queue.enqueue global_flags c;
       if get sim "event_valid" < 0 then Int.incr x_outputs)

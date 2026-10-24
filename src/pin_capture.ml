@@ -72,6 +72,10 @@
       event on that pin and counted; a count mismatch (lost or phantom edges)
       sets [lost_edge]. Both resynchronise. A pin that toggles every cycle
       without a pause is not checked until it pauses.
+    - {b Runts.} A merged pulse that one bank's clock tree passes and the
+      other's swallows gives one bank an extra write. When the other bank
+      stays exactly one record ahead for 3 cycles the drain reads it next
+      (re-aligning the order) and counts a [runt].
     - {b Pointers.} An invalid Johnson code, or banks whose fill differs by
       more than alternation allows, sets the sticky [capture_fault], counts,
       marks events in the pipeline, and resynchronises: the drain discards
@@ -716,7 +720,10 @@ module Make (C : Config) (R : Ring.S) = struct
       ; merge_error_count : 'a [@bits status_width]
       ; empty_count : 'a [@bits status_width]
       ; stale_count : 'a [@bits status_width]
+      ; runt_count : 'a [@bits status_width]
+      (** a bank missed a toggle the other saw (read order re-aligned) *)
       ; fault_now : 'a
+      ; runt_now : 'a
       ; overflow_now : 'a
       ; lost_edge_now : 'a [@bits pins]
       ; level_mismatch_now : 'a [@bits pins]
@@ -863,7 +870,11 @@ module Make (C : Config) (R : Ring.S) = struct
       let pointer_bad = ~:valid_r |: ~:valid_f in
       let alt_transient = b ==: a +:. 1 in
       let alt_ok = a ==: b |: (a ==: b +:. 1) in
-      let alt_bad = ~:alt_ok &: ~:alt_transient |: (alt_transient &: (alt_wait ==:. 3)) in
+      let alt_bad = ~:alt_ok &: ~:alt_transient in
+      (* The other bank one ahead for 3 cycles (longer than any synchroniser
+         skew): the expected bank missed a runt toggle that the other bank's
+         clock tree passed. Read the other bank from now on. *)
+      let runt = ~:resync &: alt_transient &: (alt_wait ==:. 3) -- "runt" in
       let fault_now = normal &: (pointer_bad |: alt_bad) -- "fault_now" in
       let ovf_now = normal &: ~:fault_now &: (avail_r >:. slots |: (avail_f >:. slots)) in
       let do_read = normal &: ~:fault_now &: ~:ovf_now &: (a <>:. 0) -- "do_read" in
@@ -1022,7 +1033,7 @@ module Make (C : Config) (R : Ring.S) = struct
       in
       Signal.assign rd_r (rc (rd_next false idx_r rd_r));
       Signal.assign rd_f (rc (rd_next true idx_f rd_f));
-      Signal.assign next_f (rc (mux2 resync_done mg (next_f ^: do_read)));
+      Signal.assign next_f (rc (mux2 resync_done mg (next_f ^: do_read ^: runt)));
       Signal.assign
         prev_snap
         (rc
@@ -1059,7 +1070,9 @@ module Make (C : Config) (R : Ring.S) = struct
         (rc
            (mux2 (resync_done |: balance_check |: (do_read &: (balance_read ==:. 0))) (zero pins)
               (mux2 do_read (unconfirmed |: changed) unconfirmed)));
-      Signal.assign alt_wait (rc (mux2 (normal &: alt_transient) (alt_wait +:. 1) (zero 2)));
+      Signal.assign
+        alt_wait
+        (rc (mux2 (normal &: alt_transient &: ~:runt) (alt_wait +:. 1) (zero 2)));
       (* Auto-reset of a pointer that stays invalid while resynchronising. *)
       let bad_streak = r (resync &: pointer_bad) in
       Signal.assign
@@ -1091,6 +1104,8 @@ module Make (C : Config) (R : Ring.S) = struct
         ; empty_count = counter empty_event
         ; stale_count = counter (popcount sd.stale &: repeat timed ~count:(num_bits_to_represent pins))
         ; fault_now = r fault_now
+        ; runt_now = r runt
+        ; runt_count = counter runt
         ; overflow_now = r mark_ovf
         ; lost_edge_now = r count_bad
         ; level_mismatch_now = r level_bad
