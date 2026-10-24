@@ -520,3 +520,81 @@ let%expect_test "cells mode: hand-placed loop, loop-break pin, counters on ring 
     endmodule
     |}]
 ;;
+
+(* --- 5. Configuration and naming ----------------------------------------- *)
+
+let%expect_test "johnson_bits must be a power of two (decoded wrap = counter wrap)" =
+  List.iter [ 1; 2; 3; 4; 6 ] ~f:(fun k ->
+    let ok =
+      try
+        let module _ =
+          Ring.Make (struct
+            let lengths = [ 17 ]
+            let johnson_bits = k
+            let gray_width = 2
+            let counter_settle_stages = 1
+          end)
+        in
+        "accepted"
+      with
+      | _ -> "rejected"
+    in
+    printf "johnson_bits %d: %s\n" k ok);
+  [%expect {|
+    johnson_bits 1: accepted
+    johnson_bits 2: accepted
+    johnson_bits 3: rejected
+    johnson_bits 4: accepted
+    johnson_bits 6: rejected
+    |}]
+;;
+
+let%expect_test "Clk_sampler first-stage flop cells keep their instance names" =
+  let library = Cell_library.load "data/sg13cmos5l_excerpt.lib" in
+  let dfrbpq : Small.flop =
+    { cell = "sg13cmos5l_dfrbpq_1"; clk = "CLK"; d = "D"; reset_n = "RESET_B"; q = "Q" }
+  in
+  let clock = Signal.input "clock" 1 in
+  let enable = Signal.input "enable" 1 in
+  let length_sel = Signal.input "length_sel" Small.select_width in
+  let state, _ =
+    Small.Analog.create
+      ~name:"ring"
+      (Cells
+         { library
+         ; nand2 = "sg13cmos5l_nand2_1"
+         ; inverter = "sg13cmos5l_inv_1"
+         ; mux2 = "sg13cmos5l_mux2_1"
+         ; flop = Some dfrbpq
+         })
+      ~enable
+      ~length_sel
+  in
+  let scope = Scope.create ~flatten_design:true () in
+  let o =
+    Small.Clk_sampler.create
+      ~first_stage:(library, dfrbpq)
+      ~name:"ring"
+      scope
+      { clock; clear = Signal.gnd; enable; length_sel; state }
+  in
+  let circuit =
+    Circuit.create_exn
+      ~name:"sampler_names"
+      Small.Clk_sampler.O.(to_list (map2 port_names o ~f:Signal.output))
+  in
+  let verilog = Rtl.create Verilog [ circuit ] |> Rtl.full_hierarchy |> Rope.to_string in
+  let expected =
+    List.init Small.max_length ~f:(Printf.sprintf "ring_sample_node%d")
+    @ List.init Small.counter_width ~f:(Printf.sprintf "ring_sample_count_a_%d")
+    @ List.init Small.counter_width ~f:(Printf.sprintf "ring_sample_count_b_%d")
+  in
+  (* an instance name is on a line of its own, after the cell name *)
+  let lines = List.map (String.split_lines verilog) ~f:String.strip in
+  let missing =
+    List.filter expected ~f:(fun nm -> not (List.mem lines nm ~equal:String.equal))
+  in
+  printf "first-stage instances: %d, missing or renamed: %s\n" (List.length expected)
+    (if List.is_empty missing then "none" else String.concat ~sep:" " missing);
+  [%expect {| first-stage instances: 13, missing or renamed: none |}]
+;;
