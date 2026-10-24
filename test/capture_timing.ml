@@ -93,7 +93,6 @@ struct
         ; pins
         ; pin_enable
         ; length_sel
-        ; raw_select = Signal.zero Cap.raw_select_width
         ; ring = state
         }
     in

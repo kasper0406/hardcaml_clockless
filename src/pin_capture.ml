@@ -60,7 +60,7 @@
     - The ring time is decoded from the record ({!Ring.S.decode}).
     - Events leave the third pipeline stage combinationally, 2 cycles after
       the read (6-7 cycles after the edge), so the overwrite check below can
-      be applied to the event itself. Raw slot bits are readable through [raw_select] / [raw].
+      be applied to the event itself.
 
     {2 Integrity checks (everything is flagged, nothing silently wrong)}
 
@@ -318,7 +318,6 @@ module Make (C : Config) (R : Ring.S) = struct
   let index_width = Pointer.index_width ~slots
   let slot_width = Int.max 1 (num_bits_to_represent (slots - 1))
   let capture_count_width = num_bits_to_represent model_captures
-  let raw_select_width = num_bits_to_represent ((2 * slots) - 1)
 
   (** One capture: the ring state and the pin levels. *)
   module Record = struct
@@ -740,8 +739,6 @@ module Make (C : Config) (R : Ring.S) = struct
       ; pins : 'a [@bits pins] (** asynchronous; unused in [Model] mode *)
       ; pin_enable : 'a [@bits pins]
       ; length_sel : 'a [@bits R.select_width]
-      ; raw_select : 'a [@bits raw_select_width]
-      (** slot shown on [raw]: R slots, then F slots *)
       ; ring : 'a R.State.t [@rtlmangle "_"] (** unused in [Model] mode *)
       }
     [@@deriving hardcaml]
@@ -751,9 +748,6 @@ module Make (C : Config) (R : Ring.S) = struct
     type 'a t =
       { event : 'a Event.t [@rtlmangle "_"]
       ; status : 'a Status.t [@rtlmangle "_"]
-      ; raw : 'a Record.t [@rtlmangle "_"]
-      (** raw bits of the slot [raw_select], straight from the front (not
-          synchronised: sample it twice, while that slot is not written) *)
       }
     [@@deriving hardcaml]
   end
@@ -786,7 +780,7 @@ module Make (C : Config) (R : Ring.S) = struct
     end
 
     let create ?first_stage ~name scope ~clock ~clear ~clear_status ~pin_enable ~length_sel
-      ~raw_select (front : Signal.t Front.t)
+      (front : Signal.t Front.t)
       =
       let ( -- ) = Scope.naming scope in
       let spec = Reg_spec.create ~clock () in
@@ -1144,11 +1138,7 @@ module Make (C : Config) (R : Ring.S) = struct
         ; fault = sd.fault
         }
       in
-      let raw =
-        Record.Of_signal.unpack
-          (mux raw_select (List.map (front.slots_r @ front.slots_f) ~f:Record.Of_signal.pack))
-      in
-      ( { O.event; status; raw }
+      ( { O.event; status }
       , { enable = en; ptr_reset_n = ~:ptr_reset; edge_reset_n = ~:edge_reset; ptr_reset } )
     ;;
   end
@@ -1179,7 +1169,6 @@ module Make (C : Config) (R : Ring.S) = struct
         ~clear_status:i.clear_status
         ~pin_enable:i.pin_enable
         ~length_sel:i.length_sel
-        ~raw_select:i.raw_select
         front
     in
     Signal.assign enable ctl.enable;
