@@ -916,8 +916,15 @@ module Make (C : Config) (R : Ring.S) = struct
          XOR tree have no capture, so the next capture's snapshot attributes
          them with its own (wrong) time: once everything is drained and
          stable, captures - attributions is then negative. The pins
-         attributed since the balance was last 0 are flagged. *)
-      let balance = wire 5 in
+         attributed since the balance was last 0 are flagged.
+         A read adds 1 - k (k <= pins), and reads between checks are
+         unbounded (the FIFO need not empty), so no width holds every value.
+         Without errors the balance stays in [1 - pins, 0]; it is [bw] bits
+         signed, [2^(bw-1) > pins]: it saturates at the top, and once it
+         reaches the floor [-2^(bw-1)] (< 1 - pins: unmatched attributions)
+         it stays there until the check, which flags. *)
+      let bw = num_bits_to_represent pins + 1 in
+      let balance = wire bw in
       let unconfirmed = wire pins in
       let all_stable =
         lv ==: lv_p &: (ec ==: ec_p) &: (guard ==:. 0)
@@ -925,7 +932,11 @@ module Make (C : Config) (R : Ring.S) = struct
       let balance_check = do_check &: all_stable in
       let attributed = popcount (changed |: reconfig) in
       let balance_read =
-        balance +:. 1 -: uresize attributed ~width:5
+        let floor = of_int_trunc ~width:(bw + 1) (-(1 lsl (bw - 1))) in
+        let top = of_int_trunc ~width:(bw + 1) ((1 lsl (bw - 1)) - 1) in
+        let sum = sresize balance ~width:(bw + 1) +:. 1 -: uresize attributed ~width:(bw + 1) in
+        let sat = mux2 (sum <+ floor) floor (mux2 (sum >+ top) top sum) in
+        mux2 (balance ==: sel_bottom floor ~width:bw) balance (sel_bottom sat ~width:bw)
       in
       (* Excess captures (balance > 0: pulses narrower than the merge
          window, two empty captures) are caught by the pin's edge count. *)
@@ -1062,7 +1073,7 @@ module Make (C : Config) (R : Ring.S) = struct
       Signal.assign
         balance
         (rc
-           (mux2 (resync_done |: balance_check) (zero 5)
+           (mux2 (resync_done |: balance_check) (zero bw)
               (mux2 do_read balance_read balance)));
       Signal.assign
         unconfirmed

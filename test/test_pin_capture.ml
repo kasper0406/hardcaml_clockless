@@ -542,3 +542,24 @@ let%expect_test "pins high at reset: edges counted forward, no false lost_edge" 
     edges 12: timed 12, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
     |}]
 ;;
+
+(* --- 9. Capture balance over many reads ---------------------------------- *)
+
+let%expect_test "capture balance far below 0 between checks: merge_error, not wrapped" =
+  (* Each cycle, pins 0+1 and 2+3 toggle in cancelling pairs, then pin 0
+     again: one capture attributing pins 1-3 (balance -2). The levels change
+     every cycle, so there is no balance check until the end: -18 after 9
+     cycles. Pin 0 loses 18 edges (2 mod 4: lost_edge). *)
+  let edges =
+    List.concat_map (List.init 9 ~f:Fn.id) ~f:(fun g ->
+      let t = ((40 + g) * spc) + 100 in
+      List.map [ 0, 0; 1, 1; 3, 2; 4, 3; 7, 0 ] ~f:(fun (dt, pin) -> { Ref.time = t + dt; pin }))
+  in
+  let r = run ~edges ~cycles:500 () in
+  print_status r.status;
+  print_endline (Capture_oracle.pp (oracle ~edges r));
+  [%expect {|
+    status: fault 0 (0) overflow 0 (0) lost_edge 1 (1) level_mismatch 0 (0) merge_error e (1) empty 0 stale 0 resyncing 0
+    edges 45: timed 18, untimed 0, lost+flagged 27, bad+flagged 9 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    |}]
+;;
