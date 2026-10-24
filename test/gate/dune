@@ -1,0 +1,7 @@
+; The Nov 21 gate run for Pin_capture (long; not part of `dune runtest`):
+;   dune exec test/gate/capture_gate.exe -- EDGES_PER_CORNER [SEED]
+(executable
+ (name capture_gate)
+ (libraries hardcaml_clockless hardcaml_clockless_test hardcaml stdio unix)
+ (preprocess
+  (pps ppx_jane ppx_hardcaml)))
