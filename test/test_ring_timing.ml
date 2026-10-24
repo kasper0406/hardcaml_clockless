@@ -6,18 +6,20 @@
    transition of nodes 0..n-1 and of every counter bit is recorded, with the
    sampler's setup/hold aperture for it (the dfrbpq D constraint tables at
    that transition's slew and the clock slew, as Event_sim applies them):
-   - A clock edge at [t] can decode phase [q] only if [t] is in
-     [R q = (T q - hold, T (q+1) + setup)], where [T q] is the q-th node
-     transition of the wavefront: node [q] may read new and node [q+1] old.
-     The majority filter cannot produce anything outside that. Because the
-     aperture is wider than a stage, this covers the +-1 stage of phase
-     decode uncertainty, and more.
+   - Let [T q] be the q-th node transition of the wavefront. A clock edge at
+     [t] can read node [q] new if [t > T q - hold], and old if [t < T q +
+     setup]. A majority-filtered position takes a value only if two of its
+     three raw inputs can, so phase [q] (positions up to [q] new, from [q+1]
+     old) is possible only in an interval [R q] built from medians of three.
+     Because the aperture is wider than a stage, this covers the +-1 stage of
+     phase decode uncertainty, and more.
    - A counter is unstable for a clock edge in [(first change - hold, last
-     change + setup)] after its own node-0 edge.
+     change + setup)] after its own node-0 edge, over all its bits.
    - The margin before a counter's window is the gap between its unstable
      interval and the [R] of the first phase it is read at; the margin after
      is the gap between the [R] of the last phase it is read at and its next
-     unstable interval. Both are converted to stages by the mean stage delay.
+     unstable interval. Both are converted to stages by the mean inverter
+     stage delay.
 
    Every sample is also checked end to end: its decoded phase is one the
    model allows, its decoded time is that phase's wavefront index, and no
@@ -54,6 +56,10 @@ let corners =
 
 let dfrbpq_cell = "sg13cmos5l_dfrbpq_1"
 let clock_period = Event_sim.of_ns 20.
+
+(* For the end-to-end checks: not close to a simple multiple of any ring
+   period here, so the samples visit every phase (checked). *)
+let sample_period = Event_sim.of_ps 19_937.
 
 (* Asserted at every corner and length, on both sides of both windows. *)
 let min_margin_stages = 4.
@@ -143,6 +149,7 @@ module Measure (Config : Ring.Timed_config) = struct
 
   (* Margins for one length at one corner; returns the smallest, in stages. *)
   let margins ~corner ~path ~n =
+    let clock_period = sample_period in
     let tl, sim = create_sim ~path ~n ~clock_period in
     let clock_slew () = Event_sim.slew_ns sim "clock" in
     let record name ~f =
@@ -300,6 +307,9 @@ module Measure (Config : Ring.Timed_config) = struct
         |> Option.map ~f:(fun q' -> q', t))
     in
     let impossible_phase = List.count matched ~f:Option.is_none in
+    let visited =
+      List.map samples ~f:(fun (_, _, p, _) -> p) |> List.dedup_and_sort ~compare:Int.compare |> List.length
+    in
     let modulus = (1 lsl R.count_width) * 2 * n in
     let offsets = List.filter_map matched ~f:(Option.map ~f:(fun (q, t) -> (t - q) % modulus)) in
     let mode =
@@ -333,9 +343,9 @@ module Measure (Config : Ring.Timed_config) = struct
       (Event_sim.to_ps (Float.iround_nearest_exn stage)) sa_max (2 * n) sa_min sb_max (2 * n)
       sb_min s a_before a_after b_before b_after;
     printf
-      "     bins: NAND %3.0f/%3.0f ps, after node 0 %2.0f/%2.0f, others %2.0f..%2.0f | %d samples: X %d, pattern errors %d, outside model %d, time wrong %d, selected counter caught %d, counter metastable %d\n"
+      "     bins: NAND %3.0f/%3.0f ps, after node 0 %2.0f/%2.0f, others %2.0f..%2.0f | %d samples, %d/%d phases: X %d, pattern errors %d, outside model %d, time wrong %d, selected counter caught %d, counter metastable %d\n"
       (List.nth_exn bins (n - 1)) (List.nth_exn bins ((2 * n) - 1)) (List.nth_exn bins 0)
-      (List.nth_exn bins n) lo_others hi_others (List.length samples) unknown pattern_errors
+      (List.nth_exn bins n) lo_others hi_others (List.length samples) visited (2 * n) unknown pattern_errors
       impossible_phase time_errors caught counter_meta;
     worst
   ;;
@@ -435,31 +445,31 @@ let%expect_test "counter selection margins with Liberty delays at three corners"
   [%expect {|
     selectable length (mux in the loop):
     typ  n=15 period 1568 ps, stage 35.2 ps | safe phases A [12, 30+7) B [11, 30+6) | s=17 margins A 12.0/ 5.2 B 13.7/ 4.8 stages
-         bins: NAND 281/302 ps, after node 0 31/40, others 29..52 | 393 samples: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
+         bins: NAND 281/302 ps, after node 0 31/40, others 29..52 | 393 samples, 30/30 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     typ  n=17 period 1726 ps, stage 35.8 ps | safe phases A [12, 34+7) B [11, 34+6) | s=18 margins A 13.9/ 6.2 B 13.9/ 5.5 stages
-         bins: NAND 279/302 ps, after node 0 31/40, others 29..52 | 393 samples: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
+         bins: NAND 279/302 ps, after node 0 31/40, others 29..52 | 393 samples, 34/34 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     typ  n=21 period 1793 ps, stage 35.5 ps | safe phases A [12, 42+7) B [11, 42+6) | s=20 margins A  8.9/12.4 B  8.5/11.9 stages
-         bins: NAND 185/188 ps, after node 0 31/40, others 29..52 | 393 samples: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
+         bins: NAND 185/188 ps, after node 0 31/40, others 29..52 | 393 samples, 42/42 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     slow n=15 period 2500 ps, stage 55.8 ps | safe phases A [12, 30+7) B [11, 30+6) | s=17 margins A 12.1/ 4.8 B 13.8/ 4.5 stages
-         bins: NAND 446/490 ps, after node 0 39/72, others 36..92 | 393 samples: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
+         bins: NAND 446/490 ps, after node 0 39/72, others 36..92 | 393 samples, 30/30 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     slow n=17 period 2756 ps, stage 56.9 ps | safe phases A [12, 34+7) B [11, 34+6) | s=18 margins A 14.1/ 6.0 B 13.9/ 5.0 stages
-         bins: NAND 446/490 ps, after node 0 39/72, others 36..93 | 393 samples: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
+         bins: NAND 446/490 ps, after node 0 39/72, others 36..93 | 393 samples, 34/34 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     slow n=21 period 2862 ps, stage 56.4 ps | safe phases A [12, 42+7) B [11, 42+6) | s=20 margins A  8.9/12.2 B  8.5/11.6 stages
-         bins: NAND 296/309 ps, after node 0 39/72, others 36..93 | 393 samples: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
+         bins: NAND 296/309 ps, after node 0 39/72, others 36..93 | 393 samples, 42/42 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     fast n=15 period 1044 ps, stage 23.7 ps | safe phases A [12, 30+7) B [11, 30+6) | s=17 margins A 12.0/ 5.0 B 13.5/ 5.1 stages
-         bins: NAND 177/202 ps, after node 0 13/34, others 12..41 | 393 samples: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
+         bins: NAND 177/202 ps, after node 0 13/34, others 12..41 | 393 samples, 30/30 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     fast n=17 period 1152 ps, stage 24.1 ps | safe phases A [12, 34+7) B [11, 34+6) | s=18 margins A 14.1/ 6.3 B 13.6/ 5.5 stages
-         bins: NAND 178/202 ps, after node 0 13/34, others 12..42 | 393 samples: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
+         bins: NAND 178/202 ps, after node 0 13/34, others 12..42 | 393 samples, 34/34 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     fast n=21 period 1204 ps, stage 24.0 ps | safe phases A [12, 42+7) B [11, 42+6) | s=20 margins A  9.2/12.3 B  8.6/11.9 stages
-         bins: NAND 117/128 ps, after node 0 13/34, others 12..42 | 393 samples: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
+         bins: NAND 117/128 ps, after node 0 13/34, others 12..42 | 393 samples, 42/42 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     every margin >= 4 stages: true
     fixed length:
     typ  n=17 period 1267 ps, stage 34.4 ps | safe phases A [12, 34+7) B [11, 34+6) | s=18 margins A  8.4/ 6.5 B  7.1/ 5.8 stages
-         bins: NAND  94/ 72 ps, after node 0 30/40, others 29..40 | 393 samples: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
+         bins: NAND  94/ 72 ps, after node 0 30/40, others 29..40 | 393 samples, 34/34 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     slow n=17 period 2018 ps, stage 54.6 ps | safe phases A [12, 34+7) B [11, 34+6) | s=18 margins A  8.5/ 6.2 B  7.1/ 5.2 stages
-         bins: NAND 146/124 ps, after node 0 39/72, others 36..74 | 393 samples: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
+         bins: NAND 146/124 ps, after node 0 39/72, others 36..74 | 393 samples, 34/34 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     fast n=17 period  855 ps, stage 23.3 ps | safe phases A [12, 34+7) B [11, 34+6) | s=18 margins A  8.7/ 6.6 B  7.2/ 5.7 stages
-         bins: NAND  56/ 54 ps, after node 0 13/34, others 12..34 | 393 samples: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
+         bins: NAND  56/ 54 ps, after node 0 13/34, others 12..34 | 393 samples, 34/34 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     every margin >= 4 stages: true
     |}]
 ;;
