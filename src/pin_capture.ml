@@ -703,23 +703,16 @@ module Make (C : Config) (R : Ring.S) = struct
     type 'a t =
       { resyncing : 'a
       ; capture_fault : 'a (** sticky *)
-      ; fault_count : 'a [@bits status_width]
       ; overflow : 'a (** sticky *)
-      ; overflow_count : 'a [@bits status_width]
       ; lost_edge : 'a [@bits pins] (** sticky, per pin *)
-      ; lost_edge_count : 'a [@bits status_width]
       ; level_mismatch : 'a [@bits pins] (** sticky, per pin *)
-      ; level_mismatch_count : 'a [@bits status_width]
       ; merge_error : 'a [@bits pins]
       (** sticky, per pin: attributions not matched by captures (edges that
           cancelled in the XOR were attributed to a later capture) *)
-      ; merge_error_count : 'a [@bits status_width]
-      ; empty_count : 'a [@bits status_width]
-      ; stale_count : 'a [@bits status_width]
-      ; runt_count : 'a [@bits status_width]
-      (** a bank missed a toggle the other saw (read order re-aligned) *)
       ; fault_now : 'a
       ; runt_now : 'a
+      (** a bank missed a toggle the other saw (read order re-aligned) *)
+      ; empty_now : 'a (** an empty capture was dropped *)
       ; overflow_now : 'a
       ; lost_edge_now : 'a [@bits pins]
       ; level_mismatch_now : 'a [@bits pins]
@@ -1090,28 +1083,16 @@ module Make (C : Config) (R : Ring.S) = struct
       let edge_reset = r clear in
       (* --- Status --- *)
       let sticky x = reg_fb specc ~width:(width x) ~f:(fun s -> mux2 clear_status (zero (width x)) (s |: x)) in
-      let counter x =
-        reg_fb specc ~width:status_width ~f:(fun c ->
-          mux2 clear_status (zero status_width) (c +: uresize x ~width:status_width))
-      in
-      let count_bits x = popcount x in
       let status =
         { Status.resyncing = resync
         ; capture_fault = sticky fault_now
-        ; fault_count = counter fault_now
         ; overflow = sticky mark_ovf
-        ; overflow_count = counter (ovf_now |: late_ovf)
         ; lost_edge = sticky count_bad
-        ; lost_edge_count = counter (count_bits count_bad)
         ; level_mismatch = sticky level_bad
-        ; level_mismatch_count = counter (count_bits level_bad)
         ; merge_error = sticky merge_error
-        ; merge_error_count = counter merge_bad
-        ; empty_count = counter empty_event
-        ; stale_count = counter (popcount sd.stale &: repeat timed ~count:(num_bits_to_represent pins))
         ; fault_now = r fault_now
         ; runt_now = r runt
-        ; runt_count = counter runt
+        ; empty_now = r empty_event
         ; overflow_now = r mark_ovf
         ; lost_edge_now = r count_bad
         ; level_mismatch_now = r level_bad
