@@ -70,7 +70,7 @@ module type Config = sig
       number of physical stages. *)
   val lengths : int list
 
-  (** Johnson prescaler flops K: it counts 2K ring periods. *)
+  (** Johnson prescaler flops K: it counts 2K ring periods. A power of two. *)
   val johnson_bits : int
 
   (** Gray counter width, counting prescaler wraps. *)
@@ -315,7 +315,8 @@ module type S = sig
     end
 
     (** [first_stage]: build the asynchronous first stage from flip-flop cells
-        (named [<name>_sample_*]) instead of kept Hardcaml registers. *)
+        (instances named [<name>_sample_*], their outputs [<name>_sample_*_q])
+        instead of kept Hardcaml registers. *)
     val create
       :  ?first_stage:Cell_library.t * flop
       -> name:string
@@ -334,6 +335,10 @@ module Make (C : Config) : S = struct
     if not (List.is_sorted_strictly lengths ~compare:Int.compare) then bad "lengths ascending";
     List.iter lengths ~f:(fun n -> if n < 3 || n % 2 = 0 then bad "lengths odd and >= 3");
     if johnson_bits < 1 || gray_width < 1 then bad "counter widths >= 1";
+    (* The decoded count wraps modulo 2^count_width; the counter wraps modulo
+       2 * johnson_bits * 2^gray_width. They agree (so [B - 1] at count 0 is
+       right) only when [johnson_bits] is a power of two. *)
+    if not (Int.is_pow2 johnson_bits) then bad "johnson_bits a power of two";
     List.iter lengths ~f:(fun n ->
       let s = (n + counter_settle_stages + 1) / 2 in
       if counter_settle_stages < 0 || s <= counter_settle_stages || s >= n
@@ -651,7 +656,9 @@ module Make (C : Config) : S = struct
           let r = reg spec b in
           List.iter Cell.attributes ~f:(fun a -> ignore (add_attribute r a : Signal.t));
           r -- nm
-        | Some (library, f) -> flop_cell library f ~instance:nm ~clk:i.clock ~reset_n:vdd b -- nm
+        | Some (library, f) ->
+          (* the instance keeps [nm]; a wire of the same name would rename it *)
+          flop_cell library f ~instance:nm ~clk:i.clock ~reset_n:vdd b -- (nm ^ "_q")
       in
       let first x nm =
         let nm = Printf.sprintf "%s_sample_%s" name nm in
