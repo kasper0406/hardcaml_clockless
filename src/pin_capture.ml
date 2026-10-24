@@ -958,12 +958,17 @@ module Make (C : Config) (R : Ring.S) = struct
         ; fault = gnd
         }
       in
-      (* Only the ring part of the record goes on, to the decoder. *)
-      let ring_a =
-        R.State.Of_signal.reg
-          spec
+      (* The ring part of the record is decoded in the read cycle; only the
+         phase, period count and pattern error go on (the time is formed at
+         the output). *)
+      let length_sel_q = r (r length_sel) in
+      let dec_now =
+        R.decode
+          ~length_sel:length_sel_q
           { R.State.nodes = record.nodes; count_a = record.count_a; count_b = record.count_b }
       in
+      let slim (d : Signal.t R.Decoded.t) = concat_lsb [ d.phase; d.periods; d.pattern_error ] in
+      let dec_a = r (slim dec_now) in
       (* Marks from overflow/fault detection reach every event in flight. *)
       let mark_ovf = wire 1 in
       let mark_fault = wire 1 in
@@ -972,11 +977,27 @@ module Make (C : Config) (R : Ring.S) = struct
         { s with overflow = s.overflow |: mark_ovf; fault = s.fault |: mark_fault }
       in
       let sa = stage_reg (marked stage_a) in
-      let length_sel_q = r (r length_sel) in
       let sb = stage_reg (marked sa) in
-      let dec_b = R.Decoded.Of_signal.reg spec (R.decode ~length_sel:length_sel_q ring_a) in
+      let dec_b = r dec_a in
       let sc = stage_reg (marked sb) in
-      let dec_d = R.Decoded.Of_signal.reg spec dec_b in
+      let dec_d =
+        let x = r dec_b in
+        let pw = R.phase_width
+        and cw = R.count_width
+        and tw = R.time_width in
+        let phase = sel_bottom x ~width:pw in
+        let periods = x.:[pw + cw - 1, pw] in
+        let time =
+          mux
+            length_sel_q
+            (List.map R.lengths ~f:(fun n ->
+               (uresize periods ~width:tw *: of_int_trunc ~width:pw (2 * n) |> uresize ~width:tw)
+               +: uresize phase ~width:tw)
+             |> fun xs ->
+             xs @ List.init ((1 lsl R.select_width) - List.length xs) ~f:(fun _ -> List.last_exn xs))
+        in
+        { R.Decoded.phase; periods; time; pattern_error = msb x }
+      in
       (* Overwrite check: the pointer sample registered two edges after the
          read covers every write that landed before the read edge (a write
          just before it may resolve late in the first synchroniser stage).
