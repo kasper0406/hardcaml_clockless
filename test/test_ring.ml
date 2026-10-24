@@ -258,6 +258,7 @@ let%expect_test "cells mode: hand-placed loop, loop-break pin, counters on ring 
          ; nand2 = "sg13cmos5l_nand2_1"
          ; inverter = "sg13cmos5l_inv_1"
          ; mux2 = "sg13cmos5l_mux2_1"
+         ; flop = None
          })
       ~enable
       ~length_sel
@@ -287,44 +288,61 @@ let%expect_test "cells mode: hand-placed loop, loop-break pin, counters on ring 
         output [3:0] count_a;
         output [3:0] count_b;
 
-        wire [1:0] signal_const;
-        wire [1:0] signal_const_1;
+        wire signal_const;
         wire signal_select;
-        wire signal_not;
+        reg signal_reg;
         wire signal_select_1;
         wire [1:0] signal_cat;
-        reg [1:0] signal_reg;
-        wire [1:0] signal_wire;
-        wire signal_eq;
+        wire [1:0] signal_const_3;
         wire signal_select_2;
-        wire signal_const_3;
         wire [1:0] signal_cat_1;
-        wire [1:0] signal_const_4;
-        wire signal_select_3;
-        wire [1:0] signal_cat_2;
         wire [1:0] signal_xor;
         wire [1:0] signal_add;
         wire [1:0] signal_xor_1;
-        reg [1:0] signal_reg_1;
+        wire [1:0] signal_const_4;
+        wire signal_select_3;
+        reg signal_reg_1;
+        wire signal_select_4;
+        wire signal_not;
+        wire signal_select_5;
+        wire [1:0] signal_cat_2;
+        wire signal_select_6;
+        reg signal_reg_2;
+        wire [1:0] signal_cat_3;
+        wire [1:0] signal_wire;
+        wire signal_eq;
+        wire [1:0] signal_mux;
+        wire signal_select_7;
+        reg signal_reg_3;
+        wire [1:0] signal_cat_4;
         wire [1:0] signal_wire_1;
         wire [3:0] ring_count_b;
-        wire signal_select_4;
-        wire signal_not_1;
-        wire signal_select_5;
-        wire [1:0] signal_cat_3;
-        reg [1:0] signal_reg_2;
-        wire [1:0] signal_wire_2;
-        wire signal_eq_1;
-        wire signal_not_2;
-        wire signal_select_6;
-        wire [1:0] signal_cat_4;
-        wire signal_select_7;
-        wire gnd;
+        wire signal_select_8;
+        reg signal_reg_4;
+        wire signal_select_9;
         wire [1:0] signal_cat_5;
+        wire signal_select_10;
+        wire gnd;
+        wire [1:0] signal_cat_6;
         wire [1:0] signal_xor_2;
         wire [1:0] signal_add_1;
         wire [1:0] signal_xor_3;
-        reg [1:0] signal_reg_3;
+        wire signal_select_11;
+        reg signal_reg_5;
+        wire signal_not_1;
+        wire signal_select_12;
+        wire signal_not_2;
+        wire signal_select_13;
+        wire [1:0] signal_cat_7;
+        wire signal_select_14;
+        reg signal_reg_6;
+        wire [1:0] signal_cat_8;
+        wire [1:0] signal_wire_2;
+        wire signal_eq_1;
+        wire [1:0] signal_mux_1;
+        wire signal_select_15;
+        reg signal_reg_7;
+        wire [1:0] signal_cat_9;
         wire [1:0] signal_wire_3;
         wire [3:0] ring_count_a;
         wire signal_inst;
@@ -340,75 +358,114 @@ let%expect_test "cells mode: hand-placed loop, loop-break pin, counters on ring 
         wire ring_node3;
         wire signal_inst_5;
         wire ring_node4;
-        wire [4:0] signal_cat_6;
-        assign signal_const = 2'b10;
-        assign signal_const_1 = 2'b00;
-        assign signal_select = signal_wire[1:1];
-        assign signal_not = ~ signal_select;
-        assign signal_select_1 = signal_wire[0:0];
-        assign signal_cat = { signal_select_1,
-                              signal_not };
-        always @(negedge ring_node0 or posedge signal_not_2) begin
-            if (signal_not_2)
-                signal_reg <= signal_const_1;
+        wire [4:0] signal_cat_10;
+        assign signal_const = 1'b0;
+        assign signal_select = signal_mux[0:0];
+        always @(negedge ring_node0 or posedge signal_not_1) begin
+            if (signal_not_1)
+                signal_reg <= signal_const;
             else
-                signal_reg <= signal_cat;
+                signal_reg <= signal_select;
         end
-        assign signal_wire = signal_reg;
-        assign signal_eq = signal_wire == signal_const;
-        assign signal_select_2 = signal_add[1:1];
-        assign signal_const_3 = 1'b0;
-        assign signal_cat_1 = { signal_const_3,
+        assign signal_select_1 = signal_add[1:1];
+        assign signal_cat = { signal_const,
+                              signal_select_1 };
+        assign signal_const_3 = 2'b01;
+        assign signal_select_2 = signal_wire_1[1:1];
+        assign signal_cat_1 = { gnd,
                                 signal_select_2 };
-        assign signal_const_4 = 2'b01;
-        assign signal_select_3 = signal_wire_1[1:1];
-        assign signal_cat_2 = { gnd,
-                                signal_select_3 };
-        assign signal_xor = signal_wire_1 ^ signal_cat_2;
-        assign signal_add = signal_xor + signal_const_4;
-        assign signal_xor_1 = signal_add ^ signal_cat_1;
-        always @(negedge ring_node0 or posedge signal_not_2) begin
-            if (signal_not_2)
-                signal_reg_1 <= signal_const_1;
+        assign signal_xor = signal_wire_1 ^ signal_cat_1;
+        assign signal_add = signal_xor + signal_const_3;
+        assign signal_xor_1 = signal_add ^ signal_cat;
+        assign signal_const_4 = 2'b10;
+        assign signal_select_3 = signal_cat_2[0:0];
+        always @(negedge ring_node0 or posedge signal_not_1) begin
+            if (signal_not_1)
+                signal_reg_1 <= signal_const;
             else
-                if (signal_eq)
-                    signal_reg_1 <= signal_xor_1;
+                signal_reg_1 <= signal_select_3;
         end
-        assign signal_wire_1 = signal_reg_1;
+        assign signal_select_4 = signal_wire[1:1];
+        assign signal_not = ~ signal_select_4;
+        assign signal_select_5 = signal_wire[0:0];
+        assign signal_cat_2 = { signal_select_5,
+                                signal_not };
+        assign signal_select_6 = signal_cat_2[1:1];
+        always @(negedge ring_node0 or posedge signal_not_1) begin
+            if (signal_not_1)
+                signal_reg_2 <= signal_const;
+            else
+                signal_reg_2 <= signal_select_6;
+        end
+        assign signal_cat_3 = { signal_reg_2,
+                                signal_reg_1 };
+        assign signal_wire = signal_cat_3;
+        assign signal_eq = signal_wire == signal_const_4;
+        assign signal_mux = signal_eq ? signal_xor_1 : signal_wire_1;
+        assign signal_select_7 = signal_mux[1:1];
+        always @(negedge ring_node0 or posedge signal_not_1) begin
+            if (signal_not_1)
+                signal_reg_3 <= signal_const;
+            else
+                signal_reg_3 <= signal_select_7;
+        end
+        assign signal_cat_4 = { signal_reg_3,
+                                signal_reg };
+        assign signal_wire_1 = signal_cat_4;
         assign ring_count_b = { signal_wire_1,
                                 signal_wire };
-        assign signal_select_4 = signal_wire_2[1:1];
-        assign signal_not_1 = ~ signal_select_4;
-        assign signal_select_5 = signal_wire_2[0:0];
-        assign signal_cat_3 = { signal_select_5,
-                                signal_not_1 };
-        always @(posedge ring_node0 or posedge signal_not_2) begin
-            if (signal_not_2)
-                signal_reg_2 <= signal_const_1;
+        assign signal_select_8 = signal_mux_1[0:0];
+        always @(posedge ring_node0 or posedge signal_not_1) begin
+            if (signal_not_1)
+                signal_reg_4 <= signal_const;
             else
-                signal_reg_2 <= signal_cat_3;
+                signal_reg_4 <= signal_select_8;
         end
-        assign signal_wire_2 = signal_reg_2;
-        assign signal_eq_1 = signal_wire_2 == signal_const;
-        assign signal_not_2 = ~ enable;
-        assign signal_select_6 = signal_add_1[1:1];
-        assign signal_cat_4 = { signal_const_3,
-                                signal_select_6 };
-        assign signal_select_7 = signal_wire_3[1:1];
+        assign signal_select_9 = signal_add_1[1:1];
+        assign signal_cat_5 = { signal_const,
+                                signal_select_9 };
+        assign signal_select_10 = signal_wire_3[1:1];
         assign gnd = 1'b0;
-        assign signal_cat_5 = { gnd,
-                                signal_select_7 };
-        assign signal_xor_2 = signal_wire_3 ^ signal_cat_5;
-        assign signal_add_1 = signal_xor_2 + signal_const_4;
-        assign signal_xor_3 = signal_add_1 ^ signal_cat_4;
-        always @(posedge ring_node0 or posedge signal_not_2) begin
-            if (signal_not_2)
-                signal_reg_3 <= signal_const_1;
+        assign signal_cat_6 = { gnd,
+                                signal_select_10 };
+        assign signal_xor_2 = signal_wire_3 ^ signal_cat_6;
+        assign signal_add_1 = signal_xor_2 + signal_const_3;
+        assign signal_xor_3 = signal_add_1 ^ signal_cat_5;
+        assign signal_select_11 = signal_cat_7[0:0];
+        always @(posedge ring_node0 or posedge signal_not_1) begin
+            if (signal_not_1)
+                signal_reg_5 <= signal_const;
             else
-                if (signal_eq_1)
-                    signal_reg_3 <= signal_xor_3;
+                signal_reg_5 <= signal_select_11;
         end
-        assign signal_wire_3 = signal_reg_3;
+        assign signal_not_1 = ~ enable;
+        assign signal_select_12 = signal_wire_2[1:1];
+        assign signal_not_2 = ~ signal_select_12;
+        assign signal_select_13 = signal_wire_2[0:0];
+        assign signal_cat_7 = { signal_select_13,
+                                signal_not_2 };
+        assign signal_select_14 = signal_cat_7[1:1];
+        always @(posedge ring_node0 or posedge signal_not_1) begin
+            if (signal_not_1)
+                signal_reg_6 <= signal_const;
+            else
+                signal_reg_6 <= signal_select_14;
+        end
+        assign signal_cat_8 = { signal_reg_6,
+                                signal_reg_5 };
+        assign signal_wire_2 = signal_cat_8;
+        assign signal_eq_1 = signal_wire_2 == signal_const_4;
+        assign signal_mux_1 = signal_eq_1 ? signal_xor_3 : signal_wire_3;
+        assign signal_select_15 = signal_mux_1[1:1];
+        always @(posedge ring_node0 or posedge signal_not_1) begin
+            if (signal_not_1)
+                signal_reg_7 <= signal_const;
+            else
+                signal_reg_7 <= signal_select_15;
+        end
+        assign signal_cat_9 = { signal_reg_7,
+                                signal_reg_4 };
+        assign signal_wire_3 = signal_cat_9;
         assign ring_count_a = { signal_wire_3,
                                 signal_wire_2 };
         (* keep=1,dont_touch=1 *)
@@ -451,12 +508,12 @@ let%expect_test "cells mode: hand-placed loop, loop-break pin, counters on ring 
             ( .A(ring_node3),
               .Y(signal_inst_5) );
         assign ring_node4 = signal_inst_5;
-        assign signal_cat_6 = { ring_node4,
-                                ring_node3,
-                                ring_node2,
-                                ring_node1,
-                                ring_node0 };
-        assign nodes = signal_cat_6;
+        assign signal_cat_10 = { ring_node4,
+                                 ring_node3,
+                                 ring_node2,
+                                 ring_node1,
+                                 ring_node0 };
+        assign nodes = signal_cat_10;
         assign count_a = ring_count_a;
         assign count_b = ring_count_b;
 

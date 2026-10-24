@@ -43,6 +43,16 @@
     From A, [k = A]. From B, [k = B - (p >= n ? 1 : 0)], because B also counts
     the fall in the current period once [p >= n].
 
+    {2 Loop length and loads}
+
+    Every stage should carry the same load, or its bin is wider. With flop
+    cells, the counter clocks are therefore buffered off node 0: two inverters
+    for counter A, one for counter B. A length-select mux inside the loop makes
+    one very wide bin (~3x a stage per mux level). Event_sim measured bins up to
+    ~400 ps and twice the calibrated error compared with a fixed length (see
+    test/test_ring_timing.ml). Prefer a single length, and escape injection
+    locking to the system clock by changing the clock frequency.
+
     {2 Reset}
 
     While [enable] is low the ring is static (node 0 high, nodes alternate),
@@ -92,18 +102,24 @@ module Counter = struct
     (gray_of_int g lsl johnson_bits) lor johnson_of_index ~johnson_bits m
   ;;
 
-  (** Hardware: a counter clocked by [spec] (the ring edge). *)
-  let create ~johnson_bits ~gray_width spec =
+  (** Hardware, with [flop name d] building one flip-flop per bit. *)
+  let create_with ~johnson_bits ~gray_width ~flop =
     let k = johnson_bits in
     let j = wire k in
     let g = wire gray_width in
     let wrap = j ==:. 1 lsl (k - 1) in
-    let j_next =
-      if k = 1 then ~:j else sel_bottom j ~width:(k - 1) @: ~:(msb j)
+    let j_next = if k = 1 then ~:j else sel_bottom j ~width:(k - 1) @: ~:(msb j) in
+    let flops prefix d =
+      concat_lsb (List.mapi (bits_lsb d) ~f:(fun i b -> flop (Printf.sprintf "%s%d" prefix i) b))
     in
-    Signal.assign j (reg spec j_next);
-    Signal.assign g (reg spec ~enable:wrap (gray_increment g ~by:1));
+    Signal.assign j (flops "j" j_next);
+    Signal.assign g (flops "g" (mux2 wrap (gray_increment g ~by:1) g));
     g @: j
+  ;;
+
+  (** Hardware: a counter of Hardcaml registers clocked by [spec]. *)
+  let create ~johnson_bits ~gray_width spec =
+    create_with ~johnson_bits ~gray_width ~flop:(fun _ d -> reg spec d)
   ;;
 
   (** Decode [johnson @ gray] bits to the period count. *)
@@ -213,11 +229,24 @@ module type S = sig
     [@@deriving hardcaml]
   end
 
+  (** A flip-flop cell with an active-low asynchronous reset. *)
+  type flop =
+    { cell : string
+    ; clk : string
+    ; d : string
+    ; reset_n : string
+    ; q : string
+    }
+
   type cells =
     { library : Cell_library.t
     ; nand2 : string
     ; inverter : string
     ; mux2 : string
+    ; flop : flop option
+    (** Counter flip-flops as hand-placed cells (named [<name>_cnt_{a,b}_{j,g}<i>];
+        counter B is clocked through an inverter [<name>_clkinv_b]). [None]:
+        Hardcaml registers. *)
     }
 
   type implementation =
@@ -267,7 +296,14 @@ module type S = sig
       [@@deriving hardcaml]
     end
 
-    val create : name:string -> Scope.t -> Signal.t I.t -> Signal.t O.t
+    (** [first_stage]: build the asynchronous first stage from flip-flop cells
+        (named [<name>_sample_*]) instead of kept Hardcaml registers. *)
+    val create
+      :  ?first_stage:Cell_library.t * flop
+      -> name:string
+      -> Scope.t
+      -> Signal.t I.t
+      -> Signal.t O.t
   end
 end
 
@@ -312,16 +348,29 @@ module Make (C : Config) : S = struct
     [@@deriving hardcaml]
   end
 
+  type flop =
+    { cell : string
+    ; clk : string
+    ; d : string
+    ; reset_n : string
+    ; q : string
+    }
+
   type cells =
     { library : Cell_library.t
     ; nand2 : string
     ; inverter : string
     ; mux2 : string
+    ; flop : flop option
     }
 
   type implementation =
     | Cells of cells
     | Model of Signal.t Model_stimulus.t
+
+  let flop_cell library (f : flop) ~instance ~clk ~reset_n d =
+    Cell.instantiate library ~cell:f.cell ~instance [ f.clk, clk; f.d, d; f.reset_n, reset_n ] f.q
+  ;;
 
   type loop_break =
     { instance : string
@@ -421,7 +470,7 @@ module Make (C : Config) : S = struct
           ; count_b = encode m.count_b
           }
         , [] )
-      | Cells { library; nand2; inverter; mux2 } ->
+      | Cells { library; nand2; inverter; mux2; flop } ->
         let nand_a, nand_b, nand_y = Pins.nand2 library nand2 in
         let inv_a, inv_y = Pins.inverter library inverter in
         let mux_s, mux_d0, mux_d1, mux_x = Pins.mux2 library mux2 in
@@ -459,12 +508,30 @@ module Make (C : Config) : S = struct
           | _ -> assert false
         in
         Signal.assign fb feedback;
-        let reset = ~:enable in
-        let spec edge = Reg_spec.create ~clock:node0 ~clock_edge:edge ~reset ~reset_level:High () in
-        let counter edge = Counter.create ~johnson_bits ~gray_width (spec edge) in
+        let count_a, count_b =
+          match flop with
+          | None ->
+            let reset = ~:enable in
+            let spec edge = Reg_spec.create ~clock:node0 ~clock_edge:edge ~reset ~reset_level:High () in
+            ( Counter.create ~johnson_bits ~gray_width (spec Rising)
+            , Counter.create ~johnson_bits ~gray_width (spec Falling) )
+          | Some f ->
+            (* Rising-edge cells; counter B is clocked by node 0 inverted. *)
+            (* Counter clocks are buffered so node 0 carries only small,
+               uniform loads like every other node. *)
+            let inv instance x = Cell.instantiate library ~cell:inverter ~instance [ inv_a, x ] inv_y in
+            let node0_n = inv (name ^ "_clkinv_b") node0 in
+            let node0_buf = inv (name ^ "_clkinv_a1") node0 |> inv (name ^ "_clkinv_a2") in
+            let counter tag clk =
+              Counter.create_with ~johnson_bits ~gray_width ~flop:(fun bit d ->
+                flop_cell library f ~instance:(Printf.sprintf "%s_cnt_%s_%s" name tag bit) ~clk
+                  ~reset_n:enable d)
+            in
+            counter "a" node0_buf, counter "b" node0_n
+        in
         ( { State.nodes = nodes_named (Array.to_list nodes)
-          ; count_a = counter Rising -- (name ^ "_count_a")
-          ; count_b = counter Falling -- (name ^ "_count_b")
+          ; count_a = count_a -- (name ^ "_count_a")
+          ; count_b = count_b -- (name ^ "_count_b")
           }
         , [ { instance = nand_instance; pin = nand_b } ] )
     ;;
@@ -493,15 +560,24 @@ module Make (C : Config) : S = struct
       [@@deriving hardcaml]
     end
 
-    let create ~name scope (i : Signal.t I.t) : Signal.t O.t =
+    let create ?first_stage ~name scope (i : Signal.t I.t) : Signal.t O.t =
       I.Of_signal.assert_widths i;
       let ( -- ) = Scope.naming scope in
       let spec = Reg_spec.create ~clock:i.clock () in
       (* First stage: catches the asynchronous ring state. Kept and named. *)
+      let first_bit b nm =
+        match first_stage with
+        | None ->
+          let r = reg spec b in
+          List.iter Cell.attributes ~f:(fun a -> ignore (add_attribute r a : Signal.t));
+          r -- nm
+        | Some (library, f) -> flop_cell library f ~instance:nm ~clk:i.clock ~reset_n:vdd b -- nm
+      in
       let first x nm =
-        let r = reg spec x in
-        List.iter Cell.attributes ~f:(fun a -> ignore (add_attribute r a : Signal.t));
-        r -- Printf.sprintf "%s_sample_%s" name nm
+        let nm = Printf.sprintf "%s_sample_%s" name nm in
+        if Signal.width x = 1
+        then first_bit x nm
+        else concat_lsb (List.mapi (bits_lsb x) ~f:(fun k b -> first_bit b (Printf.sprintf "%s_%d" nm k)))
       in
       let s1 =
         { State.nodes =
