@@ -31,25 +31,38 @@
     Counter A counts rising edges of node 0, at [p = 0]. Counter B counts
     falling edges, at [p = n]. Each is a Johnson prescaler of [johnson_bits]
     flops (single-bit change, one gate level, fast enough for the ring
-    clock), plus a Gray counter enabled on the Johnson wrap. Both are clocked
-    by the same edge, so a counter is only unreliable for a short {e settle}
-    window after its own edge. That window is roughly clock-to-Q plus the
-    clock buffer, and is about the same number of stage delays at every corner,
-    because both scale with the process.
+    clock), plus a Gray counter enabled on the Johnson wrap. All its flops
+    are clocked by the same edge, so a counter changes only in a short window
+    after its own edge, and a sampler reads it whole outside that window. In
+    decoded phases after the edge the window is [[E, L)]: it opens after the
+    clock buffer and clock-to-Q, closes after the last bit change, and each
+    end is widened by the sampler's setup/hold aperture and the phase
+    decode's uncertainty. Both ends are about the same number of stages at
+    every corner, because they scale with the process (test/test_ring_timing.ml
+    measures [E = 6], [L = 12] with sg13cmos5l flop cells). The counter's
+    stable interval is phases [[L, 2n + E)] after its edge.
 
-    A sampler uses counter A when [p] is in [[s, n + s)] and counter B
-    otherwise, where [s = (n + settle + 1) / 2]. Then neither is read within
-    [settle] stages after its edge, with equal margin before its next edge.
-    From A, [k = A]. From B, [k = B - (p >= n ? 1 : 0)], because B also counts
-    the fall in the current period once [p >= n].
+    A sampler uses counter A when [p] is in [[s, s + n)] (modulo [2n]) and
+    counter B otherwise, where [s = (n + L + E + 1) / 2]. That centres each
+    counter's [n]-phase window in its stable interval, with margin [s - L]
+    after the change and [n + E - s] before the next one. From A, [k = A];
+    when [s > n], A's window wraps into [[0, s - n)], where A has not yet
+    counted this period's rise, so [k = A + (p < n ? 1 : 0)]. From B, [k =
+    B]; when [s < n], B's window includes [[n + s, 2n)], where B has already
+    counted this period's fall, so [k = B - (p >= n ? 1 : 0)].
 
     {2 Loop length and loads}
 
     Every stage should carry the same load, or its bin is wider. With flop
-    cells, the counter clocks are therefore buffered off node 0: two inverters
-    for counter A, one for counter B. A length-select mux inside the loop makes
-    one very wide bin (~3x a stage per mux level). Event_sim measured bins up to
-    ~400 ps and twice the calibrated error compared with a fixed length (see
+    cells, the counter clocks are buffered off node 0 (two inverters for
+    counter A, one for counter B), but node 0 still drives three inverter
+    inputs and a sampler, against one inverter and a sampler on other nodes,
+    and it is the NAND output. The two bins ending at node 0 measure ~2-2.5x
+    an inverter stage (94 and 72 ps against 29-40 ps, typ). Calibration
+    absorbs that; a single clock buffer off node 0, or matching dummy loads,
+    would narrow them. A length-select mux inside the loop makes one very wide
+    bin (~3x a stage per mux level). Event_sim measured bins up to ~500 ps and
+    twice the calibrated error compared with a fixed length (see
     test/test_ring_timing.ml). Prefer a single length, and escape injection
     locking to the system clock by changing the clock frequency.
 
@@ -76,9 +89,21 @@ module type Config = sig
   (** Gray counter width, counting prescaler wraps. *)
   val gray_width : int
 
-  (** Stage delays after a counter's clock edge during which it may be read
-      half-updated. *)
+  (** [L]: decoded phases after a counter's clock edge from which a sampler
+      reads its new value whole (the last bit change, widened by the
+      sampler's aperture and the phase decode; see the module doc). *)
   val counter_settle_stages : int
+end
+
+(** A {!Config} with the other end of the counters' change window. *)
+module type Timed_config = sig
+  include Config
+
+  (** [E]: decoded phases after a counter's clock edge before which a
+      sampler still reads its old value whole (clock buffer plus clock-to-Q,
+      less the sampler's aperture and the phase decode). [0] is always safe,
+      but gives up [E / 2] stages of margin on each side. *)
+  val counter_earliest_change_stages : int
 end
 
 (** Johnson + Gray period counter. Its encoding is shared by the hardware
@@ -189,16 +214,18 @@ module Ideal = struct
   ;;
 
   (** Counter values as a sampler would read them. A counter read fewer than
-      [settle] stages after its edge returns the old or new value, chosen by
-      [pick_old]. *)
-  let counts ?(settle = 0) ?(pick_old = fun () -> false) t =
-    let read c since = if since < settle && pick_old () then c - 1 else c in
+      [earliest] stages after its edge returns the old value; fewer than
+      [settle], the old or new value, chosen by [pick_old]. *)
+  let counts ?(earliest = 0) ?(settle = 0) ?(pick_old = fun () -> false) t =
+    let read c since =
+      if since < earliest || (since < settle && pick_old ()) then c - 1 else c
+    in
     read t.count_a t.since_a, read t.count_b t.since_b
   ;;
 end
 
 module type S = sig
-  include Config
+  include Timed_config
 
   val max_length : int
   val select_width : int
@@ -207,7 +234,8 @@ module type S = sig
   val phase_width : int (** bits for [0, 2 * max_length) *)
   val time_width : int (** [count * 2n + phase] *)
 
-  (** [s] for each length, in stage delays (see the module doc). *)
+  (** [s] for each length, in stage delays: counter A is read for phases
+      [[s, s + n)] modulo [2n] (see the module doc). *)
   val select_threshold : int -> int
 
   (** The ring's observable state. *)
@@ -326,7 +354,7 @@ module type S = sig
   end
 end
 
-module Make (C : Config) : S = struct
+module Make_timed (C : Timed_config) : S = struct
   include C
 
   let () =
@@ -339,10 +367,15 @@ module Make (C : Config) : S = struct
        2 * johnson_bits * 2^gray_width. They agree (so [B - 1] at count 0 is
        right) only when [johnson_bits] is a power of two. *)
     if not (Int.is_pow2 johnson_bits) then bad "johnson_bits a power of two";
+    (* Counter A's window [s, s + n) must leave at least one stage on each
+       side of its stable interval [L, 2n + E). *)
+    let l = counter_settle_stages
+    and e = counter_earliest_change_stages in
+    if e < 0 || e > l then bad "0 <= counter_earliest_change_stages <= counter_settle_stages";
     List.iter lengths ~f:(fun n ->
-      let s = (n + counter_settle_stages + 1) / 2 in
-      if counter_settle_stages < 0 || s <= counter_settle_stages || s >= n
-      then bad "counter_settle_stages too large for the shortest length")
+      let s = (n + l + e + 1) / 2 in
+      if s - l < 1 || n + e - s < 1 || s >= 2 * n
+      then bad "counter change window too wide for the shortest length")
   ;;
 
   let max_length = List.last_exn lengths
@@ -351,7 +384,7 @@ module Make (C : Config) : S = struct
   let count_width = gray_width + num_bits_to_represent ((2 * johnson_bits) - 1)
   let phase_width = num_bits_to_represent ((2 * max_length) - 1)
   let time_width = count_width + phase_width
-  let select_threshold n = (n + counter_settle_stages + 1) / 2
+  let select_threshold n = (n + counter_settle_stages + counter_earliest_change_stages + 1) / 2
 
   module State = struct
     type 'a t =
@@ -540,8 +573,9 @@ module Make (C : Config) : S = struct
             , Counter.create ~johnson_bits ~gray_width (spec Falling) )
           | Some f ->
             (* Rising-edge cells; counter B is clocked by node 0 inverted. *)
-            (* Counter clocks are buffered so node 0 carries only small,
-               uniform loads like every other node. *)
+            (* Counter clocks are buffered so node 0 drives two inverters, not
+               every counter flop (still more than other nodes; see the
+               module doc). *)
             let inv instance x = Cell.instantiate library ~cell:inverter ~instance [ inv_a, x ] inv_y in
             let node0_n = inv (name ^ "_clkinv_b") node0 in
             let node0_buf = inv (name ^ "_clkinv_a1") node0 |> inv (name ^ "_clkinv_a2") in
@@ -598,11 +632,22 @@ module Make (C : Config) : S = struct
         |> concat_lsb |> popcount
       in
       let pattern_error = changes >:. 1 in
+      (* Counter A's window [thr, thr + n) wraps past 2n when thr > n. *)
       let thr = select_threshold n in
-      let use_a = phase >=:. thr &: (phase <:. n + thr) in
       let a = Counter.decode ~johnson_bits ~gray_width s.count_a in
       let b = Counter.decode ~johnson_bits ~gray_width s.count_b in
-      let periods = mux2 use_a a (b -: uresize (phase >=:. n) ~width:count_width) in
+      let one_if c = uresize c ~width:count_width in
+      let periods =
+        if thr <= n
+        then (
+          (* B is read in [n + thr, 2n) after counting this period's fall. *)
+          let use_a = phase >=:. thr &: (phase <:. n + thr) in
+          mux2 use_a a (b -: one_if (phase >=:. n)))
+        else (
+          (* A is read in [0, thr - n) before counting this period's rise. *)
+          let use_a = phase >=:. thr |: (phase <:. thr - n) in
+          mux2 use_a (a +: one_if (phase <:. n)) b)
+      in
       let time =
         (uresize periods ~width:time_width *: of_int_trunc ~width:phase_width (2 * n)
          |> uresize ~width:time_width)
@@ -689,3 +734,10 @@ module Make (C : Config) : S = struct
     ;;
   end
 end
+
+(** A ring that assumes a counter may change right after its edge ([E = 0]). *)
+module Make (C : Config) : S = Make_timed (struct
+    include C
+
+    let counter_earliest_change_stages = 0
+  end)

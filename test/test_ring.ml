@@ -3,14 +3,18 @@ open Stdio
 open Hardcaml
 open Hardcaml_clockless
 
+(* Counters change 6 to 11 stages after their edge. The select thresholds,
+   16, 17 and 19, cover counter A's window wrapping past 2n (s > n), s = n
+   and B's window wrapping (s < n). *)
 module Config = struct
   let lengths = [ 15; 17; 21 ]
   let johnson_bits = 4
   let gray_width = 6
-  let counter_settle_stages = 6
+  let counter_settle_stages = 11
+  let counter_earliest_change_stages = 6
 end
 
-module R = Ring.Make (Config)
+module R = Ring.Make_timed (Config)
 
 (* --- 1. Counter ---------------------------------------------------------- *)
 
@@ -129,11 +133,19 @@ end
 let latency = 2
 
 (* Sample an ideal ring every [stages_per_cycle] stage delays. Counters read
-   within [hazard] stages of their edge return old or new at random. Returns
-   (samples, errors), where an error is a decoded time that differs from the
-   ideal ring's time (by more than one stage with [bubble]), or a wrong
-   phase. *)
-let run_sampled ?bubble ~n ~stages_per_cycle ~hazard ~cycles () =
+   [earliest] to [settle] - 1 stages after their edge return old or new at
+   random (old before that). Returns (samples, errors, phases visited), where
+   an error is a decoded time that differs from the ideal ring's time (by
+   more than one stage with [bubble]), or a wrong phase. *)
+let run_sampled
+      ?bubble
+      ?(earliest = Config.counter_earliest_change_stages)
+      ?(settle = Config.counter_settle_stages)
+      ~n
+      ~stages_per_cycle
+      ~cycles
+      ()
+  =
   let has_bubble = Option.is_some bubble in
   let bubble = Option.value bubble ~default:(fun ~n:_ ~phase:_ -> None) in
   let module Sim = Cyclesim.With_interface (Sampled.I) (R.Clk_sampler.O) in
@@ -141,7 +153,7 @@ let run_sampled ?bubble ~n ~stages_per_cycle ~hazard ~cycles () =
   let sim = Sim.create (Sampled.create scope) in
   let i = Cyclesim.inputs sim in
   let o = Cyclesim.outputs sim in
-  let random = Random.State.make [| n; stages_per_cycle; hazard |] in
+  let random = Random.State.make [| n; stages_per_cycle; earliest; settle |] in
   let sel = List.findi_exn Config.lengths ~f:(fun _ m -> m = n) |> fst in
   i.length_sel := Bits.of_int_trunc ~width:R.select_width sel;
   i.enable := Bits.vdd;
@@ -150,11 +162,14 @@ let run_sampled ?bubble ~n ~stages_per_cycle ~hazard ~cycles () =
   let history = Queue.create () in
   let errors = ref 0 in
   let samples = ref 0 in
+  let visited = Hash_set.create (module Int) in
   (* Decoded time is [k * 2n + p] with [k] modulo the counter range. *)
   let modulus = (1 lsl R.count_width) * 2 * n in
   for _ = 1 to cycles do
     for _ = 1 to stages_per_cycle do Ring.Ideal.step ring done;
-    let a, b = Ring.Ideal.counts ring ~settle:hazard ~pick_old:(fun () -> Random.State.bool random) in
+    let a, b =
+      Ring.Ideal.counts ring ~earliest ~settle ~pick_old:(fun () -> Random.State.bool random)
+    in
     let true_t = ring.time + n - 1 in
     let nodes =
       Array.foldi ring.nodes ~init:0 ~f:(fun idx acc v -> if v then acc lor (1 lsl idx) else acc)
@@ -175,46 +190,57 @@ let run_sampled ?bubble ~n ~stages_per_cycle ~hazard ~cycles () =
       let decoded = Bits.to_int_trunc !(o.time) in
       let phase = Bits.to_int_trunc !(o.phase) in
       Int.incr samples;
+      Hash_set.add visited phase;
       (* The decoder's time origin is the ideal ring's: decoded = true time. *)
       let d = (decoded - t) % modulus in
       let tolerance = if has_bubble then 1 else 0 in
       if Int.min d (modulus - d) > tolerance then Int.incr errors;
       if (not has_bubble) && phase <> t % (2 * n) then Int.incr errors)
   done;
-  !samples, !errors
+  !samples, !errors, Hash_set.length visited
 ;;
 
 let%expect_test "clk sampler recovers ring time exactly, with counters read mid-update" =
+  (* Steps coprime with every 2n, so every phase is visited. *)
   List.iter Config.lengths ~f:(fun n ->
-    List.iter [ 37; 41; 64 ] ~f:(fun stages_per_cycle ->
-      let samples, errors =
-        run_sampled ~n ~stages_per_cycle ~hazard:Config.counter_settle_stages ~cycles:3000 ()
-      in
-      printf "n=%d stages/cycle=%d: %d samples, %d errors\n" n stages_per_cycle samples errors));
+    List.iter [ 37; 41; 61 ] ~f:(fun stages_per_cycle ->
+      let samples, errors, visited = run_sampled ~n ~stages_per_cycle ~cycles:3000 () in
+      printf
+        "n=%d stages/cycle=%d: %d samples, %d errors, %d/%d phases\n"
+        n stages_per_cycle samples errors visited (2 * n)));
   [%expect {|
-    n=15 stages/cycle=37: 2998 samples, 0 errors
-    n=15 stages/cycle=41: 2998 samples, 0 errors
-    n=15 stages/cycle=64: 2998 samples, 0 errors
-    n=17 stages/cycle=37: 2998 samples, 0 errors
-    n=17 stages/cycle=41: 2998 samples, 0 errors
-    n=17 stages/cycle=64: 2998 samples, 0 errors
-    n=21 stages/cycle=37: 2998 samples, 0 errors
-    n=21 stages/cycle=41: 2998 samples, 0 errors
-    n=21 stages/cycle=64: 2998 samples, 0 errors
+    n=15 stages/cycle=37: 2998 samples, 0 errors, 30/30 phases
+    n=15 stages/cycle=41: 2998 samples, 0 errors, 30/30 phases
+    n=15 stages/cycle=61: 2998 samples, 0 errors, 30/30 phases
+    n=17 stages/cycle=37: 2998 samples, 0 errors, 34/34 phases
+    n=17 stages/cycle=41: 2998 samples, 0 errors, 34/34 phases
+    n=17 stages/cycle=61: 2998 samples, 0 errors, 34/34 phases
+    n=21 stages/cycle=37: 2998 samples, 0 errors, 42/42 phases
+    n=21 stages/cycle=41: 2998 samples, 0 errors, 42/42 phases
+    n=21 stages/cycle=61: 2998 samples, 0 errors, 42/42 phases
     |}]
 ;;
 
-let%expect_test "a settle window beyond the configured one does cause errors (the margin is real)" =
+let%expect_test "a change window wider than the configured one causes errors (exact margins)" =
+  (* Counter A is read at phases [s, s + n): its last read is s - n - 1
+     stages after its next edge, which matters only when s > n. *)
   List.iter Config.lengths ~f:(fun n ->
-    let thr = R.select_threshold n in
-    let _, errors_ok = run_sampled ~n ~stages_per_cycle:37 ~hazard:(thr - 1) ~cycles:3000 () in
-    let _, errors_bad = run_sampled ~n ~stages_per_cycle:37 ~hazard:(thr + 2) ~cycles:3000 () in
-    printf "n=%d threshold=%d: hazard %d -> %d errors; hazard %d -> errors > 0: %b\n"
-      n thr (thr - 1) errors_ok (thr + 2) (errors_bad > 0));
+    let s = R.select_threshold n in
+    let errors ?earliest ?settle () =
+      let _, errors, _ = run_sampled ?earliest ?settle ~n ~stages_per_cycle:37 ~cycles:3000 () in
+      errors
+    in
+    printf "n=%d s=%d: settle %d -> %d errors, %d -> %d" n s s (errors ~settle:s ()) (s + 1)
+      (errors ~settle:(s + 1) ());
+    if s > n
+    then
+      printf "; earliest %d -> %d errors, %d -> %d\n" (s - n) (errors ~earliest:(s - n) ())
+        (s - n - 1) (errors ~earliest:(s - n - 1) ())
+    else printf "; read before the next edge\n");
   [%expect {|
-    n=15 threshold=11: hazard 10 -> 0 errors; hazard 13 -> errors > 0: true
-    n=17 threshold=12: hazard 11 -> 0 errors; hazard 14 -> errors > 0: true
-    n=21 threshold=14: hazard 13 -> 0 errors; hazard 16 -> errors > 0: true
+    n=15 s=16: settle 16 -> 0 errors, 17 -> 111; earliest 1 -> 0 errors, 0 -> 97
+    n=17 s=17: settle 17 -> 0 errors, 18 -> 89; read before the next edge
+    n=21 s=19: settle 19 -> 0 errors, 20 -> 71; read before the next edge
     |}]
 ;;
 
@@ -226,9 +252,7 @@ let%expect_test "a single misread node next to the wavefront moves time by at mo
     if pos >= 0 && pos < n then Some pos else None
   in
   List.iter Config.lengths ~f:(fun n ->
-    let samples, errors =
-      run_sampled ~bubble ~n ~stages_per_cycle:41 ~hazard:Config.counter_settle_stages ~cycles:3000 ()
-    in
+    let samples, errors, _ = run_sampled ~bubble ~n ~stages_per_cycle:41 ~cycles:3000 () in
     printf "n=%d: %d samples, %d off by more than one stage\n" n samples errors);
   [%expect {|
     n=15: 2998 samples, 0 off by more than one stage
@@ -546,6 +570,38 @@ let%expect_test "johnson_bits must be a power of two (decoded wrap = counter wra
     johnson_bits 3: rejected
     johnson_bits 4: accepted
     johnson_bits 6: rejected
+    |}]
+;;
+
+let%expect_test "the counter change window must leave a stage of margin on each side" =
+  (* n = 15: counter A is read at [s, s + n), safe in [L, 2n + E). *)
+  List.iter [ 0, 0; 0, 13; 0, 14; 6, 11; 6, 19; 6, 20; 7, 6; -1, 5 ] ~f:(fun (e, l) ->
+    let result =
+      try
+        let module R =
+          Ring.Make_timed (struct
+            let lengths = [ 15 ]
+            let johnson_bits = 4
+            let gray_width = 2
+            let counter_settle_stages = l
+            let counter_earliest_change_stages = e
+          end)
+        in
+        let s = R.select_threshold 15 in
+        Printf.sprintf "s=%d, margins %d/%d" s (s - l) (15 + e - s)
+      with
+      | _ -> "rejected"
+    in
+    printf "E=%d L=%d: %s\n" e l result);
+  [%expect {|
+    E=0 L=0: s=8, margins 8/7
+    E=0 L=13: s=14, margins 1/1
+    E=0 L=14: rejected
+    E=6 L=11: s=16, margins 5/5
+    E=6 L=19: s=20, margins 1/1
+    E=6 L=20: rejected
+    E=7 L=6: rejected
+    E=-1 L=5: rejected
     |}]
 ;;
 
