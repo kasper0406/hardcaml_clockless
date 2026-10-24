@@ -93,9 +93,15 @@ library (wl) {
     slope : 5;
     fanout_length (2, 10);
   }
+  wire_load ("frac") {
+    capacitance : 1;
+    slope : 0;
+    fanout_length (1.25, 10);
+    fanout_length (2.25, 30);
+  }
   wire_load_selection (sel) {
-    wire_load_from_area (0, 100, small);
     wire_load_from_area (100, 1000, big);
+    wire_load_from_area (0, 100, small);
   }
   default_wire_load : "small";
   default_wire_load_selection : sel;
@@ -144,7 +150,11 @@ let%expect_test "timing library: wire loads, pulse widths, recovery arcs" =
   printf "big: %g %g pF\n"
     (Timing_library.Wire_load.cap_pf big ~fanout:1)
     (Timing_library.Wire_load.cap_pf big ~fanout:4);
-  (* greatest lower bound: 100 is "big"; below every range, the first *)
+  (* fractional fanouts kept: 10 + 20 * 0.75 = 25 fF at fanout 2 *)
+  printf "frac: %g pF\n"
+    (Timing_library.Wire_load.cap_pf (Timing_library.find_wire_load_exn t "frac") ~fanout:2);
+  (* greatest lower bound: 100 is "big"; below every range, the lowest
+     (declared last) *)
   List.iter [ -1.; 50.; 100.; 5000. ] ~f:(fun a ->
     printf "area %g -> %s\n" a (Timing_library.wire_load_for_area t a).name);
   let f = Timing_library.find_exn t "f" in
@@ -162,6 +172,7 @@ let%expect_test "timing library: wire loads, pulse widths, recovery arcs" =
   [%expect {|
     small: 0 0.002 0.006 0.01 0.022 pF
     big: 0.01 0.04 pF
+    frac: 0.025 pF
     area -1 -> small
     area 50 -> small
     area 100 -> big

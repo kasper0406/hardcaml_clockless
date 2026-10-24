@@ -187,6 +187,9 @@ type seq_state =
   ; mutable gen : int
   ; mutable last_edge : int (* time of the last active trigger edge; min_int: none *)
   ; mutable last_edge_slew : float
+  ; edge_seen : int array
+    (* per [async_pins] entry: the pin's history count when the last edge
+       checked it, so a transition is not checked against that edge twice *)
   }
 
 type cell_inst =
@@ -673,9 +676,10 @@ let recovery_window t c arcs ~value ~slew ~clock_slew =
    their window. *)
 let check_recovery_at_edge t c s =
   let edge_time = t.now in
-  List.fold s.async_pins ~init:false ~f:(fun acc (i, recovery, removal) ->
+  List.foldi s.async_pins ~init:false ~f:(fun k acc (i, recovery, removal) ->
     let net = c.in_nets.(i) in
     let cnt = t.hist_count.(net) in
+    s.edge_seen.(k) <- cnt;
     let hit = ref acc in
     for k = Int.max 0 (cnt - hist_depth) to cnt - 1 do
       let idx = (net * hist_depth) + (k % hist_depth) in
@@ -700,11 +704,11 @@ let check_recovery_at_edge t c s =
 (* Asynchronous pin [i] just changed: is it inside the window of the last
    active edge? (Transitions processed before that edge was are checked by
    [check_recovery_at_edge].) *)
-let check_recovery_after_edge t c s i arcs =
-  if s.last_edge = Int.min_value
+let check_recovery_after_edge t c s k i arcs =
+  let net = c.in_nets.(i) in
+  if s.last_edge = Int.min_value || t.hist_count.(net) <= s.edge_seen.(k)
   then false
   else (
-    let net = c.in_nets.(i) in
     let td = t.now - s.last_edge in
     let window =
       recovery_window t c arcs ~value:t.value.(net) ~slew:t.slew.(net) ~clock_slew:s.last_edge_slew
@@ -734,8 +738,9 @@ let run_checks t c ~trig ~edge =
       let after =
         trig >= 0
         &&
-        match List.find s.async_pins ~f:(fun (i, _, _) -> i = trig) with
-        | Some (i, recovery, removal) -> check_recovery_after_edge t c s i (recovery, removal)
+        match List.findi s.async_pins ~f:(fun _ (i, _, _) -> i = trig) with
+        | Some (k, (i, recovery, removal)) ->
+          check_recovery_after_edge t c s k i (recovery, removal)
         | None -> false
       in
       at_edge || after
@@ -1432,6 +1437,7 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
           ; gen = 0
           ; last_edge = Int.min_value
           ; last_edge_slew = config.input_slew
+          ; edge_seen = Array.create ~len:(List.length async_pins) 0
           })
       in
       (* pins checked for minimum pulse width: those with Liberty data, else
@@ -1559,12 +1565,8 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
      capacitances plus the wire model at the net's pin count; a clock pin
      behind an insertion delay loads the original net *)
   let fanout = Array.create ~len:num_nets [] in
-  let pins = Array.create ~len:num_nets 0 in
-  let pin_cap = Array.create ~len:num_nets 0. in
-  let add_pin n cap =
-    pins.(n) <- pins.(n) + 1;
-    pin_cap.(n) <- pin_cap.(n) +. cap
-  in
+  (* load pins, as (net, capacitance), in element order *)
+  let load_pins = Queue.create () in
   Array.iteri elements ~f:(fun e el ->
     let add_unique ns =
       Array.to_list ns
@@ -1575,18 +1577,21 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
     | Cell_e c ->
       Array.iteri c.in_nets ~f:(fun i n ->
         fanout.(n) <- (e, i) :: fanout.(n);
-        if n < pin_nets then add_pin n (Timing_library.Cell.pin_cap c.tcell c.in_pins.(i)))
+        if n < pin_nets
+        then Queue.enqueue load_pins (n, Timing_library.Cell.pin_cap c.tcell c.in_pins.(i)))
     | Word_e w ->
       add_unique w.w_inputs;
-      Array.iter w.w_inputs ~f:(fun n -> add_pin n config.prim_input_cap)
+      Array.iter w.w_inputs ~f:(fun n -> Queue.enqueue load_pins (n, config.prim_input_cap))
     | Reg_e r ->
       let ins = reg_inputs r in
       add_unique ins;
-      Array.iter ins ~f:(fun n -> add_pin n config.prim_input_cap)
+      Array.iter ins ~f:(fun n -> Queue.enqueue load_pins (n, config.prim_input_cap))
     | Delay_e d ->
       fanout.(d.dl_src) <- (e, -1) :: fanout.(d.dl_src);
-      add_pin d.dl_src d.dl_pin_cap);
+      Queue.enqueue load_pins (d.dl_src, d.dl_pin_cap));
   let fanout = Array.map fanout ~f:(fun l -> Array.of_list (List.rev l)) in
+  let pins = Array.create ~len:num_nets 0 in
+  Queue.iter load_pins ~f:(fun (n, _) -> pins.(n) <- pins.(n) + 1);
   let wire =
     let liberty (m : Timing_library.Wire_load.t) k = Timing_library.Wire_load.cap_pf m ~fanout:k in
     match config.wire_load with
@@ -1602,7 +1607,10 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
       in
       liberty (Timing_library.wire_load_for_area lib area)
   in
-  let load = Array.init num_nets ~f:(fun n -> wire pins.(n) +. pin_cap.(n)) in
+  (* wire first, then the pin capacitances in element order (the order in
+     which earlier versions summed them, so loads are bit-identical) *)
+  let load = Array.init num_nets ~f:(fun n -> wire pins.(n)) in
+  Queue.iter load_pins ~f:(fun (n, cap) -> load.(n) <- load.(n) +. cap);
   (* Hardcaml elements next to Liberty cells: forward from cell outputs and
      backward from cell inputs through Hardcaml elements, remembering the
      first cell (in instance-name order) that reaches each *)

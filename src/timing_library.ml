@@ -94,7 +94,7 @@ module Wire_load = struct
     { name : string
     ; capacitance : float (** pF per unit length *)
     ; slope : float (** length per fanout beyond the table *)
-    ; fanout_length : (int * float) list (** ascending fanout *)
+    ; fanout_length : (float * float) list (** (fanout, length), ascending fanout *)
     }
   [@@deriving sexp_of]
 
@@ -106,16 +106,14 @@ module Wire_load = struct
     | [] -> 0.
     | (f0, l0) :: _ as pts ->
       let fmax, lmax = List.last_exn pts in
-      if fanout <= f0
-      then Float.max 0. (l0 -. ((Float.of_int f0 -. f) *. t.slope))
-      else if fanout >= fmax
-      then lmax +. ((f -. Float.of_int fmax) *. t.slope)
+      if Float.(f <= f0)
+      then Float.max 0. (l0 -. ((f0 -. f) *. t.slope))
+      else if Float.(f >= fmax)
+      then lmax +. ((f -. fmax) *. t.slope)
       else (
         let rec go = function
           | (fa, la) :: ((fb, lb) :: _ as rest) ->
-            if fanout <= fb
-            then la +. ((lb -. la) *. (f -. Float.of_int fa) /. Float.of_int (fb - fa))
-            else go rest
+            if Float.(f <= fb) then la +. ((lb -. la) *. (f -. fa) /. (fb -. fa)) else go rest
           | _ -> lmax
         in
         go pts)
@@ -453,10 +451,10 @@ let of_liberty (lib : Liberty.group) : t =
         List.filter_map g.body ~f:(function
           | Liberty.Complex ("fanout_length", vs) ->
             (match Liberty.floats vs with
-             | f :: l :: _ -> Some (Float.iround_nearest_exn f, l)
+             | f :: l :: _ -> Some (f, l)
              | _ -> raise_s [%message "bad fanout_length" (Liberty.group_name g : string)])
           | _ -> None)
-        |> List.sort ~compare:(fun (a, _) (b, _) -> Int.compare a b)
+        |> List.sort ~compare:(fun (a, _) (b, _) -> Float.compare a b)
       in
       { Wire_load.name = Liberty.group_name g
       ; capacitance = num "capacitance" *. cap
@@ -519,12 +517,14 @@ let default_wire_load t =
 
 (** The model the [default_wire_load_selection] gives a design of [area]
     (in the library's cell-area units): as OpenSTA, the range with the
-    greatest lower bound not above [area] (the first range if there is
-    none; upper bounds are ignored). *)
+    greatest lower bound not above [area] (the one with the smallest lower
+    bound if there is none; upper bounds are ignored). *)
 let wire_load_for_area t area =
   match t.wire_load_selection with
   | [] -> raise_s [%message "the timing library has no default_wire_load_selection"]
-  | (_, _, first) :: _ as sel ->
+  | sel ->
+    let sel = List.sort sel ~compare:(fun (a, _, _) (b, _, _) -> Float.compare a b) in
+    let _, _, first = List.hd_exn sel in
     let name =
       List.fold sel ~init:None ~f:(fun best (lo, _, m) ->
         match best with

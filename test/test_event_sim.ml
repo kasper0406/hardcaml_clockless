@@ -1236,10 +1236,10 @@ let%expect_test "minimum pulse width: flagged exactly below the Liberty minimum"
       let flagged width =
         let v, _, _ = pulse circuit ~hold ~port ~pin ~level ~width ~slew () in
         match v with
-        | [ { kind = Pulse_width { width = w; min_width; level = l }; _ } ] ->
-          w = width && min_width = min && Sim.Value.equal l level
         | [] -> false
-        | _ -> failwith "several violations"
+        | [ { kind = Pulse_width { width = w; min_width; level = l }; _ } ]
+          when w = width && min_width = min && Sim.Value.equal l level -> true
+        | _ -> failwith "unexpected violations"
       in
       printf "%-8s %c     %.2f %10.3f ps   %b / %b / %b\n" pin (Sim.Value.to_char level) slew
         (Sim.to_ps min) (flagged (min - 1)) (flagged min) (flagged (min + 1))));
@@ -1577,4 +1577,45 @@ let%expect_test "per-instance factor override: one slow stage, period from the o
   printf "oracle %.3f ps; sim matches: %b\n" (Sim.to_ps expected)
     Float.(abs ((of_int p /. of_int expected) -. 1.) < 1e-5);
   [%expect {| oracle 587.296 ps; sim matches: true |}]
+;;
+
+let%expect_test "recovery/removal: a transition seen at the edge is not checked again" =
+  (* CK and RN on one net, so the release coincides with the edge, inside a
+     constant (-10, 10) ps window: one violation, not one per pin *)
+  let tl =
+    Timing_library.of_liberty
+      (Liberty.parse_string
+         {|
+library (rr) {
+  time_unit : "1ns";
+  capacitive_load_unit (1,pf);
+  cell (f) {
+    pin (CK) { direction : input; clock : true; capacitance : 0.001; }
+    pin (D) { direction : input; capacitance : 0.001; }
+    pin (RN) {
+      direction : input;
+      capacitance : 0.001;
+      timing () { related_pin : "CK"; timing_type : recovery_rising; rise_constraint (scalar) { values ("0.01"); } }
+      timing () { related_pin : "CK"; timing_type : removal_rising; rise_constraint (scalar) { values ("0.01"); } }
+    }
+    pin (Q) { direction : output; function : "IQ"; }
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; clear : "!RN"; }
+  }
+}
+|})
+  in
+  let clk = Signal.input "clk" 1 in
+  let q =
+    Cell.instantiate tl.library ~cell:"f" ~instance:"ff" [ "CK", clk; "D", Signal.vdd; "RN", clk ] "Q"
+  in
+  let config = { Sim.Config.default with recovery_removal_check = Log } in
+  let sim = Sim.create ~config tl (Circuit.create_exn ~name:"tied" [ Signal.output "q" q ]) in
+  Sim.set_input sim "clk" V0 ~at:0;
+  Sim.set_input sim "clk" V1 ~at:(Sim.of_ns 5.);
+  Sim.run_until sim (Sim.of_ns 10.);
+  List.iter (Sim.timing_violations sim) ~f:(fun v -> print_s [%sexp (v : Sim.Timing_violation.t)]);
+  [%expect {|
+    ((instance ff) (pin RN) (time 5000000)
+     (kind (Recovery_removal (edge_time 5000000) (window (-10000 10000)))))
+    |}]
 ;;
