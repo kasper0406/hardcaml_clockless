@@ -30,17 +30,43 @@ click elements) are in that repo's
 |---|---|---|
 | `Liberty` | Liberty (.lib) parser: groups, attributes, tables | done |
 | `Bool_expr` | Liberty boolean functions: parse, evaluate, lower to Hardcaml logic | done |
+| `Timing_library` | Liberty timing view: NLDM delay/slew tables per arc (bilinear interpolation, extrapolation), pin capacitances, `ff`/`latch` groups, setup/hold tables | done |
 | `Cell_library` | Typed cells: kind (combinational/latch/flop/tristate/constant/physical), pins, functions, area | done |
 | `Cell` | Hand-placed cell instantiation with `dont_touch`/`keep`, pin checking, stable instance names | done |
 | `Delay_line` | Tapped chain of buffer/delay cells | done |
 | `Tdc` | Delay line + first-stage sampling flops (kept, stably named) + synchronous decoder: bubble filter, fine code, overflow and multi-edge flags, coarse counter. `Cells` (Verilog) or behavioural `Model` (Cyclesim) | done |
 | `Tdc_calibration` | Code-density calibration against the system clock | next |
 | Behavioural models | Cyclesim models of TDC/delay lines so the rest of a design simulates normally | partial: TDC (`Tdc.Model`, uniform stage delays) |
-| `Event_sim` | Event-driven gate-level simulation with Liberty/SDF delays, random and adversarial | planned |
+| `Event_sim` | Event-driven gate-level simulation of Hardcaml circuits of Liberty cells: fs time, 0/1/X, NLDM delays with slew propagation and loads, inertial/transport, flops/latches from Liberty with setup/hold-aperture metastability (exponential resolution), corner scale and seeded per-instance variation, Hardcaml registers on any clock net, loops (ring oscillators), VCD | done (minimal); SDF, adversarial delays, hazard/protocol monitors, Cyclesim co-simulation: planned |
 | `Sdc` | Timing constraints and LibreLane config (dont-touch, loop breaks, relative timing) | planned |
 | Post-route check | Re-extract islands from the routed netlist; check cells survived unchanged | planned |
 | `Click`, `Bd_channel` | Bundled-data click handshake components with a synchronous reference | planned |
 | Workcraft export | Formal checks: deadlock freedom, hazard freedom, conformation | planned |
+
+## Event-driven simulation
+
+```ocaml
+let lib = Timing_library.load "sg13cmos5l_stdcell_typ_1p20V_25C.lib" in
+(* build a circuit with Cell.instantiate lib.library ..., close loops with Signal.wire *)
+let sim = Event_sim.create lib circuit in
+Event_sim.set_input sim "en" V1 ~at:(Event_sim.of_ns 5.);
+Event_sim.add_clock sim "clk" ~period:(Event_sim.of_ns 20.);
+Event_sim.on_change sim "ring_s8/Y" (fun ~time v -> ...);
+Event_sim.run_until sim (Event_sim.of_ns 10_000.);
+```
+
+Nets are named by port, by signal name (`s[i]` for bus bits) and by cell pin
+(`<instance>/<pin>`). Semantics are documented in `src/event_sim.mli`.
+
+Measured at typ (1.2 V, 25 °C), a NAND2 + 8 × inv_1 ring has a 550.6 ps period,
+equal to the period computed independently from the tables. Against the real
+corner libraries (`test/data/*_excerpt_{slow,fast}*.lib`) it is ×1.58 (slow,
+1.08 V 125 °C) and ×0.69 (fast, 1.32 V −40 °C). The global `corner` factor that
+reproduces these is about 1.40 and 0.71 (slews scaled too, the default), not the rough
+×2.1/×0.48 estimate; prefer loading the real corner file. A NAND2 +
+4 × (dlygate4sd1_1, inv_1) ring (1.47 ns) sampled by 9 flops on 50 MHz plus a
+ring-clocked 16-bit counter simulates 10 µs in about 0.1 s
+(`dune exec bench/ring_bench.exe`).
 
 ## Testing
 

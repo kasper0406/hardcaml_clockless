@@ -1,7 +1,5 @@
-(** Event-driven, delay-aware gate-level simulation of a Hardcaml circuit built
-    from hand-instantiated Liberty cells (see {!Cell}), including loops (ring
-    oscillators), several clocks and Hardcaml registers clocked by arbitrary
-    nets. See the [.mli] for the semantics. *)
+(* Event-driven, delay-aware gate-level simulation. Semantics are documented
+   in event_sim.mli. *)
 
 open! Base
 open Hardcaml
@@ -196,7 +194,7 @@ end
 
 type event_kind =
   | Drive of driver
-  | Input of int * int
+  | Input of int * int * float (* net, value, slew *)
   | Clock_toggle of clock_gen
   | Resolve of cell_inst * int * int (* gen, resolved value *)
   | Capture of cell_inst * int * int (* gen, edge time *)
@@ -211,6 +209,7 @@ and clock_gen =
   { c_net : int
   ; c_period : int
   ; c_high : int
+  ; c_slew : float
   ; mutable c_level : int
   }
 
@@ -218,7 +217,6 @@ let hist_depth = 8
 
 type t =
   { config : Config.t
-  ; lib : Timing_library.t
   ; num_nets : int
   ; value : int array
   ; slew : float array
@@ -245,7 +243,7 @@ type t =
 
 (* --- Priority queue (binary heap on time, then sequence number) ------------- *)
 
-let dummy_event = { time = 0; seq_no = 0; kind = Input (0, 0) }
+let dummy_event = { time = 0; seq_no = 0; kind = Input (0, 0, 0.) }
 let ev_lt a b = a.time < b.time || (a.time = b.time && a.seq_no < b.seq_no)
 
 let heap_push t ev =
@@ -398,19 +396,6 @@ let record_history t net value slew =
   t.hist_count.(net) <- c + 1
 ;;
 
-(* Value of [net] just before [time], from its history. *)
-let value_before t net time =
-  let c = t.hist_count.(net) in
-  let rec go i =
-    if i < 0 || i < c - hist_depth
-    then if c <= hist_depth then vx (* nets start at X *) else vx
-    else (
-      let k = (net * hist_depth) + (i % hist_depth) in
-      if t.hist_time.(k) < time then t.hist_value.(k) else go (i - 1))
-  in
-  go (c - 1)
-;;
-
 (* Setup/hold aperture for a transition on data pin [i] going to [value] with
    slew [d_slew] (ns), relative to the edge: [(-setup, hold)] in fs. *)
 let aperture t c (setup, hold) ~clock_slew ~value ~d_slew =
@@ -463,12 +448,24 @@ let rec capture t c s ~edge_time =
     else decide_capture t c s ~edge_time ~clock_slew)
 
 and decide_capture t c s ~edge_time ~clock_slew =
+  (* Each recorded transition of a data pin is, relative to its own
+     (direction- and slew-dependent) aperture (lo, hi) around the edge:
+     before it (captured), after it (not captured) or inside (violation).
+     The captured value is the one set by the last transition before its
+     aperture; without one in the history, the value before the oldest
+     recorded transition (X if the history does not reach back far enough). *)
   let violation = ref false in
-  let min_hold = ref Int.max_value in
+  let n = Array.length c.in_nets in
+  let saved = Array.sub c.vals ~pos:0 ~len:n in
+  for i = 0 to n - 1 do
+    c.vals.(i) <- t.value.(c.in_nets.(i))
+  done;
   List.iter s.data_pins ~f:(fun (i, setup, hold) ->
     let net = c.in_nets.(i) in
     let cnt = t.hist_count.(net) in
-    for k = Int.max 0 (cnt - hist_depth) to cnt - 1 do
+    let first = Int.max 0 (cnt - hist_depth) in
+    let captured = ref vx in
+    for k = first to cnt - 1 do
       let idx = (net * hist_depth) + (k % hist_depth) in
       let td = t.hist_time.(idx) - edge_time in
       let lo, hi =
@@ -480,20 +477,10 @@ and decide_capture t c s ~edge_time ~clock_slew =
           ~value:t.hist_value.(idx)
           ~d_slew:t.hist_slew.(idx)
       in
-      if lo < hi && td > lo && td < hi then violation := true
+      let lo, hi = if lo < hi then lo, hi else (lo + hi) / 2, (lo + hi) / 2 in
+      if td > lo && td < hi then violation := true else if td <= lo then captured := t.hist_value.(idx)
     done;
-    List.iter [ 0; 1 ] ~f:(fun v ->
-      let _, h = aperture t c (setup, hold) ~clock_slew ~value:v ~d_slew:t.slew.(net) in
-      min_hold := Int.min !min_hold h));
-  let sample_time = edge_time + Int.min 0 !min_hold in
-  (* data pins as they were at the sampling instant, other pins as now *)
-  let n = Array.length c.in_nets in
-  let saved = Array.sub c.vals ~pos:0 ~len:n in
-  for i = 0 to n - 1 do
-    c.vals.(i) <- t.value.(c.in_nets.(i))
-  done;
-  List.iter s.data_pins ~f:(fun (i, _, _) ->
-    c.vals.(i) <- value_before t c.in_nets.(i) (sample_time + 1));
+    c.vals.(i) <- !captured);
   let next = s.data_fn c.vals in
   Array.blit ~src:saved ~src_pos:0 ~dst:c.vals ~dst_pos:0 ~len:n;
   s.gen <- s.gen + 1;
@@ -692,11 +679,11 @@ let process t ev =
        drv.pending <- rest;
        set_net t drv.d_net p.p_value p.p_slew
      | _ -> ())
-  | Input (net, v) -> set_net t net v t.config.input_slew
+  | Input (net, v, slew) -> set_net t net v slew
   | Clock_toggle g ->
     let v = if g.c_level = 1 then 0 else 1 in
     g.c_level <- v;
-    set_net t g.c_net v t.config.input_slew;
+    set_net t g.c_net v g.c_slew;
     let next = if v = 1 then g.c_high else g.c_period - g.c_high in
     ignore (push t ~time:(t.now + next) (Clock_toggle g) : int)
   | Resolve (c, gen, v) ->
@@ -863,7 +850,7 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
   in
   let what s =
     match Signal.names s with
-    | [] -> "uid " ^ Signal.Type.Uid.to_string (Signal.uid s)
+    | [] -> "<unnamed>"
     | names -> String.concat ~sep:"," names
   in
   let elements = Queue.create () in
@@ -1211,7 +1198,6 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
     Array.iteri c.in_pins ~f:(fun i p -> add_name (c.inst_name ^ "/" ^ p) c.in_nets.(i)));
   let t =
     { config
-    ; lib
     ; num_nets
     ; value = Array.create ~len:num_nets vx
     ; slew = Array.create ~len:num_nets config.input_slew
@@ -1293,27 +1279,37 @@ let check_input t n name =
   then raise_s [%message "not a primary input" (name : string)]
 ;;
 
-let set_input t name (v : Value.t) ~at =
+let check_time t at =
+  if at < t.now then raise_s [%message "cannot schedule in the past" (at : int) ~now:(t.now : int)]
+;;
+
+let set_input ?slew t name (v : Value.t) ~at =
   let n = net_exn t name in
   check_input t n name;
-  if at < t.now then raise_s [%message "cannot schedule in the past" (at : int) ~now:(t.now : int)];
-  ignore (push t ~time:at (Input (n, Value.to_int v)) : int)
+  check_time t at;
+  let slew = Option.value slew ~default:t.config.input_slew in
+  ignore (push t ~time:at (Input (n, Value.to_int v, slew)) : int)
 ;;
 
-let set_input_int t name x ~at =
+let set_input_int ?slew t name x ~at =
   let b = bus_exn t name in
+  check_time t at;
+  let slew = Option.value slew ~default:t.config.input_slew in
   Array.iteri b ~f:(fun i n ->
     check_input t n name;
-    ignore (push t ~time:at (Input (n, (x lsr i) land 1)) : int))
+    ignore (push t ~time:at (Input (n, (x lsr i) land 1, slew)) : int))
 ;;
 
-let add_clock ?(start = 0) ?high t name ~period =
+let add_clock ?(start = 0) ?high ?slew t name ~period =
   let n = net_exn t name in
   check_input t n name;
   let high = Option.value high ~default:(period / 2) in
-  let g = { c_net = n; c_period = period; c_high = high; c_level = 0 } in
+  if period <= 0 || high <= 0 || high >= period
+  then raise_s [%message "bad clock" (period : int) (high : int)];
+  let slew = Option.value slew ~default:t.config.input_slew in
+  let g = { c_net = n; c_period = period; c_high = high; c_slew = slew; c_level = 0 } in
   (* level 0 from [now]; first rising edge at [start] *)
-  ignore (push t ~time:t.now (Input (n, 0)) : int);
+  ignore (push t ~time:t.now (Input (n, 0, slew)) : int);
   ignore (push t ~time:(Int.max start t.now) (Clock_toggle g) : int)
 ;;
 
@@ -1358,13 +1354,11 @@ let net_display_names t =
   best
 ;;
 
-let write_vcd ?(timescale = "1fs") t oc =
+let write_vcd t oc =
   let trace = Option.value t.trace ~default:[] |> List.rev in
   let names = net_display_names t in
   let out = Stdio.Out_channel.output_string oc in
-  out "$timescale " ;
-  out timescale;
-  out " $end\n$scope module event_sim $end\n";
+  out "$timescale 1fs $end\n$scope module event_sim $end\n";
   Array.iteri names ~f:(fun n name ->
     Option.iter name ~f:(fun name ->
       let safe = String.map name ~f:(fun c -> if Char.equal c ' ' then '_' else c) in

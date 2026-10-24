@@ -451,7 +451,7 @@ let flop_circuit lib =
 
 (* Drive [d] to toggle at [edge_k + delta_k] for each cycle k, clock edges every
    10 ns; return per cycle: (delta, d rose, metastable?, Q settled, Q changes). *)
-let run_flop ?config deltas =
+let run_flop ?config ?(d_slew = input_slew) ?(clk_slew = input_slew) deltas =
   let tl = force tlib in
   let sim = Sim.create ?config tl (flop_circuit tl.library) in
   let cyc = Sim.of_ns 10. in
@@ -462,15 +462,15 @@ let run_flop ?config deltas =
   let qs = ref [] in
   Sim.on_change sim "q" (fun ~time v -> qs := (time, v) :: !qs);
   (* one cycle to load a known value *)
-  Sim.set_input sim "clk" V1 ~at:(Sim.of_ns 10.);
-  Sim.set_input sim "clk" V0 ~at:(Sim.of_ns 15.);
+  Sim.set_input sim "clk" V1 ~at:(Sim.of_ns 10.) ~slew:clk_slew;
+  Sim.set_input sim "clk" V0 ~at:(Sim.of_ns 15.) ~slew:clk_slew;
   Sim.run_until sim (Sim.of_ns 19.);
   List.mapi deltas ~f:(fun k delta ->
     let e = edge k in
     let rising = k % 2 = 0 in
-    Sim.set_input sim "d" (if rising then V1 else V0) ~at:(e + delta);
-    Sim.set_input sim "clk" V1 ~at:e;
-    Sim.set_input sim "clk" V0 ~at:(e + (cyc / 2));
+    Sim.set_input sim "d" (if rising then V1 else V0) ~at:(e + delta) ~slew:d_slew;
+    Sim.set_input sim "clk" V1 ~at:e ~slew:clk_slew;
+    Sim.set_input sim "clk" V0 ~at:(e + (cyc / 2)) ~slew:clk_slew;
     qs := [];
     Sim.run_until sim (e + (cyc / 2) - 1);
     let meta =
@@ -482,40 +482,52 @@ let run_flop ?config deltas =
 let%expect_test "flop setup/hold: X only inside the liberty aperture" =
   let ol = force olib in
   let c = Oracle.constraint_group ol ~cell:"sg13cmos5l_dfrbpq_1" ~pin:"D" ~related:"CLK" in
-  let window ~rise =
-    let kind = if rise then "rise_constraint" else "fall_constraint" in
-    let s = Oracle.interp (Oracle.tbl (c ~timing_type:"setup_rising") kind) input_slew input_slew in
-    let h = Oracle.interp (Oracle.tbl (c ~timing_type:"hold_rising") kind) input_slew input_slew in
-    Oracle.fs (-.s), Oracle.fs h
-  in
-  let deltas = List.init 151 ~f:(fun i -> Sim.of_ps (-200. +. (2. *. Float.of_int i))) in
-  (* each delta twice: D rising then D falling *)
-  let results = run_flop (List.concat_map deltas ~f:(fun d -> [ d; d ])) in
-  List.iter [ true; false ] ~f:(fun rise ->
-    let lo, hi = window ~rise in
-    let mine = List.filter results ~f:(fun (_, r, _, _, _, _) -> Bool.equal r rise) in
-    let xs = List.filter_map mine ~f:(fun (d, _, m, _, _, _) -> Option.map m ~f:(fun _ -> d)) in
-    let mismatches =
-      List.count mine ~f:(fun (d, _, m, q, _, _) ->
-        let expect_x = d > lo && d < hi in
-        let new_v = if rise then Sim.Value.V1 else V0 in
-        let old_v = if rise then Sim.Value.V0 else V1 in
-        if expect_x
-        then Option.is_none m
-        else Option.is_some m || not (Sim.Value.equal q (if d <= lo then new_v else old_v)))
+  let sweep ~d_slew ~clk_slew ~from =
+    printf "D slew %.2f ns, CLK slew %.2f ns:\n" d_slew clk_slew;
+    let window ~rise =
+      let kind = if rise then "rise_constraint" else "fall_constraint" in
+      let s = Oracle.interp (Oracle.tbl (c ~timing_type:"setup_rising") kind) d_slew clk_slew in
+      let h = Oracle.interp (Oracle.tbl (c ~timing_type:"hold_rising") kind) d_slew clk_slew in
+      Oracle.fs (-.s), Oracle.fs h
     in
-    printf
-      "D %s: oracle aperture (%.3f, %.3f) ps; sim metastable for delta in [%.0f, %.0f] ps; mismatches %d of %d\n"
-      (if rise then "rising " else "falling")
-      (Sim.to_ps lo)
-      (Sim.to_ps hi)
-      (Sim.to_ps (List.hd_exn xs))
-      (Sim.to_ps (List.last_exn xs))
-      mismatches
-      (List.length mine));
+    let deltas = List.init 151 ~f:(fun i -> Sim.of_ps (from +. (2. *. Float.of_int i))) in
+    (* each delta twice: D rising then D falling *)
+    let results = run_flop ~d_slew ~clk_slew (List.concat_map deltas ~f:(fun d -> [ d; d ])) in
+    List.iter [ true; false ] ~f:(fun rise ->
+      let lo, hi = window ~rise in
+      let mine = List.filter results ~f:(fun (_, r, _, _, _, _) -> Bool.equal r rise) in
+      let xs = List.filter_map mine ~f:(fun (d, _, m, _, _, _) -> Option.map m ~f:(fun _ -> d)) in
+      (* outside the aperture: captured iff D changed before it *)
+      let mismatches =
+        List.count mine ~f:(fun (d, _, m, q, _, _) ->
+          let expect_x = d > lo && d < hi in
+          let new_v = if rise then Sim.Value.V1 else V0 in
+          let old_v = if rise then Sim.Value.V0 else V1 in
+          if expect_x
+          then Option.is_none m
+          else Option.is_some m || not (Sim.Value.equal q (if d <= lo then new_v else old_v)))
+      in
+      printf
+        "  D %s: oracle aperture (%.3f, %.3f) ps; sim metastable for delta in [%.0f, %.0f] ps; mismatches %d of %d\n"
+        (if rise then "rising " else "falling")
+        (Sim.to_ps lo)
+        (Sim.to_ps hi)
+        (Sim.to_ps (List.hd_exn xs))
+        (Sim.to_ps (List.last_exn xs))
+        mismatches
+        (List.length mine))
+  in
+  sweep ~d_slew:input_slew ~clk_slew:input_slew ~from:(-200.);
+  (* slow clock: positive hold, negative setup for falling D (the aperture
+     lies after the clock edge, so the capture decision is deferred) *)
+  sweep ~d_slew:0.02 ~clk_slew:1.0 ~from:(-100.);
   [%expect {|
-    D rising : oracle aperture (-118.062, -63.872) ps; sim metastable for delta in [-118, -64] ps; mismatches 0 of 151
-    D falling: oracle aperture (-115.778, -37.653) ps; sim metastable for delta in [-114, -38] ps; mismatches 0 of 151
+    D slew 0.05 ns, CLK slew 0.05 ns:
+      D rising : oracle aperture (-118.062, -63.872) ps; sim metastable for delta in [-118, -64] ps; mismatches 0 of 151
+      D falling: oracle aperture (-115.778, -37.653) ps; sim metastable for delta in [-114, -38] ps; mismatches 0 of 151
+    D slew 0.02 ns, CLK slew 1.00 ns:
+      D rising : oracle aperture (-15.570, 15.084) ps; sim metastable for delta in [-14, 14] ps; mismatches 0 of 151
+      D falling: oracle aperture (63.633, 111.348) ps; sim metastable for delta in [64, 110] ps; mismatches 0 of 151
     |}]
 ;;
 
@@ -936,6 +948,45 @@ let%expect_test "unsupported constructs are rejected" =
   [%expect {|
     ("instantiation is not a cell of the timing library (hierarchical instantiations are not supported)"
      (name my_block) (instance blk))
-    ("memories are not supported by Event_sim" (signal "uid 1693"))
+    ("memories are not supported by Event_sim" (signal <unnamed>))
+    |}]
+;;
+
+let%expect_test "latch: metastable only when D moves inside the closing-edge aperture" =
+  let tl = force tlib
+  and ol = force olib in
+  let cell = "sg13cmos5l_dlhq_1" in
+  let c = Oracle.constraint_group ol ~cell ~pin:"D" ~related:"GATE" in
+  let window ~rise =
+    let kind = if rise then "rise_constraint" else "fall_constraint" in
+    let s = Oracle.interp (Oracle.tbl (c ~timing_type:"setup_falling") kind) input_slew input_slew in
+    let h = Oracle.interp (Oracle.tbl (c ~timing_type:"hold_falling") kind) input_slew input_slew in
+    Oracle.fs (-.s), Oracle.fs h
+  in
+  let lo, hi = window ~rise:true in
+  printf "oracle aperture for rising D: (%.3f, %.3f) ps around GATE falling\n" (Sim.to_ps lo) (Sim.to_ps hi);
+  let try_ delta =
+    let q =
+      Cell.instantiate tl.library ~cell ~instance:"lat" [ "D", Signal.input "d" 1; "GATE", Signal.input "g" 1 ] "Q"
+    in
+    let sim = Sim.create tl (Circuit.create_exn ~name:"latch" [ Signal.output "q" q ]) in
+    let close = Sim.of_ns 5. in
+    Sim.set_input sim "g" V1 ~at:0;
+    Sim.set_input sim "d" V0 ~at:0;
+    Sim.set_input sim "g" V0 ~at:close;
+    Sim.set_input sim "d" V1 ~at:(close + delta);
+    Sim.run_until sim (Sim.of_ns 10.);
+    printf "D rises at %+8.3f ps: metastable %b, Q %c\n" (Sim.to_ps delta)
+      (not (List.is_empty (Sim.metastable_events sim)))
+      (Sim.Value.to_char (Sim.value sim "q"))
+  in
+  try_ (lo - Sim.of_ps 20.);
+  try_ ((lo + hi) / 2);
+  try_ (hi + Sim.of_ps 20.);
+  [%expect {|
+    oracle aperture for rising D: (-108.759, -100.478) ps around GATE falling
+    D rises at -128.759 ps: metastable false, Q 1
+    D rises at -104.618 ps: metastable true, Q 1
+    D rises at  -80.478 ps: metastable false, Q 0
     |}]
 ;;
