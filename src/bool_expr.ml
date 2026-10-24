@@ -1,7 +1,7 @@
 (** Liberty boolean functions, e.g. ["!(A1&A2 | B1)"] or ["(A*B)+C'"].
 
-    Precedence, loosest first: [+ |] (or), [^] (xor), [* &] and juxtaposition
-    (and), then the prefix [!] and postfix ['] negations. *)
+    Precedence, loosest first, as in OpenSTA: [+ |] (or), [* &] (and), [^]
+    (xor), juxtaposition (and), then the prefix [!] and postfix ['] negations. *)
 
 open! Base
 
@@ -22,22 +22,29 @@ let parse (s : string) : t =
   let rec skip () = if !i < n && Char.is_whitespace s.[!i] then (Int.incr i; skip ()) in
   let peek () = skip (); if !i < n then Some s.[!i] else None in
   let err msg = raise (Parse_error (Printf.sprintf "%s at %d in %S" msg !i s)) in
+  (* Precedence, loosest first, as in OpenSTA's liberty/LibExprParse.yy:
+     [+ |], then [* &], then [^], then juxtaposition (implicit and of
+     operands), then [!] and postfix ['] on an operand. *)
   let rec or_ () =
-    let l = xor_ () in
+    let l = and_ () in
     match peek () with
     | Some ('+' | '|') -> Int.incr i; Or (l, or_ ())
     | _ -> l
+  and and_ () =
+    let l = xor_ () in
+    match peek () with
+    | Some ('*' | '&') -> Int.incr i; And (l, and_ ())
+    | _ -> l
   and xor_ () =
-    let l = and_ () in
+    let l = juxtaposed () in
     match peek () with
     | Some '^' -> Int.incr i; Xor (l, xor_ ())
     | _ -> l
-  and and_ () =
+  and juxtaposed () =
     let l = unary () in
     match peek () with
-    | Some ('*' | '&') -> Int.incr i; And (l, and_ ())
     | Some c when Char.is_alphanum c || Char.equal c '(' || Char.equal c '!' || Char.equal c '_' ->
-      And (l, and_ ()) (* juxtaposition *)
+      And (l, juxtaposed ())
     | _ -> l
   and unary () =
     let base =
