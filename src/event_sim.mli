@@ -87,7 +87,9 @@
 
     Same-time events run in the order they were scheduled; zero-delay
     outputs land after everything already scheduled for that time, so
-    registers sample their D before a same-edge update reaches it. *)
+    registers sample their D before a same-edge update reaches it. A loop
+    with zero total delay (e.g. a ring in [Zero] mode) raises after a million
+    events at one instant instead of hanging. *)
 
 open! Base
 open Hardcaml

@@ -237,6 +237,7 @@ type t =
   ; mutable heap : event array
   ; mutable heap_size : int
   ; mutable events_processed : int
+  ; mutable same_instant : int
   ; mutable metastable : Metastable_event.t list
   ; mutable trace : (int * int * int) list option (* time, net, value; newest first *)
   }
@@ -669,7 +670,19 @@ let refresh_vals t c =
   done
 ;;
 
+let max_events_per_instant = 1_000_000
+
 let process t ev =
+  if ev.time = t.now
+  then (
+    t.same_instant <- t.same_instant + 1;
+    if t.same_instant > max_events_per_instant
+    then
+      raise_s
+        [%message
+          "Event_sim: more than a million events at one instant (a loop with zero delay?)"
+            ~time:(ev.time : int)])
+  else t.same_instant <- 0;
   t.now <- ev.time;
   t.events_processed <- t.events_processed + 1;
   match ev.kind with
@@ -1218,6 +1231,7 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
     ; heap = Array.create ~len:1024 dummy_event
     ; heap_size = 0
     ; events_processed = 0
+    ; same_instant = 0
     ; metastable = []
     ; trace = None
     }

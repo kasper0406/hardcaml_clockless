@@ -990,3 +990,19 @@ let%expect_test "latch: metastable only when D moves inside the closing-edge ape
     D rises at  -80.478 ps: metastable false, Q 0
     |}]
 ;;
+
+let%expect_test "a ring in zero-delay mode is reported, not hung" =
+  let tl = force tlib in
+  let sim =
+    Sim.create ~config:{ Sim.Config.default with delay_mode = Zero } tl (ring_circuit tl.library fast_ring)
+  in
+  Sim.set_input sim "en" V0 ~at:0;
+  Sim.set_input sim "en" V1 ~at:(Sim.of_ns 1.);
+  (match Sim.run_until sim (Sim.of_ns 2.) with
+   | () -> print_endline "returned"
+   | exception e -> print_s (Exn.sexp_of_t e));
+  [%expect {|
+    ("Event_sim: more than a million events at one instant (a loop with zero delay?)"
+     (time 1000000))
+    |}]
+;;
