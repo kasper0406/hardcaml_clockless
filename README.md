@@ -34,9 +34,12 @@ click elements) are in that repo's
 | `Cell_library` | Typed cells: kind (combinational/latch/flop/tristate/constant/physical), pins, functions, area | done |
 | `Cell` | Hand-placed cell instantiation with `dont_touch`/`keep`, pin checking, stable instance names | done |
 | `Delay_line` | Tapped chain of buffer/delay cells | done |
-| `Tdc` | Delay line + first-stage sampling flops (kept, stably named) + synchronous decoder: bubble filter, fine code, overflow and multi-edge flags, coarse counter. `Cells` (Verilog) or behavioural `Model` (Cyclesim) | done |
-| `Tdc_calibration` | Code-density calibration against the system clock | next |
-| Behavioural models | Cyclesim models of TDC/delay lines so the rest of a design simulates normally | partial: TDC (`Tdc.Model`, uniform stage delays) |
+| `Ring` | Free-running ring oscillator: NAND enable + inverters, selectable lengths, ring-clocked Johnson+Gray period counters (two copies half a period apart), loop-break metadata. `Clk_sampler` decodes the system-clock-sampled state to ring time `k*2n+p`, choosing the stable counter by phase. `Ideal` is a unit-delay reference ring in plain OCaml that drives the behavioural `Model` | done (Cyclesim-verified; timing pending `Event_sim`) |
+| `Tdc` | Delay line + first-stage sampling flops (kept, stably named) + synchronous decoder: bubble filter, fine code, overflow and multi-edge flags, coarse counter. `Cells` (Verilog) or behavioural `Model` (Cyclesim). Fallback design: a line of buf_1 does not span a 20 ns cycle at the fast corner | done |
+| `Pin_capture` | XOR-merged input pins clock a shared async FIFO of (ring phase, counts, pin snapshot); edge counters and level checks flag lost or merged edges | next |
+| `Strobe_sampler` | Vernier-delayed strobe samples every pin: equivalent-time sampling for repetitive signals | planned |
+| Calibration | Code-density histogram of the `clk`-sampled ring; ring periods per cycle | next |
+| Behavioural models | Cyclesim models so the rest of a design simulates normally | `Tdc.Model`, `Ring.Model` (driven by `Ring.Ideal`) |
 | `Event_sim` | Event-driven gate-level simulation of Hardcaml circuits of Liberty cells: fs time, 0/1/X, NLDM delays with slew propagation and loads, inertial/transport, flops/latches from Liberty with setup/hold-aperture metastability (exponential resolution), corner scale and seeded per-instance variation, Hardcaml registers on any clock net, loops (ring oscillators), VCD | done (minimal); SDF, adversarial delays, hazard/protocol monitors, Cyclesim co-simulation: planned |
 | `Sdc` | Timing constraints and LibreLane config (dont-touch, loop breaks, relative timing) | planned |
 | Post-route check | Re-extract islands from the routed netlist; check cells survived unchanged | planned |
