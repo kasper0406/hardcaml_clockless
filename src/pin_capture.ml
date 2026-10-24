@@ -45,7 +45,9 @@
       not captured at all; the level check reports them (below).
     - {b Edge counters.} Per pin, a flop toggled on each rising edge and one
       toggled on each falling edge form a 2-bit Gray count of edges, clocked
-      by the pin itself.
+      by the pin itself. Both reset to 0 whatever the pin level, so the pair
+      steps through the Gray code forwards from a low pin and backwards from
+      a high one; the drain decodes it relative to the synchronised level.
 
     {2 Drain}
 
@@ -354,7 +356,7 @@ module Make (C : Config) (R : Ring.S) = struct
       (** merged toggles in this cycle, in order; the first goes to bank R
           if the merged level was low *)
       ; capture : 'a Record.t list [@length model_captures] [@rtlmangle "_"]
-      ; edges : 'a [@bits 2 * pins] (** edge counters (Gray) at this edge *)
+      ; edges : 'a [@bits 2 * pins] (** edge counter flops at this edge, as [Front.edges] *)
       ; levels : 'a [@bits pins] (** pin levels at this edge *)
       ; corrupt_r : 'a [@bits ptr_bits] (** XOR-ed into the R pointer (fault injection) *)
       ; corrupt_f : 'a [@bits ptr_bits]
@@ -606,7 +608,7 @@ module Make (C : Config) (R : Ring.S) = struct
       ; mutable captures : Reference.capture list (** pending, sorted *)
       ; mutable cycle : int
       ; mutable levels : int
-      ; counts : int array
+      ; mutable edge_flops : int (** as the cells: bit 2i toggles on a rise of pin i, 2i+1 on a fall *)
       ; mutable corrupt_r : int
       ; mutable corrupt_f : int
       }
@@ -620,7 +622,7 @@ module Make (C : Config) (R : Ring.S) = struct
             Int.compare a.time b.time)
       ; cycle = 0
       ; levels = initial
-      ; counts = Array.create ~len:pins 0
+      ; edge_flops = 0
       ; corrupt_r = 0
       ; corrupt_f = 0
       }
@@ -659,19 +661,14 @@ module Make (C : Config) (R : Ring.S) = struct
       t.edges <- rest;
       List.iter evs ~f:(fun e ->
         t.levels <- t.levels lxor (1 lsl e.pin);
-        t.counts.(e.pin) <- t.counts.(e.pin) + 1);
+        let rise = t.levels land (1 lsl e.pin) <> 0 in
+        t.edge_flops <- t.edge_flops lxor (1 lsl ((2 * e.pin) + if rise then 0 else 1)));
       let set r w v = r := Bits.of_int_trunc ~width:w v in
       set s.captures capture_count_width (List.length records);
       List.iteri s.capture ~f:(fun k (cap : Bits.t ref Record.t) ->
         let rc = List.nth records k |> Option.value ~default:{ Record.nodes = 0; count_a = 0; count_b = 0; pins = 0; delayed = 0 } in
         Record.iter2 cap (Record.map2 rc Record.port_widths ~f:(fun v w -> v, w)) ~f:(fun r (v, w) -> set r w v));
-      let gray =
-        Array.foldi t.counts ~init:0 ~f:(fun i acc c ->
-          let c1 = (c lsr 1) land 1
-          and c0 = c land 1 in
-          acc lor ((c0 lxor c1) lsl (2 * i)) lor (c1 lsl ((2 * i) + 1)))
-      in
-      set s.edges (2 * pins) gray;
+      set s.edges (2 * pins) t.edge_flops;
       set s.levels pins t.levels;
       set s.corrupt_r ptr_bits t.corrupt_r;
       set s.corrupt_f ptr_bits t.corrupt_f;
@@ -840,11 +837,15 @@ module Make (C : Config) (R : Ring.S) = struct
       let idx_f = Pointer.to_index ~slots wf in
       let valid_r = Pointer.valid ~slots wr in
       let valid_f = Pointer.valid ~slots wf in
-      (* Edge counts (mod 4) from the Gray pairs. *)
+      (* Edge counts (mod 4) from the Gray pairs, relative to the level: the
+         flops reset to 0 whatever the pin level, so from a high pin the pair
+         steps through the Gray code backwards ([fb @: (fb ^: rb)] would count
+         down). The high bit is the flop of the edge type not last seen.
+         Only used while the pin's level and counters are stable. *)
       let ec_count i =
         let rb = ec.:(2 * i)
         and fb = ec.:((2 * i) + 1) in
-        fb @: (fb ^: rb)
+        mux2 lv.:(i) fb rb @: (fb ^: rb)
       in
       (* --- State --- *)
       let resync = wire 1 in
@@ -917,8 +918,15 @@ module Make (C : Config) (R : Ring.S) = struct
          XOR tree have no capture, so the next capture's snapshot attributes
          them with its own (wrong) time: once everything is drained and
          stable, captures - attributions is then negative. The pins
-         attributed since the balance was last 0 are flagged. *)
-      let balance = wire 5 in
+         attributed since the balance was last 0 are flagged.
+         A read adds 1 - k (k <= pins), and reads between checks are
+         unbounded (the FIFO need not empty), so no width holds every value.
+         Without errors the balance stays in [1 - pins, 0]; it is [bw] bits
+         signed, [2^(bw-1) > pins]: it saturates at the top, and once it
+         reaches the floor [-2^(bw-1)] (< 1 - pins: unmatched attributions)
+         it stays there until the check, which flags. *)
+      let bw = num_bits_to_represent pins + 1 in
+      let balance = wire bw in
       let unconfirmed = wire pins in
       let all_stable =
         lv ==: lv_p &: (ec ==: ec_p) &: (guard ==:. 0)
@@ -926,7 +934,11 @@ module Make (C : Config) (R : Ring.S) = struct
       let balance_check = do_check &: all_stable in
       let attributed = popcount (changed |: reconfig) in
       let balance_read =
-        balance +:. 1 -: uresize attributed ~width:5
+        let floor = of_int_trunc ~width:(bw + 1) (-(1 lsl (bw - 1))) in
+        let top = of_int_trunc ~width:(bw + 1) ((1 lsl (bw - 1)) - 1) in
+        let sum = sresize balance ~width:(bw + 1) +:. 1 -: uresize attributed ~width:(bw + 1) in
+        let sat = mux2 (sum <+ floor) floor (mux2 (sum >+ top) top sum) in
+        mux2 (balance ==: sel_bottom floor ~width:bw) balance (sel_bottom sat ~width:bw)
       in
       (* Excess captures (balance > 0: pulses narrower than the merge
          window, two empty captures) are caught by the pin's edge count. *)
@@ -1063,7 +1075,7 @@ module Make (C : Config) (R : Ring.S) = struct
       Signal.assign
         balance
         (rc
-           (mux2 (resync_done |: balance_check) (zero 5)
+           (mux2 (resync_done |: balance_check) (zero bw)
               (mux2 do_read balance_read balance)));
       Signal.assign
         unconfirmed

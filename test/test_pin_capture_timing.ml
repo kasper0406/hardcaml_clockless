@@ -136,3 +136,31 @@ let%expect_test "slots = 3 and 4 per bank (typ)" =
          status: capture_fault=0 fault_count=0 overflow=0 overflow_count=0 lost_edge=15 lost_edge_count=10 level_mismatch=15 level_mismatch_count=34 merge_error=0 merge_error_count=0 empty_count=13 stale_count=35 runt_count=2 resyncing=0
     |}]
 ;;
+
+let%expect_test "pins high at reset: no false lost_edge with the real edge counters (typ)" =
+  (* Pins 0 and 2 start high; each pin toggles 3 times, 200 ns apart. *)
+  let initial = 0b0101 in
+  let edges = List.init 12 ~f:(fun k -> Event_sim.of_ns 1000. + (k * Event_sim.of_ns 200.), k % 4) in
+  let cycles = (List.last_exn edges |> fst) / T.clock_period + 50 in
+  let r = T.simulate ~initial ~path:"data/sg13cmos5l_excerpt.lib" ~edges ~cycles () in
+  List.iter r.events ~f:(fun e ->
+    printf "cycle %3d: %s pins %x changed %x\n" e.cycle (if e.untimed then "untimed" else "timed  ") e.pins
+      e.changed);
+  printf "pin flags: %d; status: %s\n" (List.length r.pin_flags)
+    (String.concat ~sep:" " (List.map r.status ~f:(fun (k, v) -> Printf.sprintf "%s=%d" k v)));
+  [%expect {|
+    cycle  55: timed   pins 4 changed 1
+    cycle  65: timed   pins 6 changed 2
+    cycle  75: timed   pins 2 changed 4
+    cycle  85: timed   pins a changed 8
+    cycle  95: timed   pins b changed 1
+    cycle 105: timed   pins 9 changed 2
+    cycle 115: timed   pins d changed 4
+    cycle 125: timed   pins 5 changed 8
+    cycle 135: timed   pins 4 changed 1
+    cycle 145: timed   pins 6 changed 2
+    cycle 155: timed   pins 2 changed 4
+    cycle 165: timed   pins a changed 8
+    pin flags: 0; status: capture_fault=0 fault_count=0 overflow=0 overflow_count=0 lost_edge=0 lost_edge_count=0 level_mismatch=0 level_mismatch_count=0 merge_error=0 merge_error_count=0 empty_count=0 stale_count=0 runt_count=0 resyncing=0
+    |}]
+;;

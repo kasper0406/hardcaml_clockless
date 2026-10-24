@@ -107,8 +107,9 @@ struct
 
   let config ?(seed = 0) () = { Event_sim.Config.default with seed }
 
-  (* One run: [edges] are (time fs, pin) toggles. Samples the outputs every
-     cycle (mid-cycle, after the edge they were registered on). *)
+  (* One run: [edges] are (time fs, pin) toggles from the levels [initial].
+     Samples the outputs every cycle (mid-cycle, after the edge they were
+     registered on). *)
   type event =
     { cycle : int
     ; untimed : bool
@@ -145,17 +146,17 @@ struct
 
   let get sim nm = Option.value (Event_sim.to_int sim nm) ~default:(-1)
 
-  let simulate ?(seed = 0) ?(setup = fun (_ : Event_sim.t) -> ()) ~path ~(edges : (int * int) list) ~cycles () =
+  let simulate ?(seed = 0) ?(initial = 0) ?(setup = fun (_ : Event_sim.t) -> ()) ~path ~(edges : (int * int) list) ~cycles () =
     let tl = Timing_library.load path in
     let sim = Event_sim.create ~config:(config ~seed ()) tl (circuit tl.library) in
     Event_sim.set_input_int sim "enable" 0 ~at:0;
     Event_sim.set_input_int sim "enable" 1 ~at:(Event_sim.of_ns 5.);
     Event_sim.set_input_int sim "clear" 1 ~at:0;
     Event_sim.set_input_int sim "clear" 0 ~at:(3 * clock_period);
-    Event_sim.set_input_int sim "pins" 0 ~at:0;
+    Event_sim.set_input_int sim "pins" initial ~at:0;
     Event_sim.set_input_int sim "pin_enable" ((1 lsl Cfg.pins) - 1) ~at:0;
     Event_sim.add_clock sim "clock" ~period:clock_period;
-    let level = Array.create ~len:Cfg.pins 0 in
+    let level = Array.init Cfg.pins ~f:(fun p -> (initial lsr p) land 1) in
     List.iter (List.sort edges ~compare:(fun (a, _) (b, _) -> Int.compare a b)) ~f:(fun (t, p) ->
       level.(p) <- 1 - level.(p);
       Event_sim.set_input sim (Printf.sprintf "pins[%d]" p) (if level.(p) = 1 then V1 else V0) ~at:t);
