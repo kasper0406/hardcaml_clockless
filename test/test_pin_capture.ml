@@ -77,6 +77,7 @@ let run
   ?(trace = false)
   ?(corrupt = fun _ ~ptr_r:_ ~ptr_f:_ -> None)
   ?(initial = 0)
+  ?(count_select = Cap.Count_source.Fault)
   ?(captures : Ref.capture list option)
   ~(edges : Ref.edge list)
   ~cycles
@@ -108,6 +109,8 @@ let run
     let c = k + 1 in
     i.cap.clear := Bits.of_bool (k < 2);
     i.cap.pin_enable := Bits.of_int_trunc ~width:Cfg.pins (enable c);
+    i.cap.count_select
+    := Bits.of_int_trunc ~width:Cap.Count_source.width (Cap.Count_source.code count_select);
     (match corrupt c ~ptr_r:(model_ptr "model_ptr_r") ~ptr_f:(model_ptr "model_ptr_f") with
      | Some (r, f) -> Cap.Model_driver.corrupt driver ~r ~f
      | None -> ());
@@ -335,6 +338,56 @@ let%expect_test "bursts overflow the banks: flagged, resynchronised, nothing unf
   [%expect {|
     status: fault 0 (0) overflow 1 (3385) lost_edge f (72) level_mismatch f (106) merge_error d (2) empty 392 stale 1906 resyncing 0
     edges 19682: timed 3145, untimed 153, lost+flagged 16384, bad+flagged 5236 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    |}]
+;;
+
+let%expect_test "shared status counter: each source counts what its pulses report, saturating" =
+  (* Two scenarios: bursts (overflow, stale, empty, lost edges), and gentle
+     traffic with a corrupted pointer (fault). The counter is 8 bits wide
+     here, so large counts saturate. Runts need the real cells (Event_sim);
+     the Model front never produces them. *)
+  let scenario ~seed ~count ~gap ~corrupt_at =
+    let edges = random_edges ~seed ~count ~start:(30 * spc) ~gap in
+    let cycles = cycle_of_time (List.last_exn edges).time + 400 in
+    let corrupt c ~ptr_r ~ptr_f:_ =
+      if c = corrupt_at then Some (ptr_r () lxor 0b010, 0) else None
+    in
+    List.iter Cap.Count_source.all ~f:(fun source ->
+      let r = run ~trace:true ~corrupt ~count_select:source ~edges ~cycles () in
+      let pulses = r.counts.(Cap.Count_source.code source) in
+      let expect = Int.min pulses ((1 lsl Cfg.status_width) - 1) in
+      let got = b r.status.count in
+      printf "  %-15s pulses %4d counter %3d%s\n"
+        (Sexp.to_string (Cap.Count_source.sexp_of_t source)) pulses got
+        (if got = expect then "" else " MISMATCH"))
+  in
+  print_endline "bursts:";
+  scenario ~seed:7 ~count:3000 ~corrupt_at:(-1) ~gap:(fun rng ->
+    match Random.State.int rng 10 with
+    | 0 -> 1 + Random.State.int rng 4
+    | 1 | 2 | 3 -> Random.State.int rng (spc / 2)
+    | _ -> Random.State.int rng (3 * spc));
+  print_endline "gentle, pointer corrupted at cycle 300:";
+  scenario ~seed:3 ~count:600 ~corrupt_at:300 ~gap:(fun rng -> spc + Random.State.int rng (4 * spc));
+  [%expect {|
+    bursts:
+      Fault           pulses    0 counter   0
+      Overflow        pulses  503 counter 255
+      Lost_edge       pulses    9 counter   9
+      Level_mismatch  pulses   21 counter  21
+      Merge_error     pulses    1 counter   1
+      Empty           pulses   54 counter  54
+      Stale           pulses  242 counter 242
+      Runt            pulses    0 counter   0
+    gentle, pointer corrupted at cycle 300:
+      Fault           pulses    1 counter   1
+      Overflow        pulses    0 counter   0
+      Lost_edge       pulses    0 counter   0
+      Level_mismatch  pulses    0 counter   0
+      Merge_error     pulses    0 counter   0
+      Empty           pulses    0 counter   0
+      Stale           pulses    0 counter   0
+      Runt            pulses    0 counter   0
     |}]
 ;;
 
