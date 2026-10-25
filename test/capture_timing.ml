@@ -93,7 +93,6 @@ struct
         ; pins
         ; pin_enable
         ; length_sel
-        ; raw_select = Signal.zero Cap.raw_select_width
         ; ring = state
         }
     in
@@ -171,9 +170,21 @@ struct
     let global_flags = Queue.create () in
     let clk_phases = Queue.create () in
     let x_outputs = ref 0 in
+    (* Status counts, from the [_now] pulses and the events. *)
+    let counts = Hashtbl.create (module String) in
+    let add nm x = if x > 0 then Hashtbl.update counts nm ~f:(fun o -> Option.value o ~default:0 + x) in
+    let pc nm = Int.popcount (Int.max 0 (get sim nm)) in
     for c = 1 to cycles do
       Event_sim.run_until sim ((c * clock_period) + (clock_period / 2));
       if get sim "smp_valid" = 1 && c > 10 then Queue.enqueue clk_phases (get sim "smp_phase");
+      add "fault_count" (pc "status_fault_now");
+      add "overflow_count" (pc "status_overflow_now");
+      add "lost_edge_count" (pc "status_lost_edge_now");
+      add "level_mismatch_count" (pc "status_level_mismatch_now");
+      add "merge_error_count" (if get sim "status_merge_error_now" > 0 then 1 else 0);
+      add "empty_count" (pc "status_empty_now");
+      add "runt_count" (pc "status_runt_now");
+      if get sim "event_valid" = 1 && get sim "event_untimed" = 0 then add "stale_count" (pc "event_stale");
       if get sim "event_valid" = 1
       then (
         let g nm = get sim ("event_" ^ nm) in
@@ -215,7 +226,11 @@ struct
     { events = Queue.to_list events
     ; pin_flags = Queue.to_list pin_flags
     ; global_flags = Queue.to_list global_flags
-    ; status = List.map status_names ~f:(fun nm -> nm, get sim ("status_" ^ nm))
+    ; status =
+        List.map status_names ~f:(fun nm ->
+          if String.is_suffix nm ~suffix:"_count"
+          then nm, Option.value (Hashtbl.find counts nm) ~default:0
+          else nm, get sim ("status_" ^ nm))
     ; rises = Queue.to_array rises
     ; sim
     ; cycles
