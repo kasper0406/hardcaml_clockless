@@ -783,11 +783,14 @@ let%expect_test "cells: hand-placed delay cells and kept, stably named sampling 
         (* keep=1,dont_touch=1 *)
         reg tdc_sample2;
         wire signal_inst;
-        wire signal_wire;
+        (* stable_name=1 *)
+        wire tdc_stage0__X;
         wire signal_inst_1;
-        wire signal_wire_1;
+        (* stable_name=1 *)
+        wire tdc_stage1__X;
         wire signal_inst_2;
-        wire signal_wire_2;
+        (* stable_name=1 *)
+        wire tdc_stage2__X;
         (* keep=1,dont_touch=1 *)
         reg tdc_sample3;
         wire [3:0] signal_cat;
@@ -795,31 +798,31 @@ let%expect_test "cells: hand-placed delay cells and kept, stably named sampling 
             tdc_sample0 <= hit;
         end
         always @(posedge clock) begin
-            tdc_sample1 <= signal_wire;
+            tdc_sample1 <= tdc_stage0__X;
         end
         always @(posedge clock) begin
-            tdc_sample2 <= signal_wire_1;
+            tdc_sample2 <= tdc_stage1__X;
         end
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_buf_1
             tdc_stage0
             ( .A(hit),
               .X(signal_inst) );
-        assign signal_wire = signal_inst;
+        assign tdc_stage0__X = signal_inst;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_buf_1
             tdc_stage1
-            ( .A(signal_wire),
+            ( .A(tdc_stage0__X),
               .X(signal_inst_1) );
-        assign signal_wire_1 = signal_inst_1;
+        assign tdc_stage1__X = signal_inst_1;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_buf_1
             tdc_stage2
-            ( .A(signal_wire_1),
+            ( .A(tdc_stage1__X),
               .X(signal_inst_2) );
-        assign signal_wire_2 = signal_inst_2;
+        assign tdc_stage2__X = signal_inst_2;
         always @(posedge clock) begin
-            tdc_sample3 <= signal_wire_2;
+            tdc_sample3 <= tdc_stage2__X;
         end
         assign signal_cat = { tdc_sample3,
                               tdc_sample2,
@@ -860,21 +863,29 @@ let%expect_test "cells: whole TDC as a separate module named by the caller; pass
         reg tdc_sample1;
         (* keep=1,dont_touch=1 *)
         reg tdc_sample2;
+        wire tdc_stage0__X;
+        wire tdc_stage1__X;
+        wire tdc_stage2__X;
         (* keep=1,dont_touch=1 *)
         reg tdc_sample3;
             tdc_sample0 <= signal_wire_3;
-            tdc_sample1 <= signal_wire_4;
-            tdc_sample2 <= signal_wire_5;
+            tdc_sample1 <= tdc_stage0__X;
+            tdc_sample2 <= tdc_stage1__X;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_buf_1
             tdc_stage0
+        assign tdc_stage0__X = signal_inst;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_buf_1
             tdc_stage1
+            ( .A(tdc_stage0__X),
+        assign tdc_stage1__X = signal_inst_1;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_buf_1
             tdc_stage2
-            tdc_sample3 <= signal_wire_6;
+            ( .A(tdc_stage1__X),
+        assign tdc_stage2__X = signal_inst_2;
+            tdc_sample3 <= tdc_stage2__X;
         assign signal_cat_7 = { tdc_sample3,
                                 tdc_sample2,
                                 tdc_sample1,

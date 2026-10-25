@@ -699,6 +699,24 @@ module Make (C : Config) (R : Ring.S) = struct
     [@@deriving hardcaml]
   end
 
+  (** What the shared status counter counts ([count_select]). Each source
+      adds the number of pins (or events) it reports in that cycle. *)
+  module Count_source = struct
+    type t =
+      | Fault
+      | Overflow
+      | Lost_edge
+      | Level_mismatch
+      | Merge_error
+      | Empty
+      | Stale
+      | Runt
+    [@@deriving sexp_of, compare, equal, enumerate]
+
+    let code t = List.find_mapi_exn all ~f:(fun i x -> Option.some_if (equal x t) i)
+    let width = num_bits_to_represent (List.length all - 1)
+  end
+
   module Status = struct
     type 'a t =
       { resyncing : 'a
@@ -717,6 +735,9 @@ module Make (C : Config) (R : Ring.S) = struct
       ; lost_edge_now : 'a [@bits pins]
       ; level_mismatch_now : 'a [@bits pins]
       ; merge_error_now : 'a [@bits pins]
+      ; count : 'a [@bits status_width]
+      (** events of the [count_select] source since [clear_status];
+          saturates at all ones *)
       ; ptr_reset : 'a (** the front's write pointers are being reset *)
       ; enabled : 'a [@bits pins] (** enables applied to the front *)
       ; guarded : 'a [@bits pins]
@@ -728,10 +749,11 @@ module Make (C : Config) (R : Ring.S) = struct
     type 'a t =
       { clock : 'a
       ; clear : 'a
-      ; clear_status : 'a (** clears sticky flags and counters *)
+      ; clear_status : 'a (** clears the sticky flags and the counter *)
       ; pins : 'a [@bits pins] (** asynchronous; unused in [Model] mode *)
       ; pin_enable : 'a [@bits pins]
       ; length_sel : 'a [@bits R.select_width]
+      ; count_select : 'a [@bits Count_source.width] (** a {!Count_source.code} *)
       ; ring : 'a R.State.t [@rtlmangle "_"] (** unused in [Model] mode *)
       }
     [@@deriving hardcaml]
@@ -773,7 +795,7 @@ module Make (C : Config) (R : Ring.S) = struct
     end
 
     let create ?first_stage ~name scope ~clock ~clear ~clear_status ~pin_enable ~length_sel
-      (front : Signal.t Front.t)
+      ~count_select (front : Signal.t Front.t)
       =
       let ( -- ) = Scope.naming scope in
       let spec = Reg_spec.create ~clock () in
@@ -1104,6 +1126,26 @@ module Make (C : Config) (R : Ring.S) = struct
       let edge_reset = r clear in
       (* --- Status --- *)
       let sticky x = reg_fb specc ~width:(width x) ~f:(fun s -> mux2 clear_status (zero (width x)) (s |: x)) in
+      (* One shared counter: a polling host cannot count the _now pulses. *)
+      let count =
+        let cw = num_bits_to_represent pins in
+        let n x = uresize x ~width:cw in
+        let source : Count_source.t -> Signal.t = function
+          | Fault -> n fault_now
+          | Overflow -> n mark_ovf
+          | Lost_edge -> popcount count_bad |> n
+          | Level_mismatch -> popcount level_bad |> n
+          | Merge_error -> n merge_bad
+          | Empty -> n empty_event
+          | Stale -> mux2 timed (popcount sd.stale |> n) (zero cw)
+          | Runt -> n runt
+        in
+        let x = r (mux (r count_select) (List.map Count_source.all ~f:source)) in
+        reg_fb specc ~width:status_width ~f:(fun c ->
+          let sum = uresize c ~width:(status_width + 1) +: uresize x ~width:(status_width + 1) in
+          mux2 clear_status (zero status_width)
+            (mux2 (msb sum) (ones status_width) (lsbs sum)))
+      in
       let status =
         { Status.resyncing = resync
         ; capture_fault = sticky fault_now
@@ -1118,6 +1160,7 @@ module Make (C : Config) (R : Ring.S) = struct
         ; lost_edge_now = r count_bad
         ; level_mismatch_now = r level_bad
         ; merge_error_now = r merge_error
+        ; count
         ; ptr_reset
         ; enabled = en
         ; guarded = guard
@@ -1171,6 +1214,7 @@ module Make (C : Config) (R : Ring.S) = struct
         ~clear_status:i.clear_status
         ~pin_enable:i.pin_enable
         ~length_sel:i.length_sel
+        ~count_select:i.count_select
         front
     in
     Signal.assign enable ctl.enable;

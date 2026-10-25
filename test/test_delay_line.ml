@@ -26,32 +26,35 @@ let%expect_test "delay line: hand-placed, dont_touch, stable instance names" =
         output tap2;
 
         wire signal_inst;
-        wire signal_wire;
+        (* stable_name=1 *)
+        wire dl_stage2__X;
         wire signal_inst_1;
-        wire signal_wire_1;
+        (* stable_name=1 *)
+        wire dl_stage1__X;
         wire signal_inst_2;
-        wire signal_wire_2;
+        (* stable_name=1 *)
+        wire dl_stage0__X;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_dlygate4sd3_1
             dl_stage2
-            ( .A(signal_wire_1),
+            ( .A(dl_stage1__X),
               .X(signal_inst) );
-        assign signal_wire = signal_inst;
+        assign dl_stage2__X = signal_inst;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_dlygate4sd3_1
             dl_stage1
-            ( .A(signal_wire_2),
+            ( .A(dl_stage0__X),
               .X(signal_inst_1) );
-        assign signal_wire_1 = signal_inst_1;
+        assign dl_stage1__X = signal_inst_1;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_dlygate4sd3_1
             dl_stage0
             ( .A(a),
               .X(signal_inst_2) );
-        assign signal_wire_2 = signal_inst_2;
-        assign tap0 = signal_wire_2;
-        assign tap1 = signal_wire_1;
-        assign tap2 = signal_wire;
+        assign dl_stage0__X = signal_inst_2;
+        assign tap0 = dl_stage0__X;
+        assign tap1 = dl_stage1__X;
+        assign tap2 = dl_stage2__X;
 
     endmodule
     |}]
