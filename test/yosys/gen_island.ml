@@ -90,7 +90,7 @@ let island lib =
       ; clear_status = gnd
       ; pin_enable = ones 4
       ; length_sel
-      ; raw_select = zero Cap.I.port_widths.raw_select
+      ; count_select = zero Cap.I.port_widths.count_select
       ; pins
       ; ring = state
       }
