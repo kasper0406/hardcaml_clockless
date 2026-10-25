@@ -60,7 +60,7 @@
     - The ring time is decoded from the record ({!Ring.S.decode}).
     - Events leave the third pipeline stage combinationally, 2 cycles after
       the read (6-7 cycles after the edge), so the overwrite check below can
-      be applied to the event itself. Raw slot bits are readable through [raw_select] / [raw].
+      be applied to the event itself.
 
     {2 Integrity checks (everything is flagged, nothing silently wrong)}
 
@@ -318,7 +318,6 @@ module Make (C : Config) (R : Ring.S) = struct
   let index_width = Pointer.index_width ~slots
   let slot_width = Int.max 1 (num_bits_to_represent (slots - 1))
   let capture_count_width = num_bits_to_represent model_captures
-  let raw_select_width = num_bits_to_represent ((2 * slots) - 1)
 
   (** One capture: the ring state and the pin levels. *)
   module Record = struct
@@ -700,31 +699,45 @@ module Make (C : Config) (R : Ring.S) = struct
     [@@deriving hardcaml]
   end
 
+  (** What the shared status counter counts ([count_select]). Each source
+      adds the number of pins (or events) it reports in that cycle. *)
+  module Count_source = struct
+    type t =
+      | Fault
+      | Overflow
+      | Lost_edge
+      | Level_mismatch
+      | Merge_error
+      | Empty
+      | Stale
+      | Runt
+    [@@deriving sexp_of, compare, equal, enumerate]
+
+    let code t = List.find_mapi_exn all ~f:(fun i x -> Option.some_if (equal x t) i)
+    let width = num_bits_to_represent (List.length all - 1)
+  end
+
   module Status = struct
     type 'a t =
       { resyncing : 'a
       ; capture_fault : 'a (** sticky *)
-      ; fault_count : 'a [@bits status_width]
       ; overflow : 'a (** sticky *)
-      ; overflow_count : 'a [@bits status_width]
       ; lost_edge : 'a [@bits pins] (** sticky, per pin *)
-      ; lost_edge_count : 'a [@bits status_width]
       ; level_mismatch : 'a [@bits pins] (** sticky, per pin *)
-      ; level_mismatch_count : 'a [@bits status_width]
       ; merge_error : 'a [@bits pins]
       (** sticky, per pin: attributions not matched by captures (edges that
           cancelled in the XOR were attributed to a later capture) *)
-      ; merge_error_count : 'a [@bits status_width]
-      ; empty_count : 'a [@bits status_width]
-      ; stale_count : 'a [@bits status_width]
-      ; runt_count : 'a [@bits status_width]
-      (** a bank missed a toggle the other saw (read order re-aligned) *)
       ; fault_now : 'a
       ; runt_now : 'a
+      (** a bank missed a toggle the other saw (read order re-aligned) *)
+      ; empty_now : 'a (** an empty capture was dropped *)
       ; overflow_now : 'a
       ; lost_edge_now : 'a [@bits pins]
       ; level_mismatch_now : 'a [@bits pins]
       ; merge_error_now : 'a [@bits pins]
+      ; count : 'a [@bits status_width]
+      (** events of the [count_select] source since [clear_status];
+          saturates at all ones *)
       ; ptr_reset : 'a (** the front's write pointers are being reset *)
       ; enabled : 'a [@bits pins] (** enables applied to the front *)
       ; guarded : 'a [@bits pins]
@@ -736,12 +749,11 @@ module Make (C : Config) (R : Ring.S) = struct
     type 'a t =
       { clock : 'a
       ; clear : 'a
-      ; clear_status : 'a (** clears sticky flags and counters *)
+      ; clear_status : 'a (** clears the sticky flags and the counter *)
       ; pins : 'a [@bits pins] (** asynchronous; unused in [Model] mode *)
       ; pin_enable : 'a [@bits pins]
       ; length_sel : 'a [@bits R.select_width]
-      ; raw_select : 'a [@bits raw_select_width]
-      (** slot shown on [raw]: R slots, then F slots *)
+      ; count_select : 'a [@bits Count_source.width] (** a {!Count_source.code} *)
       ; ring : 'a R.State.t [@rtlmangle "_"] (** unused in [Model] mode *)
       }
     [@@deriving hardcaml]
@@ -751,9 +763,6 @@ module Make (C : Config) (R : Ring.S) = struct
     type 'a t =
       { event : 'a Event.t [@rtlmangle "_"]
       ; status : 'a Status.t [@rtlmangle "_"]
-      ; raw : 'a Record.t [@rtlmangle "_"]
-      (** raw bits of the slot [raw_select], straight from the front (not
-          synchronised: sample it twice, while that slot is not written) *)
       }
     [@@deriving hardcaml]
   end
@@ -786,7 +795,7 @@ module Make (C : Config) (R : Ring.S) = struct
     end
 
     let create ?first_stage ~name scope ~clock ~clear ~clear_status ~pin_enable ~length_sel
-      ~raw_select (front : Signal.t Front.t)
+      ~count_select (front : Signal.t Front.t)
       =
       let ( -- ) = Scope.naming scope in
       let spec = Reg_spec.create ~clock () in
@@ -971,12 +980,17 @@ module Make (C : Config) (R : Ring.S) = struct
         ; fault = gnd
         }
       in
-      (* Only the ring part of the record goes on, to the decoder. *)
-      let ring_a =
-        R.State.Of_signal.reg
-          spec
+      (* The ring part of the record is decoded in the read cycle; only the
+         phase, period count and pattern error go on (the time is formed at
+         the output). *)
+      let length_sel_q = r (r length_sel) in
+      let dec_now =
+        R.decode
+          ~length_sel:length_sel_q
           { R.State.nodes = record.nodes; count_a = record.count_a; count_b = record.count_b }
       in
+      let slim (d : Signal.t R.Decoded.t) = concat_lsb [ d.phase; d.periods; d.pattern_error ] in
+      let dec_a = r (slim dec_now) in
       (* Marks from overflow/fault detection reach every event in flight. *)
       let mark_ovf = wire 1 in
       let mark_fault = wire 1 in
@@ -985,11 +999,27 @@ module Make (C : Config) (R : Ring.S) = struct
         { s with overflow = s.overflow |: mark_ovf; fault = s.fault |: mark_fault }
       in
       let sa = stage_reg (marked stage_a) in
-      let length_sel_q = r (r length_sel) in
       let sb = stage_reg (marked sa) in
-      let dec_b = R.Decoded.Of_signal.reg spec (R.decode ~length_sel:length_sel_q ring_a) in
+      let dec_b = r dec_a in
       let sc = stage_reg (marked sb) in
-      let dec_d = R.Decoded.Of_signal.reg spec dec_b in
+      let dec_d =
+        let x = r dec_b in
+        let pw = R.phase_width
+        and cw = R.count_width
+        and tw = R.time_width in
+        let phase = sel_bottom x ~width:pw in
+        let periods = x.:[pw + cw - 1, pw] in
+        let time =
+          mux
+            length_sel_q
+            (List.map R.lengths ~f:(fun n ->
+               (uresize periods ~width:tw *: of_int_trunc ~width:pw (2 * n) |> uresize ~width:tw)
+               +: uresize phase ~width:tw)
+             |> fun xs ->
+             xs @ List.init ((1 lsl R.select_width) - List.length xs) ~f:(fun _ -> List.last_exn xs))
+        in
+        { R.Decoded.phase; periods; time; pattern_error = msb x }
+      in
       (* Overwrite check: the pointer sample registered two edges after the
          read covers every write that landed before the read edge (a write
          just before it may resolve late in the first synchroniser stage).
@@ -1096,32 +1126,41 @@ module Make (C : Config) (R : Ring.S) = struct
       let edge_reset = r clear in
       (* --- Status --- *)
       let sticky x = reg_fb specc ~width:(width x) ~f:(fun s -> mux2 clear_status (zero (width x)) (s |: x)) in
-      let counter x =
+      (* One shared counter: a polling host cannot count the _now pulses. *)
+      let count =
+        let cw = num_bits_to_represent pins in
+        let n x = uresize x ~width:cw in
+        let source : Count_source.t -> Signal.t = function
+          | Fault -> n fault_now
+          | Overflow -> n mark_ovf
+          | Lost_edge -> popcount count_bad |> n
+          | Level_mismatch -> popcount level_bad |> n
+          | Merge_error -> n merge_bad
+          | Empty -> n empty_event
+          | Stale -> mux2 timed (popcount sd.stale |> n) (zero cw)
+          | Runt -> n runt
+        in
+        let x = r (mux (r count_select) (List.map Count_source.all ~f:source)) in
         reg_fb specc ~width:status_width ~f:(fun c ->
-          mux2 clear_status (zero status_width) (c +: uresize x ~width:status_width))
+          let sum = uresize c ~width:(status_width + 1) +: uresize x ~width:(status_width + 1) in
+          mux2 clear_status (zero status_width)
+            (mux2 (msb sum) (ones status_width) (lsbs sum)))
       in
-      let count_bits x = popcount x in
       let status =
         { Status.resyncing = resync
         ; capture_fault = sticky fault_now
-        ; fault_count = counter fault_now
         ; overflow = sticky mark_ovf
-        ; overflow_count = counter (ovf_now |: late_ovf)
         ; lost_edge = sticky count_bad
-        ; lost_edge_count = counter (count_bits count_bad)
         ; level_mismatch = sticky level_bad
-        ; level_mismatch_count = counter (count_bits level_bad)
         ; merge_error = sticky merge_error
-        ; merge_error_count = counter merge_bad
-        ; empty_count = counter empty_event
-        ; stale_count = counter (popcount sd.stale &: repeat timed ~count:(num_bits_to_represent pins))
         ; fault_now = r fault_now
         ; runt_now = r runt
-        ; runt_count = counter runt
+        ; empty_now = r empty_event
         ; overflow_now = r mark_ovf
         ; lost_edge_now = r count_bad
         ; level_mismatch_now = r level_bad
         ; merge_error_now = r merge_error
+        ; count
         ; ptr_reset
         ; enabled = en
         ; guarded = guard
@@ -1144,11 +1183,7 @@ module Make (C : Config) (R : Ring.S) = struct
         ; fault = sd.fault
         }
       in
-      let raw =
-        Record.Of_signal.unpack
-          (mux raw_select (List.map (front.slots_r @ front.slots_f) ~f:Record.Of_signal.pack))
-      in
-      ( { O.event; status; raw }
+      ( { O.event; status }
       , { enable = en; ptr_reset_n = ~:ptr_reset; edge_reset_n = ~:edge_reset; ptr_reset } )
     ;;
   end
@@ -1179,7 +1214,7 @@ module Make (C : Config) (R : Ring.S) = struct
         ~clear_status:i.clear_status
         ~pin_enable:i.pin_enable
         ~length_sel:i.length_sel
-        ~raw_select:i.raw_select
+        ~count_select:i.count_select
         front
     in
     Signal.assign enable ctl.enable;
