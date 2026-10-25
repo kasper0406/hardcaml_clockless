@@ -895,3 +895,232 @@ let%expect_test "cells: whole TDC as a separate module named by the caller; pass
             protoemu_tdc
     |}]
 ;;
+
+let dfrbpq : Cell.Flop.t =
+  { cell = "sg13cmos5l_dfrbpq_1"; clk = "CLK"; d = "D"; reset_n = "RESET_B"; q = "Q" }
+;;
+
+let%expect_test "cells: first sample stage as flop cells with stable instance names" =
+  let (module T) = make ~length:3 ~coarse_width:4 ~window:4 in
+  let clock = Signal.input "clock" 1 in
+  let hit = Signal.input "hit" 1 in
+  let library = force lib in
+  let sampled =
+    T.Analog.create
+      ~first_stage:(library, dfrbpq)
+      ~name:"tdc"
+      (Cells (library, "sg13cmos5l_buf_1"))
+      ~clock
+      ~hit
+  in
+  let circuit = Circuit.create_exn ~name:"tdc_analog" [ Signal.output "sampled" sampled ] in
+  (* No registers: every sampling flop is a hand-placed cell. *)
+  Rtl.print Verilog circuit;
+  [%expect {|
+    module tdc_analog (
+        hit,
+        clock,
+        sampled
+    );
+
+        input hit;
+        input clock;
+        output [3:0] sampled;
+
+        wire signal_inst;
+        (* stable_name=1 *)
+        wire tdc_sample0_q;
+        (* stable_name=1 *)
+        wire tdc_sample0__Q;
+        wire signal_inst_1;
+        (* stable_name=1 *)
+        wire tdc_sample1_q;
+        (* stable_name=1 *)
+        wire tdc_sample1__Q;
+        wire signal_inst_2;
+        (* stable_name=1 *)
+        wire tdc_sample2_q;
+        (* stable_name=1 *)
+        wire tdc_sample2__Q;
+        wire vdd;
+        wire signal_inst_3;
+        (* stable_name=1 *)
+        wire tdc_stage0__X;
+        wire signal_inst_4;
+        (* stable_name=1 *)
+        wire tdc_stage1__X;
+        wire signal_inst_5;
+        (* stable_name=1 *)
+        wire tdc_stage2__X;
+        wire signal_inst_6;
+        (* stable_name=1 *)
+        wire tdc_sample3_q;
+        (* stable_name=1 *)
+        wire tdc_sample3__Q;
+        wire [3:0] signal_cat;
+        (* keep=1,dont_touch=1 *)
+        sg13cmos5l_dfrbpq_1
+            tdc_sample0
+            ( .CLK(clock),
+              .D(hit),
+              .RESET_B(vdd),
+              .Q(signal_inst) );
+        assign tdc_sample0_q = signal_inst;
+        (* keep=1,dont_touch=1 *)
+        sg13cmos5l_dfrbpq_1
+            tdc_sample1
+            ( .CLK(clock),
+              .D(tdc_stage0__X),
+              .RESET_B(vdd),
+              .Q(signal_inst_1) );
+        assign tdc_sample1_q = signal_inst_1;
+        (* keep=1,dont_touch=1 *)
+        sg13cmos5l_dfrbpq_1
+            tdc_sample2
+            ( .CLK(clock),
+              .D(tdc_stage1__X),
+              .RESET_B(vdd),
+              .Q(signal_inst_2) );
+        assign tdc_sample2_q = signal_inst_2;
+        assign vdd = 1'b1;
+        (* keep=1,dont_touch=1 *)
+        sg13cmos5l_buf_1
+            tdc_stage0
+            ( .A(hit),
+              .X(signal_inst_3) );
+        assign tdc_stage0__X = signal_inst_3;
+        (* keep=1,dont_touch=1 *)
+        sg13cmos5l_buf_1
+            tdc_stage1
+            ( .A(tdc_stage0__X),
+              .X(signal_inst_4) );
+        assign tdc_stage1__X = signal_inst_4;
+        (* keep=1,dont_touch=1 *)
+        sg13cmos5l_buf_1
+            tdc_stage2
+            ( .A(tdc_stage1__X),
+              .X(signal_inst_5) );
+        assign tdc_stage2__X = signal_inst_5;
+        (* keep=1,dont_touch=1 *)
+        sg13cmos5l_dfrbpq_1
+            tdc_sample3
+            ( .CLK(clock),
+              .D(tdc_stage2__X),
+              .RESET_B(vdd),
+              .Q(signal_inst_6) );
+        assign tdc_sample3_q = signal_inst_6;
+        assign signal_cat = { tdc_sample3_q,
+                              tdc_sample2_q,
+                              tdc_sample1_q,
+                              tdc_sample0_q };
+        assign tdc_sample0__Q = tdc_sample0_q;
+        assign tdc_sample1__Q = tdc_sample1_q;
+        assign tdc_sample2__Q = tdc_sample2_q;
+        assign tdc_sample3__Q = tdc_sample3_q;
+        assign sampled = signal_cat;
+
+    endmodule
+    |}]
+;;
+
+(* The cell first stage in Event_sim, with metastability off (flops sample
+   ideally at the edge), against the line itself: a sample shows position
+   [i] new iff that position's net changed before the clock edge. One edge
+   per cycle at a swept offset before the clock edge; the register first
+   stage is checked the same way. This checks function, not timing
+   equivalence: the cells load the line (registers have no input
+   capacitance), so near a tap the two codes can differ by one. *)
+let%expect_test "event_sim: cell first stage decodes the line's own transitions" =
+  let length = 8 in
+  let (module T) = make ~length ~coarse_width:8 ~window:(length + 1) in
+  let tl = Timing_library.load "data/sg13cmos5l_excerpt.lib" in
+  let period = Event_sim.of_ns 20. in
+  let cycles = 60 in
+  let run ~first_stage =
+    let scope = Scope.create ~flatten_design:true () in
+    let module C = Circuit.With_interface (T.I) (T.O) in
+    let circuit =
+      C.create_exn
+        ~name:"tdc_top"
+        (T.create ?first_stage (Cells (tl.library, "sg13cmos5l_dlygate4sd3_1")) scope)
+    in
+    let config = { Event_sim.Config.default with metastability = false } in
+    let sim = Event_sim.create ~config tl circuit in
+    Event_sim.set_input_int sim "clear" 1 ~at:0;
+    Event_sim.set_input_int sim "clear" 0 ~at:(3 * period);
+    Event_sim.set_input_int sim "hit" 0 ~at:0;
+    Event_sim.add_clock sim "clock" ~period;
+    (* edge k: [offset k] before clock edge k (k >= 7; k = 6 drives the
+       level hit already has), offsets swept over
+       0.05..3.5 ns, about the line's length *)
+    let offset k = Event_sim.of_ps (50. +. (Float.of_int (k * 397 % 3450))) in
+    for k = 6 to cycles - 4 do
+      Event_sim.set_input_int sim "hit" (k % 2) ~at:((k * period) - offset k)
+    done;
+    let changes = Array.init (length + 1) ~f:(fun _ -> Queue.create ()) in
+    Array.iteri changes ~f:(fun i q ->
+      let net = if i = 0 then "hit" else Printf.sprintf "tdc_stage%d/X" (i - 1) in
+      Event_sim.on_change sim net (fun ~time _ -> Queue.enqueue q time));
+    let got = Queue.create () in
+    let x_cycles = Queue.create () in
+    for c = 1 to cycles do
+      Event_sim.run_until sim ((c * period) + (period / 2));
+      (* the event sampled at edge c - 2 *)
+      let get nm = Option.value (Event_sim.to_int sim nm) ~default:(-1) in
+      if get "valid" < 0 || get "multi_edge" < 0 then Queue.enqueue x_cycles c;
+      if get "valid" = 1 || get "multi_edge" = 1
+      then
+        Queue.enqueue
+          got
+          (c - 2, Some (get "fine"), Some (get "overflow"), get "rising", get "multi_edge", get "coarse")
+    done;
+    (* Expected: positions whose net changed between edge k's arrival at
+       [hit] and clock edge k (the line is much shorter than the time
+       between edges). *)
+    let expected k =
+      let edge = k * period in
+      let flipped =
+        Array.count changes ~f:(fun q ->
+          Queue.exists q ~f:(fun t -> t < edge && t >= edge - offset k))
+      in
+      flipped - 1, if flipped = length + 1 then 1 else 0
+    in
+    let events = Queue.to_list got in
+    (* one event per edge, at its own sampling edge, rising as driven, no
+       multi-edge flag, coarse = edge index + a constant *)
+    let coarse0 = match events with (k, _, _, _, _, c) :: _ -> c - k | [] -> 0 in
+    if not
+         (List.equal Int.equal (List.map events ~f:(fun (k, _, _, _, _, _) -> k)) (List.range 7 (cycles - 3)))
+    then print_endline "events at the wrong sampling edges";
+    let wrong =
+      List.count events ~f:(fun (k, fine, ovf, rising, multi, coarse) ->
+        let f, o = expected k in
+        not
+          (Option.equal Int.equal fine (Some f)
+           && Option.equal Int.equal ovf (Some o)
+           && rising = k % 2
+           && multi = 0
+           && coarse = coarse0 + k))
+    in
+    let events = List.map events ~f:(fun (k, f, o, _, _, _) -> k, f, o) in
+    (* cell flops start X (Event_sim's [flop_init]); registers start 0 *)
+    printf "%s: X on valid/multi_edge at cycles: %s\n"
+      (if Option.is_some first_stage then "cells" else "registers")
+      (String.concat ~sep:" " (List.map (Queue.to_list x_cycles) ~f:Int.to_string));
+    events, wrong
+  in
+  let cells, wrong_cells = run ~first_stage:(Some (tl.library, dfrbpq)) in
+  let regs, wrong_regs = run ~first_stage:None in
+  let codes evs = List.map evs ~f:(fun (_, f, _) -> Option.value f ~default:(-1)) in
+  printf "cells: %d events, %d differ from the line; registers: %d events, %d differ\n"
+    (List.length cells) wrong_cells (List.length regs) wrong_regs;
+  printf "codes (cells): %s\n" (String.concat ~sep:" " (List.map (codes cells) ~f:Int.to_string));
+  printf "codes (registers): %s\n" (String.concat ~sep:" " (List.map (codes regs) ~f:Int.to_string));
+  [%expect {|
+    cells: X on valid/multi_edge at cycles: 1
+    registers: X on valid/multi_edge at cycles:
+    cells: 50 events, 0 differ from the line; registers: 50 events, 0 differ
+    codes (cells): 7 8 0 1 2 3 4 5 6 7 8 0 1 2 4 4 6 7 8 8 1 2 3 4 5 6 7 8 0 1 2 3 4 5 6 7 8 0 1 2 3 4 6 6 8 8 1 2 3 4
+    codes (registers): 7 8 0 1 2 3 4 5 7 7 8 0 1 2 4 5 6 7 8 8 1 2 3 4 5 6 7 8 0 1 2 3 4 5 7 7 8 0 1 2 4 4 6 7 8 8 1 2 3 4
+    |}]
+;;

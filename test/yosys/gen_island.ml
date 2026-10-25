@@ -1,6 +1,7 @@
 (* gen_island LIBERTY verilog|sdc|check NETLIST: a flattened stub island (a
    17-stage ring with flop-cell counters and a cell-built system-clock sampler,
-   a 4-pin Pin_capture on that ring, a 16-stage TDC) as module [island_top].
+   a 4-pin Pin_capture on that ring, a 16-stage TDC with a cell first stage)
+   as module [island_top].
 
    - [verilog] prints its Verilog;
    - [sdc] prints the LibreLane dont-touch regex and the PnR / signoff SDC
@@ -95,7 +96,9 @@ let island lib =
       ; ring = state
       }
   in
-  let tdc = T.create (Cells (lib, "sg13cmos5l_buf_1")) scope { clock; clear; hit } in
+  let tdc =
+    T.create ~first_stage:(lib, flop) (Cells (lib, "sg13cmos5l_buf_1")) scope { clock; clear; hit }
+  in
   let outputs =
     R.Clk_sampler.O.(to_list (map2 port_names sampled ~f:(fun n s -> output ("ring_" ^ n) s)))
     @ Cap.O.(to_list (map2 port_names cap ~f:(fun n s -> output ("cap_" ^ n) s)))

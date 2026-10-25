@@ -67,3 +67,19 @@ let buffer lib ~cell ~instance a =
   let output = (List.hd_exn (Cell_library.Cell.outputs c)).name in
   instantiate lib ~cell ~instance [ input, a ] output
 ;;
+
+(** A flip-flop cell with an active-low asynchronous reset, by pin names. *)
+module Flop = struct
+  type t =
+    { cell : string
+    ; clk : string
+    ; d : string
+    ; reset_n : string
+    ; q : string
+    }
+
+  (** [instantiate lib t ~instance ~clk ~reset_n d] returns Q. *)
+  let instantiate lib t ~instance ~clk ~reset_n d =
+    instantiate lib ~cell:t.cell ~instance [ t.clk, clk; t.d, d; t.reset_n, reset_n ] t.q
+  ;;
+end

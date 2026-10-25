@@ -1,5 +1,6 @@
 (* gen_tdc LIBERTY LENGTH CELL: print the Verilog of a Cells-mode TDC as
-   module [protoemu_tdc] (hierarchy included). *)
+   module [protoemu_tdc] (hierarchy included), its first sample stage built
+   from sg13cmos5l_dfrbpq_1 cells. *)
 
 open! Base
 open Hardcaml
@@ -19,8 +20,17 @@ let () =
     let module C = Circuit.With_interface (T.I) (T.O) in
     let scope = Scope.create ~flatten_design:false () in
     let lib = Cell_library.load liberty in
+    let flop : Cell.Flop.t =
+      { cell = "sg13cmos5l_dfrbpq_1"; clk = "CLK"; d = "D"; reset_n = "RESET_B"; q = "Q" }
+    in
     let circuit =
-      C.create_exn ~name:"tdc_top" (T.hierarchical ~module_name:"protoemu_tdc" (Cells (lib, cell)) scope)
+      C.create_exn
+        ~name:"tdc_top"
+        (T.hierarchical
+           ~first_stage:(lib, flop)
+           ~module_name:"protoemu_tdc"
+           (Cells (lib, cell))
+           scope)
     in
     Rtl.print ~database:(Scope.circuit_database scope) Verilog circuit
   | _ ->

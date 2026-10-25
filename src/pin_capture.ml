@@ -370,7 +370,7 @@ module Make (C : Config) (R : Ring.S) = struct
     ; inverter : string
     ; buffer : string
     ; mux2 : string
-    ; flop : R.flop (** with active-low asynchronous reset *)
+    ; flop : Cell.Flop.t (** with active-low asynchronous reset *)
     ; delay : string * int
     (** buffer/delay cell and count for the recent-edge delay of each pin;
         it must exceed the pin -> capture clock delay at every corner *)
@@ -405,14 +405,7 @@ module Make (C : Config) (R : Ring.S) = struct
       let mux instance ~s ~a0 ~a1 =
         Cell.instantiate lib ~cell:c.mux2 ~instance [ mux_s, s; mux_a0, a0; mux_a1, a1 ] mux_x
       in
-      let flop instance ~clk ~reset_n d =
-        Cell.instantiate
-          lib
-          ~cell:c.flop.cell
-          ~instance
-          [ c.flop.clk, clk; c.flop.d, d; c.flop.reset_n, reset_n ]
-          c.flop.q
-      in
+      let flop instance ~clk ~reset_n d = Cell.Flop.instantiate lib c.flop ~instance ~clk ~reset_n d in
       let pin i = pin_bus.:(i) in
       (* Merge. *)
       let gated =
@@ -816,13 +809,8 @@ module Make (C : Config) (R : Ring.S) = struct
           let q = reg spec b in
           List.iter Cell.attributes ~f:(fun a -> ignore (add_attribute q a : Signal.t));
           q -- nm
-        | Some (library, (f : R.flop)) ->
-          Cell.instantiate
-            library
-            ~cell:f.cell
-            ~instance:nm
-            [ f.clk, clock; f.d, b; f.reset_n, vdd ]
-            f.q
+        | Some (library, f) ->
+          Cell.Flop.instantiate library f ~instance:nm ~clk:clock ~reset_n:vdd b
           (* the instance keeps [nm]; a wire of the same name would rename it *)
           -- (nm ^ "_q")
       in
