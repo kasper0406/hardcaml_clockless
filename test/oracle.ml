@@ -109,3 +109,38 @@ let arc t ~rise ~slew ~load =
 ;;
 
 let fs ns = Float.iround_nearest_exn (ns *. 1e6)
+
+(** Wire capacitance (pF) of the [wire_load] group [model] at [fanout]:
+    capacitance per unit length times the length from the [fanout_length]
+    points, linear between them and continued with [slope] beyond the first
+    and last (not below zero), as OpenSTA estimates it. *)
+let wire_cap (lib : lib) ~model ~fanout =
+  let g = find_group lib "wire_load" model in
+  let num name = Float.of_string (Option.value_exn (Liberty.attr g name)) in
+  let pts =
+    List.filter_map g.body ~f:(function
+      | Liberty.Complex ("fanout_length", [ f; l ]) ->
+        Some (Float.of_string (Liberty.value_to_string f), Float.of_string (Liberty.value_to_string l))
+      | _ -> None)
+    |> List.sort ~compare:(fun (a, _) (b, _) -> Float.compare a b)
+    |> Array.of_list
+  in
+  let x = Float.of_int fanout in
+  let last = Array.length pts - 1 in
+  let fx k = fst pts.(k)
+  and lx k = snd pts.(k) in
+  let length =
+    if Float.(x <= fx 0)
+    then Float.max 0. (lx 0 -. (num "slope" *. (fx 0 -. x)))
+    else if Float.(x >= fx last)
+    then lx last +. (num "slope" *. (x -. fx last))
+    else (
+      let k = ref 0 in
+      while Float.( > ) x (fx (!k + 1)) do
+        Int.incr k
+      done;
+      let w = (x -. fx !k) /. (fx (!k + 1) -. fx !k) in
+      ((1. -. w) *. lx !k) +. (w *. lx (!k + 1)))
+  in
+  length *. num "capacitance"
+;;

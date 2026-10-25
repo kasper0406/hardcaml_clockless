@@ -450,8 +450,10 @@ let flop_circuit lib =
 ;;
 
 (* Drive [d] to toggle at [edge_k + delta_k] for each cycle k, clock edges every
-   10 ns; return per cycle: (delta, d rose, metastable?, Q settled, Q changes). *)
-let run_flop ?config ?(d_slew = input_slew) ?(clk_slew = input_slew) deltas =
+   10 ns; return per cycle: (delta, d rose, metastable?, Q settled, Q changes).
+   [pin_delay]: the clock insertion delay, by which metastable edge times
+   follow the clock edge. *)
+let run_flop ?config ?(d_slew = input_slew) ?(clk_slew = input_slew) ?(pin_delay = 0) deltas =
   let tl = force tlib in
   let sim = Sim.create ?config tl (flop_circuit tl.library) in
   let cyc = Sim.of_ns 10. in
@@ -474,7 +476,7 @@ let run_flop ?config ?(d_slew = input_slew) ?(clk_slew = input_slew) deltas =
     qs := [];
     Sim.run_until sim (e + (cyc / 2) - 1);
     let meta =
-      List.find (Sim.metastable_events sim) ~f:(fun m -> m.edge_time = e)
+      List.find (Sim.metastable_events sim) ~f:(fun m -> m.edge_time = e + pin_delay)
     in
     delta, rising, meta, Sim.value sim "q", e, List.rev !qs)
 ;;
@@ -1026,5 +1028,594 @@ let%expect_test "a ring in zero-delay mode is reported, not hung" =
   [%expect {|
     ("Event_sim: more than a million events at one instant (a loop with zero delay?)"
      (time 1000000))
+    |}]
+;;
+
+(* --- Loads, untimed logic, timing checks, clocks ----------------------------- *)
+
+let inv_cell = "sg13cmos5l_inv_1"
+
+let%expect_test "wire load: the Liberty model at each net's fanout replaces the flat wire cap" =
+  let tl = force tlib
+  and ol = force olib in
+  let inv_cap = Oracle.pin_cap ol ~cell:inv_cell ~pin:"A" in
+  let fan_circuit k =
+    let a = Signal.input "a" 1 in
+    let n = Cell.instantiate tl.library ~cell:inv_cell ~instance:"drv" [ "A", a ] "Y" in
+    let sinks =
+      List.init k ~f:(fun i ->
+        Cell.instantiate tl.library ~cell:inv_cell ~instance:(Printf.sprintf "s%d" i) [ "A", n ] "Y")
+    in
+    Circuit.create_exn
+      ~name:"fan"
+      (Signal.output "n" n :: List.mapi sinks ~f:(fun i s -> Signal.output (Printf.sprintf "y%d" i) s))
+  in
+  (* By hand from the excerpt's default "1k" model: 0.0002 pF per unit,
+     points (1, 9.93) (5, 59.59) (20, 215.6), slope 10.9. Fanout 0: 9.93 -
+     10.9 < 0 -> 0; 1: 9.93; 3: 9.93 + 49.66 / 2 = 34.76; 5: 59.59; 20:
+     215.6; 25: 215.6 + 5 * 10.9 = 270.1 (times 0.0002). *)
+  let by_hand = [ 0, 0.; 1, 0.001986; 3, 0.006952; 5, 0.011918; 20, 0.04312; 25, 0.05402 ] in
+  let config = { Sim.Config.default with wire_load = Liberty_default } in
+  printf "fanout  wire (pF)  oracle     by hand\n";
+  let ok =
+    List.for_all by_hand ~f:(fun (k, hand) ->
+      let sim = Sim.create ~config tl (fan_circuit k) in
+      let wire = Sim.load_pf sim "drv/Y" -. (Float.of_int k *. inv_cap) in
+      let oracle = Oracle.wire_cap ol ~model:"1k" ~fanout:k in
+      printf "%6d  %.6f  %.6f  %.6f\n" k wire oracle hand;
+      Float.(abs (wire -. oracle) < 1e-12 && abs (wire -. hand) < 1e-12))
+  in
+  printf "all equal: %b\n" ok;
+  (* Per_fanout and Hardcaml input loads: two inverters and both input bits
+     of a Hardcaml xor read the net, so 4 load pins *)
+  let a = Signal.input "a" 1 in
+  let n = Cell.instantiate tl.library ~cell:inv_cell ~instance:"drv" [ "A", a ] "Y" in
+  let sinks =
+    List.init 2 ~f:(fun i ->
+      Cell.instantiate tl.library ~cell:inv_cell ~instance:(Printf.sprintf "s%d" i) [ "A", n ] "Y")
+  in
+  let circuit =
+    Circuit.create_exn
+      ~name:"mixed_fan"
+      (Signal.output "x" Signal.(n ^: n)
+       :: List.mapi sinks ~f:(fun i s -> Signal.output (Printf.sprintf "y%d" i) s))
+  in
+  let config =
+    { Sim.Config.default with wire_load = Per_fanout 0.002; prim_input_cap = 0.003 }
+  in
+  let got = Sim.load_pf (Sim.create ~config tl circuit) "drv/Y" in
+  let expect = wire_cap +. (4. *. 0.002) +. (2. *. inv_cap) +. (2. *. 0.003) in
+  printf "per-fanout + Hardcaml input cap: %.6f pF, expected %.6f: %b\n" got expect
+    Float.(abs (got -. expect) < 1e-12);
+  [%expect {|
+    fanout  wire (pF)  oracle     by hand
+         0  0.000000  0.000000  0.000000
+         1  0.001986  0.001986  0.001986
+         3  0.006952  0.006952  0.006952
+         5  0.011918  0.011918  0.011918
+        20  0.043120  0.043120  0.043120
+        25  0.054020  0.054020  0.054020
+    all equal: true
+    per-fanout + Hardcaml input cap: 0.020735 pF, expected 0.020735: true
+    |}]
+;;
+
+let%expect_test "wire load: ring period with the Liberty models matches the oracle" =
+  let tl = force tlib
+  and ol = force olib in
+  let measure config =
+    let sim = Sim.create ~config tl (ring_circuit tl.library fast_ring) in
+    (* enable once the X from power-up has left the ring, which takes ~20 ns
+       with the heaviest wire load here *)
+    Sim.set_input sim "en" V0 ~at:0;
+    Sim.set_input sim "en" V1 ~at:(Sim.of_ns 40.);
+    let p, _ =
+      Option.value_exn (measure_period sim "ring_s8/Y" ~from:(Sim.of_ns 60.) ~until:(Sim.of_ns 560.))
+    in
+    p, sim
+  in
+  let flat, _ = measure Sim.Config.default in
+  (* every ring node has fanout 1 (the next stage; the output port does not count) *)
+  let row name config ~model =
+    let p, sim = measure config in
+    let wl = Oracle.wire_cap ol ~model ~fanout:1 in
+    let expected, _ = ring_oracle ol fast_ring ~extra_load:(fun _ -> wl -. wire_cap) in
+    printf "%-26s model %-4s wire %.4f pF  oracle %.3f ps (x%.3f of flat 1 fF)  sim matches: %b  load ok: %b\n"
+      name model wl (Sim.to_ps expected)
+      (Float.of_int expected /. Float.of_int flat)
+      Float.(abs ((of_int p /. of_int expected) -. 1.) < 1e-5)
+      Float.(
+        abs (Sim.load_pf sim "ring_s3/Y" -. (wl +. Oracle.pin_cap ol ~cell:inv_cell ~pin:"A")) < 1e-12)
+  in
+  row "Liberty_default" { Sim.Config.default with wire_load = Liberty_default } ~model:"1k";
+  (* the ring's own cell area (about 50 um^2) is in the first range *)
+  row "Liberty_by_area None" { Sim.Config.default with wire_load = Liberty_by_area None } ~model:"0_1k";
+  (* 1e5 um^2 lies in [63504, 190512) *)
+  row "Liberty_by_area 1e5" { Sim.Config.default with wire_load = Liberty_by_area (Some 1e5) } ~model:"30k";
+  row "Liberty_named 5k" { Sim.Config.default with wire_load = Liberty_named "5k" } ~model:"5k";
+  [%expect {|
+    Liberty_default            model 1k   wire 0.0020 pF  oracle 623.772 ps (x1.133 of flat 1 fF)  sim matches: true  load ok: true
+    Liberty_by_area None       model 0_1k wire 0.0006 pF  oracle 524.544 ps (x0.953 of flat 1 fF)  sim matches: true  load ok: true
+    Liberty_by_area 1e5        model 30k  wire 0.0053 pF  oracle 880.398 ps (x1.599 of flat 1 fF)  sim matches: true  load ok: true
+    Liberty_named 5k           model 5k   wire 0.0040 pF  oracle 781.760 ps (x1.420 of flat 1 fF)  sim matches: true  load ok: true
+    |}]
+;;
+
+let%expect_test "untimed logic: Hardcaml primitives and registers next to Liberty cells" =
+  let tl = force tlib in
+  let inv instance x = Cell.instantiate tl.library ~cell:inv_cell ~instance [ "A", x ] "Y" in
+  let open Signal in
+  let a = input "a" 1
+  and b = input "b" 1
+  and c = input "c" 1
+  and d = input "d" 1 in
+  let u0 = inv "u0" a in
+  (* cell -> xor -> cell *)
+  let u1 = inv "u1" ((u0 ^: b) -- "mixed") in
+  (* clocked by a cell, feeding only a port (as the ring counters) *)
+  let cnt = reg_fb (Reg_spec.create ~clock:u0 ()) ~width:1 ~f:(fun q -> ~:q -- "cnt_next") -- "cnt" in
+  (* input -> not -> cell *)
+  let u2 = inv "u2" (~:c -- "pre") in
+  (* touches no cell: not listed *)
+  let free = ~:d -- "free" in
+  let circuit =
+    Circuit.create_exn
+      ~name:"untimed"
+      [ output "y1" u1; output "cnt_q" cnt; output "y2" u2; output "y3" free ]
+  in
+  let sim = Sim.create tl circuit in
+  List.iter (Sim.untimed_logic sim) ~f:(fun u -> print_s [%sexp (u : Sim.Untimed.t)]);
+  let try_ config =
+    match Sim.create ~config tl circuit with
+    | _ -> print_endline "accepted"
+    | exception Sim.Unsupported s -> print_endline (String.prefix (Sexp.to_string s) 72 ^ "...")
+  in
+  try_ { Sim.Config.default with untimed_logic = Fail };
+  try_ { Sim.Config.default with untimed_logic = Fail; delay_mode = Zero };
+  [%expect {|
+    ((element xor) (signal mixed) (from_cell (u0)) (to_cell (u1)))
+    ((element reg) (signal cnt) (from_cell (u0)) (to_cell ()))
+    ((element not) (signal cnt_next) (from_cell (u0)) (to_cell ()))
+    ((element not) (signal pre) (from_cell ()) (to_cell (u2)))
+    ("Hardcaml primitives/registers next to Liberty cells are untimed"(((ele...
+    accepted
+    |}]
+;;
+
+let dff = "sg13cmos5l_dfrbpq_1"
+let dlatch = "sg13cmos5l_dlhq_1"
+
+let latch_circuit lib =
+  let q =
+    Cell.instantiate lib ~cell:dlatch ~instance:"lat" [ "D", Signal.input "d" 1; "GATE", Signal.input "g" 1 ] "Q"
+  in
+  Circuit.create_exn ~name:"latch" [ Signal.output "q" q ]
+;;
+
+(* One pulse at [level] of [width] on input [port] (from 5 ns, after a 0/1
+   level from time 0), the other inputs held; the violations logged on
+   [pin] and the changes of [q]. *)
+let pulse ?(config = { Sim.Config.default with pulse_width_check = Log }) ?(tl = force tlib)
+  ?(hold = [])
+  circuit ~port ~pin ~level ~width ~slew ()
+  =
+  let sim = Sim.create ~config tl circuit in
+  List.iter hold ~f:(fun (n, v) -> Sim.set_input sim n v ~at:0);
+  let other = if Sim.Value.equal level V1 then Sim.Value.V0 else V1 in
+  Sim.set_input sim port other ~at:0 ~slew;
+  Sim.set_input sim port level ~at:(Sim.of_ns 5.) ~slew;
+  Sim.set_input sim port other ~at:(Sim.of_ns 5. + width) ~slew;
+  let qs = ref [] in
+  Sim.on_change sim "q" (fun ~time v -> qs := (time, v) :: !qs);
+  Sim.run_until sim (Sim.of_ns 10.);
+  ( List.filter (Sim.timing_violations sim) ~f:(fun v -> String.equal v.pin pin)
+  , List.rev !qs
+  , Sim.metastable_events sim )
+;;
+
+let%expect_test "minimum pulse width: flagged exactly below the Liberty minimum" =
+  let tl = force tlib
+  and ol = force olib in
+  let ff = flop_circuit tl.library
+  and lat = latch_circuit tl.library in
+  let ff_hold = [ "d", Sim.Value.V1; "rst_n", V1; "clk", V0 ] in
+  let rows =
+    (* circuit, cell, port, pin, level, held inputs *)
+    [ ff, dff, "clk", "CLK", Sim.Value.V1, ff_hold
+    ; ff, dff, "clk", "CLK", V0, ff_hold
+    ; ff, dff, "rst_n", "RESET_B", V0, ff_hold
+    ; lat, dlatch, "g", "GATE", V1, [ "d", Sim.Value.V1 ]
+    ]
+  in
+  printf "pin      level slew   min (oracle)  width min-1fs / min / min+1fs flagged\n";
+  List.iter rows ~f:(fun (circuit, cell, port, pin, level, hold) ->
+    List.iter [ 0.05; 0.3 ] ~f:(fun slew ->
+      let g = Oracle.constraint_group ol ~cell ~pin ~related:pin ~timing_type:"min_pulse_width" in
+      let kind = if Sim.Value.equal level V1 then "rise_constraint" else "fall_constraint" in
+      let min = Oracle.fs (Oracle.interp (Oracle.tbl g kind) slew 0.) in
+      let flagged width =
+        let v, _, _ = pulse circuit ~hold ~port ~pin ~level ~width ~slew () in
+        match v with
+        | [] -> false
+        | [ { kind = Pulse_width { width = w; min_width; level = l }; _ } ]
+          when w = width && min_width = min && Sim.Value.equal l level -> true
+        | _ -> failwith "unexpected violations"
+      in
+      printf "%-8s %c     %.2f %10.3f ps   %b / %b / %b\n" pin (Sim.Value.to_char level) slew
+        (Sim.to_ps min) (flagged (min - 1)) (flagged min) (flagged (min + 1))));
+  (* RESET_B has no high-width data: never flagged *)
+  let v, _, _ =
+    pulse ff ~hold:ff_hold ~port:"rst_n" ~pin:"RESET_B" ~level:V1 ~width:1 ~slew:0.05 ()
+  in
+  printf "RESET_B high pulse of 1 fs flagged: %b\n" (not (List.is_empty v));
+  [%expect {|
+    pin      level slew   min (oracle)  width min-1fs / min / min+1fs flagged
+    CLK      1     0.05    140.528 ps   true / false / false
+    CLK      1     0.30    521.952 ps   true / false / false
+    CLK      0     0.05    176.554 ps   true / false / false
+    CLK      0     0.30    538.665 ps   true / false / false
+    RESET_B  0     0.05    158.541 ps   true / false / false
+    RESET_B  0     0.30    530.309 ps   true / false / false
+    GATE     1     0.05    128.519 ps   true / false / false
+    GATE     1     0.30    516.380 ps   true / false / false
+    RESET_B high pulse of 1 fs flagged: false
+    |}]
+;;
+
+let%expect_test "minimum pulse width: Log leaves the simulation alone; Log_and_metastable" =
+  let tl = force tlib in
+  let ff = flop_circuit tl.library in
+  let hold = [ "d", Sim.Value.V1; "rst_n", V1; "clk", V0 ] in
+  let run check =
+    pulse ff ~config:{ Sim.Config.default with pulse_width_check = check } ~hold ~port:"clk"
+      ~pin:"CLK" ~level:V1 ~width:(Sim.of_ps 50.) ~slew:0.05 ()
+  in
+  let show name (v, qs, m) =
+    printf "%-18s violations %d, metastable %d, q: %s\n" name (List.length v) (List.length m)
+      (String.concat ~sep:" "
+         (List.map qs ~f:(fun (t, v) -> Printf.sprintf "%c@%.3f" (Sim.Value.to_char v) (Sim.to_ps t))))
+  in
+  let ignore_ = run Ignore
+  and log = run Log
+  and meta = run Log_and_metastable in
+  show "Ignore" ignore_;
+  show "Log" log;
+  show "Log_and_metastable" meta;
+  (* the state goes X at the end of the pulse (5.05 ns) and resolves from there *)
+  let _, _, m = meta in
+  List.iter m ~f:(fun m -> printf "metastable at %.3f ps\n" (Sim.to_ps m.edge_time));
+  [%expect {|
+    Ignore             violations 0, metastable 0, q: 1@5171.414
+    Log                violations 1, metastable 0, q: 1@5171.414
+    Log_and_metastable violations 1, metastable 1, q: 1@5171.414 x@5219.370 1@5225.025
+    metastable at 5050.000 ps
+    |}]
+;;
+
+(* A flop without timing data, for the configured fallback. *)
+let plain_flop_lib =
+  lazy
+    (Timing_library.of_liberty
+       (Liberty.parse_string
+          {|
+library (plain) {
+  time_unit : "1ns";
+  capacitive_load_unit (1,pf);
+  cell (f) {
+    pin (CK) { direction : input; clock : true; capacitance : 0.001; }
+    pin (D) { direction : input; capacitance : 0.001; }
+    pin (RN) { direction : input; capacitance : 0.001; }
+    pin (Q) { direction : output; function : "IQ"; }
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; clear : "!RN"; }
+  }
+}
+|}))
+;;
+
+let%expect_test "minimum pulse width: configured fallback for clock and async pins" =
+  let tl = force plain_flop_lib in
+  let circuit =
+    let q =
+      Cell.instantiate tl.library ~cell:"f" ~instance:"ff"
+        [ "CK", Signal.input "clk" 1; "D", Signal.input "d" 1; "RN", Signal.input "rst_n" 1 ] "Q"
+    in
+    Circuit.create_exn ~name:"plain" [ Signal.output "q" q ]
+  in
+  let config =
+    { Sim.Config.default with pulse_width_check = Log; min_pulse_width = Some 0.1 }
+  in
+  let hold = [ "d", Sim.Value.V1; "rst_n", V1; "clk", V0 ] in
+  let flagged ?(config = config) port pin level width =
+    let v, _, _ = pulse ~tl ~config circuit ~hold ~port ~pin ~level ~width ~slew:0.05 () in
+    not (List.is_empty v)
+  in
+  List.iter [ "clk", "CK", Sim.Value.V1; "clk", "CK", V0; "rst_n", "RN", V0; "rst_n", "RN", V1; "d", "D", V0 ]
+    ~f:(fun (port, pin, level) ->
+      printf "%-2s %c: 99.999 ps flagged %b, 100 ps flagged %b\n" pin (Sim.Value.to_char level)
+        (flagged port pin level (Sim.of_ps 99.999)) (flagged port pin level (Sim.of_ps 100.)));
+  printf "without the fallback: %b\n"
+    (flagged ~config:{ config with min_pulse_width = None } "clk" "CK" V1 (Sim.of_ps 1.));
+  [%expect {|
+    CK 1: 99.999 ps flagged true, 100 ps flagged false
+    CK 0: 99.999 ps flagged true, 100 ps flagged false
+    RN 0: 99.999 ps flagged true, 100 ps flagged false
+    RN 1: 99.999 ps flagged true, 100 ps flagged false
+    D  0: 99.999 ps flagged false, 100 ps flagged false
+    without the fallback: false
+    |}]
+;;
+
+(* RESET_B asserted at 2 ns and released at [edge + delta]; CLK rises at
+   [edge] = 10 ns. [rst_first]: for delta = 0, schedule the release before
+   the clock edge (same-time events run in scheduling order). *)
+let recovery_run ?(check = Sim.Config.Log) ?(rst_first = false) ~clk_slew ~rst_slew delta =
+  let tl = force tlib in
+  let config = { Sim.Config.default with recovery_removal_check = check } in
+  let sim = Sim.create ~config tl (flop_circuit tl.library) in
+  let edge = Sim.of_ns 10. in
+  Sim.set_input sim "d" V1 ~at:0;
+  Sim.set_input sim "clk" V0 ~at:0;
+  Sim.set_input sim "rst_n" V1 ~at:0;
+  Sim.set_input sim "rst_n" V0 ~at:(Sim.of_ns 2.) ~slew:rst_slew;
+  let release () = Sim.set_input sim "rst_n" V1 ~at:(edge + delta) ~slew:rst_slew in
+  if rst_first then release ();
+  Sim.set_input sim "clk" V1 ~at:edge ~slew:clk_slew;
+  if not rst_first then release ();
+  Sim.run_until sim (Sim.of_ns 15.);
+  Sim.timing_violations sim, Sim.metastable_events sim
+;;
+
+let%expect_test "recovery/removal: release of RESET_B inside the Liberty window around CLK" =
+  let ol = force olib in
+  let c = Oracle.constraint_group ol ~cell:dff ~pin:"RESET_B" ~related:"CLK" in
+  let rst_slew = input_slew in
+  (* windows before, around and after the edge *)
+  List.iter [ 0.05; 1.75; 2.5 ] ~f:(fun clk_slew ->
+    let at timing_type = Oracle.interp (Oracle.tbl (c ~timing_type) "rise_constraint") rst_slew clk_slew in
+    let lo = Oracle.fs (-.at "recovery_rising")
+    and hi = Oracle.fs (at "removal_rising") in
+    let flagged ?rst_first delta =
+      match recovery_run ?rst_first ~clk_slew ~rst_slew delta with
+      | [], _ -> false
+      | [ { pin = "RESET_B"; kind = Recovery_removal { edge_time; window }; _ } ], _ ->
+        if edge_time <> Sim.of_ns 10. || not ([%equal: int * int] window (lo, hi))
+        then failwith "wrong edge or window";
+        true
+      | _ -> failwith "unexpected violations"
+    in
+    printf "CLK slew %.2f ns: oracle window (%.3f, %.3f) ps\n" clk_slew (Sim.to_ps lo) (Sim.to_ps hi);
+    printf "  release at lo-1, lo, lo+1, mid, hi-1, hi, hi+1 fs: %s\n"
+      (String.concat ~sep:" "
+         (List.map [ lo - 1; lo; lo + 1; (lo + hi) / 2; hi - 1; hi; hi + 1 ] ~f:(fun d ->
+            Bool.to_string (flagged d))));
+    if lo < 0 && hi > 0
+    then
+      printf "  release at the edge, scheduled after / before it: %b %b\n" (flagged 0)
+        (flagged ~rst_first:true 0));
+  (* inside the window: Log_and_metastable makes the state metastable *)
+  let _, m = recovery_run ~check:Log_and_metastable ~clk_slew:2.5 ~rst_slew (Sim.of_ps 24.) in
+  let _, m' = recovery_run ~check:Ignore ~clk_slew:2.5 ~rst_slew (Sim.of_ps 24.) in
+  printf "Log_and_metastable: %d metastable; Ignore: %d\n" (List.length m) (List.length m');
+  [%expect {|
+    CLK slew 0.05 ns: oracle window (-125.111, -105.677) ps
+      release at lo-1, lo, lo+1, mid, hi-1, hi, hi+1 fs: false false true true true false false
+    CLK slew 1.75 ns: oracle window (-4.585, 4.755) ps
+      release at lo-1, lo, lo+1, mid, hi-1, hi, hi+1 fs: false false true true true false false
+      release at the edge, scheduled after / before it: true true
+    CLK slew 2.50 ns: oracle window (19.893, 28.010) ps
+      release at lo-1, lo, lo+1, mid, hi-1, hi, hi+1 fs: false false true true true false false
+    Log_and_metastable: 1 metastable; Ignore: 0
+    |}]
+;;
+
+let%expect_test "metastability: tau scaled by the corner" =
+  let n = 2000 in
+  let corner = 1.4 in
+  let config = { Sim.Config.default with corner; tau_scales_with_corner = true } in
+  (* D edges 120 ps before the clock edge: inside both apertures, which the
+     corner widens to about (-165, -89) and (-162, -53) ps *)
+  let results = run_flop ~config (List.init n ~f:(fun _ -> Sim.of_ps (-120.))) in
+  let dts =
+    List.filter_map results ~f:(fun (_, _, m, _, _, _) ->
+      Option.map m ~f:(fun m -> Sim.to_ns (m.resolve_time - m.edge_time)))
+  in
+  let k = Float.of_int (List.length dts) in
+  let mean = List.sum (module Float) dts ~f:Fn.id /. k in
+  let tau = Sim.Config.default.tau *. corner in
+  printf "metastable %d of %d; mean resolution %.4f ns, expected %.4f +- %.4f (3 sd): %b\n"
+    (List.length dts) n mean tau (3. *. tau /. Float.sqrt k)
+    Float.(abs (mean -. tau) < 3. *. tau /. sqrt k);
+  [%expect {| metastable 2000 of 2000; mean resolution 0.0406 ns, expected 0.0420 +- 0.0028 (3 sd): true |}]
+;;
+
+let%expect_test "clock insertion delay: the flop's edge, aperture and clk->Q move by exactly d" =
+  let ol = force olib in
+  let d = Sim.of_ps 100. in
+  let config = { Sim.Config.default with clock_insertion = Sim.to_ns d } in
+  let c = Oracle.constraint_group ol ~cell:dff ~pin:"D" ~related:"CLK" in
+  let window ~rise =
+    let kind = if rise then "rise_constraint" else "fall_constraint" in
+    let s = Oracle.interp (Oracle.tbl (c ~timing_type:"setup_rising") kind) input_slew input_slew in
+    let h = Oracle.interp (Oracle.tbl (c ~timing_type:"hold_rising") kind) input_slew input_slew in
+    Oracle.fs (-.s), Oracle.fs h
+  in
+  let arc = Oracle.timing ol ~cell:dff ~out:"Q" ~related:"CLK" () in
+  let cq rise = Oracle.fs (fst (Oracle.arc arc ~rise ~slew:input_slew ~load:wire_cap)) in
+  (* D moves at delta from the (undelayed) clock edge, each delta rising then falling *)
+  let deltas = List.init 126 ~f:(fun i -> Sim.of_ps (-100. +. (2. *. Float.of_int i))) in
+  let results = run_flop ~config ~pin_delay:d (List.concat_map deltas ~f:(fun x -> [ x; x ])) in
+  (* outside the shifted aperture: Q ends at the new value iff D moved
+     before it, and any change of Q is one, at edge + d + clk->Q *)
+  let mismatches =
+    List.count results ~f:(fun (delta, rise, m, q, e, qs) ->
+      let lo, hi = window ~rise in
+      let rel = delta - d in
+      let new_v = if rise then Sim.Value.V1 else V0 in
+      let old_v = if rise then Sim.Value.V0 else V1 in
+      if rel > lo && rel < hi
+      then Option.is_none m
+      else
+        Option.is_some m
+        || (not (Sim.Value.equal q (if rel <= lo then new_v else old_v)))
+        ||
+        match qs with
+        | [] -> false
+        | [ (t, v) ] -> t <> e + d + cq (Sim.Value.equal v V1) || not (Sim.Value.equal v q)
+        | _ -> true)
+  in
+  printf
+    "%d cycles, D from -100 to +150 ps around the clock edge (%d metastable, %d Q changes): \
+     mismatches vs aperture + d, edge + d + clk->Q: %d\n"
+    (List.length results)
+    (List.count results ~f:(fun (_, _, m, _, _, _) -> Option.is_some m))
+    (List.count results ~f:(fun (_, _, m, _, _, qs) -> Option.is_none m && not (List.is_empty qs)))
+    mismatches;
+  [%expect {| 252 cycles, D from -100 to +150 ps around the clock edge (67 metastable, 179 Q changes): mismatches vs aperture + d, edge + d + clk->Q: 0 |}]
+;;
+
+let%expect_test "clock skew: seeded per-pin draws, own random stream, overrides, loads" =
+  let tl = force tlib in
+  let n = 400 in
+  let clk = Signal.input "clk" 1
+  and d = Signal.input "d" 1 in
+  let circuit =
+    Circuit.create_exn
+      ~name:"bank"
+      (List.init n ~f:(fun i ->
+         Signal.output (Printf.sprintf "q%d" i)
+           (Cell.instantiate tl.library ~cell:dff ~instance:(Printf.sprintf "ff%03d" i)
+              [ "CLK", clk; "D", d; "RESET_B", Signal.vdd ] "Q")))
+  in
+  let insertion = 0.2
+  and sigma = 0.02 in
+  let config = { Sim.Config.default with clock_insertion = insertion; clock_skew_sigma = sigma; seed = 7 } in
+  let sim = Sim.create ~config tl circuit in
+  let ds = List.map (Sim.clock_delays sim) ~f:(fun (_, x) -> Sim.to_ns x) in
+  let k = Float.of_int (List.length ds) in
+  let mean = List.sum (module Float) ds ~f:Fn.id /. k in
+  let sd = Float.sqrt (List.sum (module Float) ds ~f:(fun x -> (x -. mean) **. 2.) /. (k -. 1.)) in
+  printf "%d delays: mean %.4f ns (%.4f +- %.4f: %b), sd %.4f ns (%.4f +- %.4f: %b)\n" (List.length ds)
+    mean insertion (3. *. sigma /. Float.sqrt k)
+    Float.(abs (mean -. insertion) < 3. *. sigma /. sqrt k)
+    sd sigma (3. *. sigma /. Float.sqrt (2. *. k))
+    Float.(abs (sd -. sigma) < 3. *. sigma /. sqrt (2. *. k));
+  let again = Sim.create ~config tl circuit in
+  printf "same seed reproduces: %b\n"
+    ([%equal: (string * int) list] (Sim.clock_delays sim) (Sim.clock_delays again));
+  let factors config = Sim.instance_factors (Sim.create ~config tl circuit) in
+  let with_var = { config with variation_sigma = 0.1 } in
+  printf "variation factors unchanged by skew: %b\n"
+    ([%equal: (string * float) list] (factors with_var)
+       (factors { with_var with clock_insertion = 0.; clock_skew_sigma = 0. }));
+  let pin_rise = ref 0 in
+  Sim.on_change sim "ff000/CLK" (fun ~time v -> if Sim.Value.equal v V1 then pin_rise := time);
+  Sim.add_clock sim "clk" ~period:(Sim.of_ns 10.) ~start:(Sim.of_ns 5.);
+  Sim.run_until sim (Sim.of_ns 6.);
+  printf "clock net load unchanged: %b; ff000/CLK rises at 5 ns + its delay: %b\n"
+    Float.(Sim.load_pf sim "clk" = Sim.load_pf (Sim.create tl circuit) "clk")
+    (!pin_rise = Sim.of_ns 5. + List.Assoc.find_exn (Sim.clock_delays sim) "ff000" ~equal:String.equal);
+  let config = { config with clock_delay_overrides = [ "ff007", 0.5 ]; factor_overrides = [ "ff001", 2. ] } in
+  let sim = Sim.create ~config tl circuit in
+  printf "overrides: ff007 delay %.3f ps, ff001 factor %.1f\n"
+    (Sim.to_ps (List.Assoc.find_exn (Sim.clock_delays sim) "ff007" ~equal:String.equal))
+    (List.Assoc.find_exn (Sim.instance_factors sim) "ff001" ~equal:String.equal);
+  (match Sim.create ~config:{ config with clock_delay_overrides = [ "nope", 0.1 ] } tl circuit with
+   | _ -> print_endline "accepted"
+   | exception e -> print_s (Exn.sexp_of_t e));
+  [%expect {|
+    400 delays: mean 0.1994 ns (0.2000 +- 0.0030: true), sd 0.0185 ns (0.0200 +- 0.0021: true)
+    same seed reproduces: true
+    variation factors unchanged by skew: true
+    clock net load unchanged: true; ff000/CLK rises at 5 ns + its delay: true
+    overrides: ff007 delay 500.000 ps, ff001 factor 2.0
+    ("Event_sim: override for an unknown instance" clock_delay_overrides
+     (name nope))
+    |}]
+;;
+
+let%expect_test "clock skew between two flops: a late capture clock races the data through" =
+  let tl = force tlib in
+  let clk = Signal.input "clk" 1
+  and d = Signal.input "d" 1 in
+  let ff name x =
+    Cell.instantiate tl.library ~cell:dff ~instance:name [ "CLK", clk; "D", x; "RESET_B", Signal.vdd ] "Q"
+  in
+  let q1 = ff "ff1" (ff "ff0" d) in
+  let circuit = Circuit.create_exn ~name:"shift" [ Signal.output "q1" q1 ] in
+  let run overrides =
+    let config = { Sim.Config.default with clock_delay_overrides = overrides } in
+    let sim = Sim.create ~config tl circuit in
+    Sim.set_input sim "d" V0 ~at:0;
+    Sim.add_clock sim "clk" ~period:(Sim.of_ns 10.) ~start:(Sim.of_ns 5.);
+    Sim.set_input sim "d" V1 ~at:(Sim.of_ns 22.);
+    (* first edge after d rises: 25 ns *)
+    let first = ref None in
+    Sim.on_change sim "q1" (fun ~time v ->
+      if Sim.Value.equal v V1 && Option.is_none !first then first := Some time);
+    Sim.run_until sim (Sim.of_ns 60.);
+    Option.value_map !first ~default:"never" ~f:(fun t -> Printf.sprintf "%.1f ns" (Sim.to_ns t))
+  in
+  (* ideal: q1 one cycle behind ff0; ff1's clock 1 ns late: ff0's new Q (about
+     0.2 ns after the edge) arrives before ff1's edge, so q1 follows in the
+     same cycle *)
+  printf "q1 rises at: ideal clocks %s (35 ns edge + clk->Q); ff1 clock +1 ns: %s (25 + 1 ns + clk->Q)\n"
+    (run []) (run [ "ff1", 1. ]);
+  [%expect {| q1 rises at: ideal clocks 35.2 ns (35 ns edge + clk->Q); ff1 clock +1 ns: 26.2 ns (25 + 1 ns + clk->Q) |}]
+;;
+
+let%expect_test "per-instance factor override: one slow stage, period from the oracle" =
+  let tl = force tlib
+  and ol = force olib in
+  let config = { Sim.Config.default with factor_overrides = [ "ring_s3", 1.5 ] } in
+  let sim = Sim.create ~config tl (ring_circuit tl.library fast_ring) in
+  Sim.set_input sim "en" V0 ~at:0;
+  Sim.set_input sim "en" V1 ~at:(Sim.of_ns 5.);
+  let p, _ =
+    Option.value_exn (measure_period sim "ring_s8/Y" ~from:(Sim.of_ns 20.) ~until:(Sim.of_ns 520.))
+  in
+  let expected, _ = ring_oracle ol fast_ring ~factors:(fun i -> if i = 3 then 1.5 else 1.) in
+  printf "oracle %.3f ps; sim matches: %b\n" (Sim.to_ps expected)
+    Float.(abs ((of_int p /. of_int expected) -. 1.) < 1e-5);
+  [%expect {| oracle 587.296 ps; sim matches: true |}]
+;;
+
+let%expect_test "recovery/removal: a transition seen at the edge is not checked again" =
+  (* CK and RN on one net, so the release coincides with the edge, inside a
+     constant (-10, 10) ps window: one violation, not one per pin *)
+  let tl =
+    Timing_library.of_liberty
+      (Liberty.parse_string
+         {|
+library (rr) {
+  time_unit : "1ns";
+  capacitive_load_unit (1,pf);
+  cell (f) {
+    pin (CK) { direction : input; clock : true; capacitance : 0.001; }
+    pin (D) { direction : input; capacitance : 0.001; }
+    pin (RN) {
+      direction : input;
+      capacitance : 0.001;
+      timing () { related_pin : "CK"; timing_type : recovery_rising; rise_constraint (scalar) { values ("0.01"); } }
+      timing () { related_pin : "CK"; timing_type : removal_rising; rise_constraint (scalar) { values ("0.01"); } }
+    }
+    pin (Q) { direction : output; function : "IQ"; }
+    ff (IQ, IQN) { clocked_on : "CK"; next_state : "D"; clear : "!RN"; }
+  }
+}
+|})
+  in
+  let clk = Signal.input "clk" 1 in
+  let q =
+    Cell.instantiate tl.library ~cell:"f" ~instance:"ff" [ "CK", clk; "D", Signal.vdd; "RN", clk ] "Q"
+  in
+  let config = { Sim.Config.default with recovery_removal_check = Log } in
+  let sim = Sim.create ~config tl (Circuit.create_exn ~name:"tied" [ Signal.output "q" q ]) in
+  Sim.set_input sim "clk" V0 ~at:0;
+  Sim.set_input sim "clk" V1 ~at:(Sim.of_ns 5.);
+  Sim.run_until sim (Sim.of_ns 10.);
+  List.iter (Sim.timing_violations sim) ~f:(fun v -> print_s [%sexp (v : Sim.Timing_violation.t)]);
+  [%expect {|
+    ((instance ff) (pin RN) (time 5000000)
+     (kind (Recovery_removal (edge_time 5000000) (window (-10000 10000)))))
     |}]
 ;;

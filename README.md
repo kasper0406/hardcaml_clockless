@@ -29,7 +29,7 @@ itself, just as `hardcaml_waveterm` or `hardcaml_circuits` do.
 |---|---|---|
 | `Liberty` | Liberty (.lib) parser: groups, attributes, tables | done |
 | `Bool_expr` | Liberty boolean functions: parse, evaluate, lower to Hardcaml logic | done |
-| `Timing_library` | Liberty timing view: NLDM delay/slew tables per arc (bilinear interpolation, extrapolation), pin capacitances, `ff`/`latch` groups, setup/hold tables | done |
+| `Timing_library` | Liberty timing view: NLDM delay/slew tables per arc (bilinear interpolation, extrapolation), pin capacitances, `ff`/`latch` groups, setup/hold and recovery/removal tables, minimum pulse widths, `wire_load` models and selection | done |
 | `Cell_library` | Typed cells: kind (combinational/latch/flop/tristate/constant/physical), pins, functions, area | done |
 | `Cell` | Hand-placed cell instantiation with `dont_touch`/`keep` (honoured by yosys, not by OpenROAD: see `Sdc`), pin checking, stable instance and output net names | done |
 | `Delay_line` | Tapped chain of buffer/delay cells | done |
@@ -39,7 +39,7 @@ itself, just as `hardcaml_waveterm` or `hardcaml_circuits` do.
 | `Strobe_sampler` | Vernier-delayed strobe samples every pin: equivalent-time sampling for repetitive signals | planned |
 | Calibration | Code-density histogram of the `clk`-sampled ring; ring periods per cycle | next |
 | Behavioural models | Cyclesim models so the rest of a design simulates normally | `Tdc.Model`, `Ring.Model` (driven by `Ring.Ideal`), `Pin_capture.Model` (driven by `Pin_capture.Reference` / `Model_driver`) |
-| `Event_sim` | Event-driven gate-level simulation of Hardcaml circuits of Liberty cells: fs time, 0/1/X, NLDM delays with slew propagation and loads, inertial/transport, flops/latches from Liberty with setup/hold-aperture metastability (exponential resolution), corner scale and seeded per-instance variation, Hardcaml registers on any clock net, loops (ring oscillators), VCD | done (minimal); SDF, adversarial delays, hazard/protocol monitors, Cyclesim co-simulation: planned |
+| `Event_sim` | Event-driven gate-level simulation of Hardcaml circuits of Liberty cells: fs time, 0/1/X, NLDM delays with slew propagation and loads, inertial/transport, flops/latches from Liberty with setup/hold-aperture metastability (exponential resolution, optionally corner-scaled tau), corner scale and seeded per-instance variation (with per-instance overrides), Hardcaml registers on any clock net, loops (ring oscillators), VCD. Opt-in realism: Liberty `wire_load` (or per-fanout) wire capacitance and Hardcaml input loads, a report of untimed Hardcaml logic next to cells (warn/fail), minimum pulse width and recovery/removal checks (log, or log and go metastable), clock insertion delay with seeded per-pin skew | done (minimal; defaults are pre-layout-optimistic: flat 1 fF wires, ideal clocks, no checks); SDF, wire RC, adversarial delays, hazard/protocol monitors, Cyclesim co-simulation: planned |
 | `Sdc` | From the flattened circuit: protected instances (every `dont_touch` cell and kept register) and nets (driven by them, plus registered fork nets); LibreLane `RSZ_DONT_TOUCH_RX`, or `RSZ_DONT_TOUCH_LIST` resolved from a synthesised netlist (it names the flops yosys made of kept registers); SDC fragments: `set_disable_timing` at loop breaks, false paths into the TDC line, and for signoff only `create_clock` on ring counter, Pin_capture bank and edge-counter clocks with asynchronous groups (CTS ignores dont-touch, so they stay out of the PnR SDC) | done (generation); not yet run through LibreLane/OpenROAD. Relative-timing checks (snapshot race, hold, pulse width, reset recovery at 3 corners): planned |
 | Post-route check | `Netlist` parses gate-level Verilog (yosys, OpenROAD); `Sdc.check` re-extracts the islands: same cells, protected nets unbuffered, unrenamed, still driving their outputs and without extra loads (antenna diodes allowed; loads from synthesised logic are not checked one by one), kept registers still plain D flops with their D, clock edge and source, reset tied off, inputs rebuffered only from their named source, constants possibly tie cells | done; checked on yosys output (`test/yosys/yosys_island.sh`), not yet on a routed netlist |
 | `Click`, `Bd_channel` | Bundled-data click handshake components with a synchronous reference | planned |
@@ -69,6 +69,15 @@ reproduces these is about 1.40 and 0.71 (slews scaled too, the default), not the
 4 × (dlygate4sd1_1, inv_1) ring (1.47 ns) sampled by 9 flops on 50 MHz plus a
 ring-clocked 16-bit counter simulates 10 µs in about 0.1 s
 (`dune exec bench/ring_bench.exe`).
+
+The figures above use the defaults: a flat 1 fF of wire per net, untimed
+Hardcaml logic and ideal clocks. With the library's default `wire_load`
+("1k": about 2 fF at fanout 1, 12 fF at fanout 5;
+`{ Config.default with wire_load = Liberty_default }`) the 9-stage ring is
+623.8 ps (+13%). For less optimistic numbers also set `prim_input_cap`,
+`clock_insertion`/`clock_skew_sigma`, `variation_sigma`, the
+`pulse_width_check`/`recovery_removal_check` options, and check
+`Event_sim.untimed_logic` (see `src/event_sim.mli`).
 
 ## Physical flow
 

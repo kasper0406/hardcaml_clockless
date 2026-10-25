@@ -1,6 +1,6 @@
 (** Timing view of a Liberty library: NLDM delay and slew tables per timing
-    arc, input pin capacitances, flop/latch state machines, and setup/hold
-    constraints.
+    arc, input pin capacitances, flop/latch state machines, setup/hold and
+    recovery/removal constraints, minimum pulse widths and wire-load models.
 
     All quantities are normalised on load to nanoseconds and picofarads,
     whatever the library's [time_unit] and [capacitive_load_unit].
@@ -63,9 +63,64 @@ module Arc = struct
     }
   [@@deriving sexp_of]
 
+  (** Setup, hold, recovery and removal arcs (a constrained input against a
+      related clock edge). *)
   let is_constraint t =
-    List.exists [ "setup_"; "hold_" ] ~f:(fun prefix -> String.is_prefix t.timing_type ~prefix)
+    List.exists [ "setup_"; "hold_"; "recovery_"; "removal_" ] ~f:(fun prefix ->
+      String.is_prefix t.timing_type ~prefix)
   ;;
+end
+
+(** Minimum pulse widths of an input pin, ns: [high] is the shortest time the
+    pin may stay at 1, [low] at 0. From [min_pulse_width] timing groups
+    ([rise_constraint] high, [fall_constraint] low, indexed by the pin's own
+    transition; look up with the slew on both axes, since templates put it on
+    either) or the constant [min_pulse_width_high]/[min_pulse_width_low] pin
+    attributes, which take precedence (as in OpenSTA). [when] conditions are
+    ignored. *)
+module Pulse_width = struct
+  type t =
+    { high : Table.t option
+    ; low : Table.t option
+    }
+  [@@deriving sexp_of]
+
+  let lookup tbl ~slew = Table.lookup tbl slew slew
+end
+
+(** A [wire_load] model: wire capacitance as a function of a net's fanout. *)
+module Wire_load = struct
+  type t =
+    { name : string
+    ; capacitance : float (** pF per unit length *)
+    ; slope : float (** length per fanout beyond the table *)
+    ; fanout_length : (float * float) list (** (fanout, length), ascending fanout *)
+    }
+  [@@deriving sexp_of]
+
+  (** Estimated wire length, as OpenSTA computes it: linear between table
+      points, extrapolated with [slope] outside them (not below 0). *)
+  let length t ~fanout =
+    let f = Float.of_int fanout in
+    match t.fanout_length with
+    | [] -> 0.
+    | (f0, l0) :: _ as pts ->
+      let fmax, lmax = List.last_exn pts in
+      if Float.(f <= f0)
+      then Float.max 0. (l0 -. ((f0 -. f) *. t.slope))
+      else if Float.(f >= fmax)
+      then lmax +. ((f -. fmax) *. t.slope)
+      else (
+        let rec go = function
+          | (fa, la) :: ((fb, lb) :: _ as rest) ->
+            if Float.(f <= fb) then la +. ((lb -. la) *. (f -. fa) /. (fb -. fa)) else go rest
+          | _ -> lmax
+        in
+        go pts)
+  ;;
+
+  (** Wire capacitance, pF. *)
+  let cap_pf t ~fanout = length t ~fanout *. t.capacitance
 end
 
 module Seq = struct
@@ -97,7 +152,9 @@ module Cell = struct
     ; logic : Cell_library.Cell.t
     ; pin_cap : (string * float) list (** input pins, pF *)
     ; arcs : (string * Arc.t list) list (** output pin -> delay arcs *)
-    ; constraints : (string * Arc.t list) list (** input pin -> setup/hold arcs *)
+    ; constraints : (string * Arc.t list) list
+    (** input pin -> setup/hold/recovery/removal arcs *)
+    ; pulse_widths : (string * Pulse_width.t) list (** input pins that have any *)
     ; seq : Seq.t option
     }
   [@@deriving sexp_of]
@@ -111,12 +168,18 @@ module Cell = struct
   let constraints t ~input =
     List.Assoc.find t.constraints input ~equal:String.equal |> Option.value ~default:[]
   ;;
+
+  let pulse_width t ~input = List.Assoc.find t.pulse_widths input ~equal:String.equal
 end
 
 type t =
   { library : Cell_library.t
   ; cells : Cell.t Map.M(String).t
   ; default_input_pin_cap : float (** pF *)
+  ; wire_loads : Wire_load.t list
+  ; default_wire_load : string option
+  ; wire_load_selection : (float * float * string) list
+  (** the [default_wire_load_selection]: (min area, max area, model) *)
   }
 
 (* --- Units ---------------------------------------------------------------- *)
@@ -326,10 +389,8 @@ let cell_of_group ~templates ~time ~cap ~default_cap (logic : Cell_library.Cell.
           , List.filter (arcs_of p) ~f:(fun a ->
               (not (Arc.is_constraint a))
               && not
-                   (List.mem
-                      [ "min_pulse_width"; "minimum_period"; "recovery_rising"; "removal_rising" ]
-                      a.timing_type
-                      ~equal:String.equal)) )
+                   (List.mem [ "min_pulse_width"; "minimum_period" ] a.timing_type ~equal:String.equal))
+          )
       | _ -> None)
   in
   let constraints =
@@ -341,12 +402,32 @@ let cell_of_group ~templates ~time ~cap ~default_cap (logic : Cell_library.Cell.
          | l -> Some (Liberty.group_name p, l))
       | _ -> None)
   in
+  let pulse_widths =
+    List.filter_map pins ~f:(fun p ->
+      match dir p with
+      | Some ("input" | "inout") ->
+        let mpw = List.filter (arcs_of p) ~f:(fun a -> String.equal a.timing_type "min_pulse_width") in
+        let const name =
+          Option.map (Liberty.attr p name) ~f:(fun v ->
+            { Table.index_1 = [| 0. |]; index_2 = [| 0. |]; values = [| [| Float.of_string v *. time |] |] })
+        in
+        let high =
+          Option.first_some (const "min_pulse_width_high") (List.find_map mpw ~f:(fun a -> a.rise_constraint))
+        in
+        let low =
+          Option.first_some (const "min_pulse_width_low") (List.find_map mpw ~f:(fun a -> a.fall_constraint))
+        in
+        if Option.is_none high && Option.is_none low
+        then None
+        else Some (Liberty.group_name p, { Pulse_width.high; low })
+      | _ -> None)
+  in
   let seq =
     List.find_map g.body ~f:(function
       | Liberty.Group ({ kind = "ff" | "latch"; _ } as sg) -> seq_of_group ~cell sg
       | _ -> None)
   in
-  { name = cell; logic; pin_cap; arcs; constraints; seq }
+  { name = cell; logic; pin_cap; arcs; constraints; pulse_widths; seq }
 ;;
 
 let of_liberty (lib : Liberty.group) : t =
@@ -363,7 +444,49 @@ let of_liberty (lib : Liberty.group) : t =
       logic.name, cell_of_group ~templates ~time ~cap ~default_cap logic g)
     |> Map.of_alist_reduce (module String) ~f:(fun a _ -> a)
   in
-  { library; cells; default_input_pin_cap = default_cap }
+  let wire_loads =
+    List.map (Liberty.groups lib "wire_load") ~f:(fun g ->
+      let num name = Option.value_map (Liberty.attr g name) ~default:0. ~f:Float.of_string in
+      let fanout_length =
+        List.filter_map g.body ~f:(function
+          | Liberty.Complex ("fanout_length", vs) ->
+            (match Liberty.floats vs with
+             | f :: l :: _ -> Some (f, l)
+             | _ -> raise_s [%message "bad fanout_length" (Liberty.group_name g : string)])
+          | _ -> None)
+        |> List.sort ~compare:(fun (a, _) (b, _) -> Float.compare a b)
+      in
+      { Wire_load.name = Liberty.group_name g
+      ; capacitance = num "capacitance" *. cap
+      ; slope = num "slope"
+      ; fanout_length
+      })
+  in
+  let wire_load_selection =
+    match Liberty.attr lib "default_wire_load_selection" with
+    | None -> []
+    | Some name ->
+      (match
+         List.find (Liberty.groups lib "wire_load_selection") ~f:(fun g ->
+           String.equal (Liberty.group_name g) name)
+       with
+       | None -> raise_s [%message "default_wire_load_selection not found" (name : string)]
+       | Some g ->
+         List.filter_map g.body ~f:(function
+           | Liberty.Complex ("wire_load_from_area", [ lo; hi; m ]) ->
+             Some
+               ( Float.of_string (Liberty.value_to_string lo)
+               , Float.of_string (Liberty.value_to_string hi)
+               , Liberty.value_to_string m )
+           | _ -> None))
+  in
+  { library
+  ; cells
+  ; default_input_pin_cap = default_cap
+  ; wire_loads
+  ; default_wire_load = Liberty.attr lib "default_wire_load"
+  ; wire_load_selection
+  }
 ;;
 
 let load path = of_liberty (Liberty.parse_file path)
@@ -373,4 +496,42 @@ let find_exn t name =
   match find t name with
   | Some c -> c
   | None -> raise_s [%message "cell not in timing library" (name : string)]
+;;
+
+let find_wire_load t name =
+  List.find t.wire_loads ~f:(fun (w : Wire_load.t) -> String.equal w.name name)
+;;
+
+let find_wire_load_exn t name =
+  match find_wire_load t name with
+  | Some w -> w
+  | None -> raise_s [%message "no such wire_load in the timing library" (name : string)]
+;;
+
+(** The library's [default_wire_load]. *)
+let default_wire_load t =
+  match t.default_wire_load with
+  | Some name -> find_wire_load_exn t name
+  | None -> raise_s [%message "the timing library has no default_wire_load"]
+;;
+
+(** The model the [default_wire_load_selection] gives a design of [area]
+    (in the library's cell-area units): as OpenSTA, the range with the
+    greatest lower bound not above [area] (the one with the smallest lower
+    bound if there is none; upper bounds are ignored). *)
+let wire_load_for_area t area =
+  match t.wire_load_selection with
+  | [] -> raise_s [%message "the timing library has no default_wire_load_selection"]
+  | sel ->
+    let sel = List.sort sel ~compare:(fun (a, _, _) (b, _, _) -> Float.compare a b) in
+    let _, _, first = List.hd_exn sel in
+    let name =
+      List.fold sel ~init:None ~f:(fun best (lo, _, m) ->
+        match best with
+        | _ when Float.(lo > area) -> best
+        | Some (blo, _) when Float.(blo >= lo) -> best
+        | _ -> Some (lo, m))
+      |> Option.value_map ~default:first ~f:snd
+    in
+    find_wire_load_exn t name
 ;;
