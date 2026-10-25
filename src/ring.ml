@@ -38,9 +38,14 @@
     clock buffer and clock-to-Q, closes after the last bit change, and each
     end is widened by the sampler's setup/hold aperture and the phase
     decode's uncertainty. Both ends are about the same number of stages at
-    every corner, because they scale with the process (test/test_ring_timing.ml
-    measures [E = 6], [L = 12] with sg13cmos5l flop cells). The counter's
-    stable interval is phases [[L, 2n + E)] after its edge.
+    every corner, because they scale with the process, but they depend on
+    the ring's load: clock-to-Q is fixed while a heavier node load slows the
+    stages. With sg13cmos5l flop cells and the Liberty 1k wire load,
+    test/test_ring_timing.ml measures [E = 6], [L = 12] for a bare ring and
+    test/test_pin_capture_timing.ml [E = 4], [L = 9] for a ring that also
+    drives Pin_capture's data buffers (for its clk sampler and capture slots
+    alike). Measure them for the ring as built. The counter's stable interval
+    is phases [[L, 2n + E)] after its edge.
 
     A sampler uses counter A when [p] is in [[s, s + n)] (modulo [2n]) and
     counter B otherwise, where [s = (n + L + E + 1) / 2]. That centres each
@@ -57,11 +62,12 @@
     cells, the counter clocks are buffered off node 0 (two inverters for
     counter A, one for counter B), but node 0 still drives three inverter
     inputs and a sampler, against one inverter and a sampler on other nodes,
-    and it is the NAND output. The two bins ending at node 0 measure ~2-2.5x
-    an inverter stage (94 and 72 ps against 29-40 ps, typ). Calibration
+    and it is the NAND output. The two bins ending at node 0 measure ~2-3x
+    an inverter stage (148 and 110 ps against 43-56 ps, typ, Liberty 1k wire
+    load; 94 and 72 ps against 29-40 ps with flat 1 fF wires). Calibration
     absorbs that; a single clock buffer off node 0, or matching dummy loads,
     would narrow them. A length-select mux inside the loop makes one very wide
-    bin (~3x a stage per mux level). Event_sim measured bins up to ~500 ps and
+    bin (~3x a stage per mux level). Event_sim measured bins up to ~570 ps and
     twice the calibrated error compared with a fixed length (see
     test/test_ring_timing.ml). Prefer a single length, and escape injection
     locking to the system clock by changing the clock frequency.
