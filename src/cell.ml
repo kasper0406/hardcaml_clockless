@@ -1,20 +1,34 @@
-(** Instantiate a standard cell directly, protected from synthesis and P&R
-    optimisation. Sub-clock and clockless structures depend on exact gates, so
-    they must never be left to logic synthesis. *)
+(** Instantiate a standard cell directly, protected from synthesis (and, with
+    the constraints from {!Sdc}, from P&R) optimisation. Sub-clock and
+    clockless structures depend on exact gates, so they must never be left to
+    logic synthesis. *)
 
 open! Base
 open Hardcaml
 
-(** Attached to every hand-placed instance. Yosys and OpenROAD honour
-    [dont_touch]; [keep] stops yosys from removing seemingly dead cells. *)
+(** Attached to every hand-instantiated cell. [keep] stops yosys from removing
+    or remapping the cell. OpenROAD and LibreLane ignore netlist attributes:
+    the resizer must be told separately ([set_dont_touch], LibreLane's
+    [RSZ_DONT_TOUCH_RX]), which {!Sdc} generates. Nothing here constrains
+    placement or routing. *)
 let attributes =
   [ Rtl_attribute.create ~value:(Bool true) "dont_touch"
   ; Rtl_attribute.create ~value:(Bool true) "keep"
   ]
 ;;
 
+(* On output nets. When a net has several names, yosys keeps the one with the
+   most attributes, then the one that sorts first: without this, often one of
+   Hardcaml's generated names. ([keep] would keep every alias, and LibreLane's
+   synthesis then joins them with buffers.) *)
+let stable_name = Rtl_attribute.create ~value:(Bool true) "stable_name"
+
 (** [instantiate lib ~cell ~instance inputs] instantiates [cell], checking the
-    pin names against the library. Returns the output pins by name. *)
+    pin names against the library. Returns the output pins by name. Each output
+    net is named [<instance>__<pin>], so that it keeps a stable name through
+    synthesis (dont-touch lists and the netlist check refer to it). The double
+    underscore keeps it apart from names a caller gives the same net (e.g.
+    [<instance>_q]): Hardcaml's name mangler is case-insensitive. *)
 let instantiate
   (lib : Cell_library.t)
   ~cell
@@ -32,9 +46,15 @@ let instantiate
     if Signal.width s <> 1 then raise_s [%message "cell pins are 1 bit" (cell : string) (pin : string)]);
   let outputs = List.map (Cell_library.Cell.outputs c) ~f:(fun p -> p.name, 1) in
   let inst = Instantiation.create ~instance ~attributes () ~name:cell ~inputs ~outputs in
+  let named =
+    List.map outputs ~f:(fun (pin, _) ->
+      let s = Signal.(Instantiation.output inst pin -- (instance ^ "__" ^ pin)) in
+      Signal.Type.add_attribute s stable_name;
+      pin, s)
+  in
   fun pin ->
-    match List.Assoc.find outputs pin ~equal:String.equal with
-    | Some _ -> Instantiation.output inst pin
+    match List.Assoc.find named pin ~equal:String.equal with
+    | Some s -> s
     | None -> raise_s [%message "no such output pin" (cell : string) (pin : string)]
 ;;
 
