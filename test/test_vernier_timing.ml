@@ -443,6 +443,43 @@ let%expect_test "narrowest pulse: adjacent-cycle rise/fall pairs, full mode" =
     |}]
 ;;
 
+(* --- Mode switches --- *)
+
+(* A mode change switches the output mux between the level flop and the
+   XOR. Here the bypass muxes and the XOR are slowed until the XOR settles
+   after settle_cycles * T, breaking the drain bound (Sdc.vernier): a switch
+   from bypass to full at settle_cycles would show the pin the XOR's old
+   level for a moment. Mode changes wait two cycles more, as margin; the
+   mismatch check flags the slow line. *)
+let%expect_test "mode switches wait two cycles beyond the drain bound" =
+  let path = List.Assoc.find_exn H.corners "slow" ~equal:String.equal in
+  let slow = [ "vernier_p0_r_fbyp", 20.; "vernier_p0_f_fbyp", 20.; "vernier_p0_xor", 20. ] in
+  let t = H.create ~config:{ H.base_config with factor_overrides = slow } ~settle:3 ~mode:Bypass path in
+  (* identity constants: in full configuration the fraction is the coarse
+     tap; 39, the last, is the longest path through the line *)
+  let at = H.request t ~pin:0 ~level:1 ~fraction:39 () in
+  (* once the request is registered, so the mode cannot apply before it *)
+  H.wait t 1;
+  H.set_mode t ~pin:0 Full;
+  let loopback = ref None in
+  Event_sim.on_change t.sim "loopback_0" (fun ~time _ -> if Option.is_none !loopback then loopback := Some time);
+  H.wait t 12;
+  let edges = H.edges_between t ~pin:0 at (at + (12 * H.period)) in
+  printf "XOR settles %.1f ns after the launch edge (settle_cycles * T = 60 ns); mode now %d\n"
+    (Event_sim.to_ns (Option.value_exn !loopback - at))
+    (Option.value_exn (Event_sim.to_int t.sim "active_mode_0"));
+  printf "mismatch %d\n" (Option.value_exn (Event_sim.to_int t.sim "mismatch_0"));
+  printf "bypass -> full with the edge in flight: pin edges %s\n"
+    (String.concat ~sep:", "
+       (List.map edges ~f:(fun (time, v) ->
+          Printf.sprintf "%c at %.1f ns" (Event_sim.Value.to_char v) (Event_sim.to_ns (time - at)))));
+  [%expect {|
+    XOR settles 66.6 ns after the launch edge (settle_cycles * T = 60 ns); mode now 3
+    mismatch 1
+    bypass -> full with the edge in flight: pin edges 1 at 0.4 ns
+    |}]
+;;
+
 (* --- Faults --- *)
 
 (* A broken cell: Event_sim's variation factor 1e4 makes it hold its output
@@ -462,8 +499,10 @@ let fault_run ~corner ~path ~instance =
       H.set_mode t ~pin:0 mode;
       H.wait t gap;
       H.clear_flags t ~pin:0 1;
+      H.mode_write t ~pin:0 1;
       H.wait t 1;
       H.clear_flags t ~pin:0 0;
+      H.mode_write t ~pin:0 0;
       let bypass = Vernier.Mode.equal mode Bypass in
       let fraction k = if Vernier.Mode.equal mode Fine then k % 16 else (k * 37) % 256 in
       let ok =

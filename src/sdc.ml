@@ -119,6 +119,33 @@ module Clock = struct
   [@@deriving sexp_of]
 end
 
+(** [set_max_delay delay_ns -from from -to to_]: [from] are register
+    instances (none: any startpoint), [to_] internal pins, which STA makes
+    path endpoints (and, without [-probe], breaks paths through). *)
+module Max_delay = struct
+  type t =
+    { delay_ns : float
+    ; from : string list
+    ; to_ : Endpoint.t list
+    }
+  [@@deriving sexp_of]
+end
+
+(** [set_false_path -from from -to [all_registers]] or [[all_outputs]]:
+    [from] are register instances. *)
+module False_path_from = struct
+  type to_ =
+    | All_registers
+    | All_outputs
+  [@@deriving sexp_of]
+
+  type t =
+    { from : string list
+    ; to_ : to_
+    }
+  [@@deriving sexp_of]
+end
+
 module Stage = struct
   type t =
     | Pnr
@@ -133,6 +160,8 @@ type t =
   ; loop_breaks : Endpoint.t list
   ; clocks : Clock.t list
   ; false_paths_through : Endpoint.t list
+  ; false_paths_from : False_path_from.t list
+  ; max_delays : Max_delay.t list
   }
 
 let is_dont_touch s =
@@ -290,6 +319,8 @@ let create ?(prefix = "") (circuit : Circuit.t) =
   ; loop_breaks = []
   ; clocks = []
   ; false_paths_through = []
+  ; false_paths_from = []
+  ; max_delays = []
   }
 ;;
 
@@ -419,23 +450,91 @@ let pin_capture t ~name ~pins ~min_edge_spacing_ns =
   clock t ~name:(n "clkf") ~source:(output_pin t (n "clkf")) ~waveform:(s, p) ~period_ns:p ~group:name ()
 ;;
 
-(** A {!Vernier} instance [name] with [pins] pins. Its lines are
-    asynchronous delay paths from the launch flops ([<name>_p<i>_{r,f}_launch])
-    to the pin, and their tap selects change only while no edge is in flight,
-    so none of these paths is a single-cycle path. False paths through each
-    pin's XOR output ([<name>_p<i>_xor]) and each line's output
-    ([<name>_p<i>_{r,f}_fbyp], the calibration loopback taps) remove all of
-    them (launch -> line -> pin and loopback, select -> tap muxes -> pin and
-    loopback) and leave the synchronous bypass path (level flop -> output mux
-    -> pin) timed. The cells themselves are protected like every
-    [dont_touch] instance. *)
-let vernier t ~name ~pins =
+(** A {!Vernier} instance [name] with [pins] pins, clocked at [period_ns],
+    whose host never loads a [settle_cycles] below the given one.
+
+    Its lines are asynchronous delay paths from the launch flops
+    ([<name>_p<i>_{r,f}_launch]) through the XOR ([<name>_p<i>_xor]) to the
+    pin, and their tap selects change only while no edge is in flight, so
+    none of these paths is a single-cycle path. The control relies instead
+    on two bounds, which become path delays to internal pins (STA makes
+    those path endpoints and, unless [-probe], breaks paths through them):
+    - {e select}, per line: [set_max_delay period_ns] to the select pin of
+      every mux of the line (coarse and fine trees, coarse and fine bypass):
+      a select is loaded, and a mode applied, one clock edge before the
+      launch it is for. The arrival includes the source clock latency and
+      the required time no capture latency, which errs on the safe side by
+      the launch flop's latency and clk->Q.
+    - {e drain}, per pin: [set_max_delay (settle_cycles * period_ns)] from
+      both launch flops to the output mux's input from the XOR
+      ([<name>_p<i>_out]): every chain, tree and bypass node and the XOR lie
+      on a path there, so once an edge has arrived every select may change
+      and the output mux may switch. The synchronised loopback, which the
+      [mismatch] check compares [settle_cycles + 2] edges after a launch,
+      relies on it too.
+    The rest is cut: false paths from the launch flops to every register
+    (the loopback synchroniser, a capture block on [line_out]) and every
+    output port (the pin itself, [loopback], [line_out]). The synchronous
+    bypass path (level flop -> output mux -> pin) stays timed. Select paths
+    past the select pins are cut only by the break at those pins.
+
+    The constraints appear in both stages: at PnR the resizer can repair the
+    select fan-out (synthesised logic); the drain paths are all
+    [dont_touch], so there it is a check. OpenSTA warns (1551) that each
+    internal pin "is not a valid endpoint" and honours it. The cells are
+    protected like every [dont_touch] instance. *)
+let vernier t ~name ~pins ~period_ns ~settle_cycles =
+  if not (Float.is_finite period_ns && Float.(period_ns > 0.))
+  then raise_s [%message "Sdc.vernier: bad period" (period_ns : float)];
+  if settle_cycles < 1 || settle_cycles >= 1 lsl Vernier.settle_bits
+  then raise_s [%message "Sdc.vernier: settle_cycles out of range" (settle_cycles : int)];
+  let driven_by (e : Endpoint.t) =
+    match t.nets.(pin_net t e).driver with
+    | Cell d -> Some d.instance
+    | Register _ | Constant _ | Other -> None
+  in
+  (* a mux's select: its one input not driven by another cell of the line *)
+  let select instance =
+    match List.filter (input_pins t instance) ~f:(fun e -> Option.is_none (driven_by e)) with
+    | [ e ] -> e
+    | l -> raise_s [%message "Sdc.vernier: expected one select input" (instance : string) (l : Endpoint.t list)]
+  in
+  let selects prefix =
+    let tree =
+      List.filter t.instances ~f:(fun (i : Instance.t) ->
+        List.exists [ "_cm"; "_fm" ] ~f:(fun s -> String.is_prefix i.name ~prefix:(prefix ^ s)))
+    in
+    if List.is_empty tree then raise_s [%message "Sdc.vernier: no tap muxes" (prefix : string)];
+    List.map tree ~f:(fun i -> select i.name) @ List.map [ prefix ^ "_cbyp"; prefix ^ "_fbyp" ] ~f:select
+  in
   List.fold (List.init pins ~f:Fn.id) ~init:t ~f:(fun t i ->
-    List.fold
-      [ "xor"; "r_fbyp"; "f_fbyp" ]
-      ~init:t
-      ~f:(fun t s -> false_path_through t (output_pin t (Printf.sprintf "%s_p%d_%s" name i s))))
+    let p = Printf.sprintf "%s_p%d" name i in
+    let launch = [ p ^ "_r_launch"; p ^ "_f_launch" ] in
+    List.iter launch ~f:(fun l ->
+      if Option.is_none (find_instance t l) then raise_s [%message "Sdc: no protected instance" ~instance:(l : string)]);
+    let xor = p ^ "_xor" in
+    let from_xor =
+      match
+        List.filter (input_pins t (p ^ "_out")) ~f:(fun e ->
+          Option.equal String.equal (driven_by e) (Some xor))
+      with
+      | [ e ] -> e
+      | l -> raise_s [%message "Sdc.vernier: expected one output mux input from the XOR" (p : string) (l : Endpoint.t list)]
+    in
+    { t with
+      false_paths_from =
+        t.false_paths_from
+        @ [ { False_path_from.from = launch; to_ = All_registers }; { from = launch; to_ = All_outputs } ]
+    ; max_delays =
+        t.max_delays
+        @ [ { Max_delay.delay_ns = period_ns; from = []; to_ = selects (p ^ "_r") }
+          ; { delay_ns = period_ns; from = []; to_ = selects (p ^ "_f") }
+          ; { delay_ns = Float.of_int settle_cycles *. period_ns; from = launch; to_ = [ from_xor ] }
+          ]
+    })
 ;;
+
+let max_delays t = t.max_delays
 
 (* --- Outputs --- *)
 
@@ -470,12 +569,16 @@ let rsz_dont_touch_rx t =
     (String.concat ~sep:"|" (List.map names ~f:rx_of_name))
 ;;
 
-(* Names go into SDC braced; refuse what would break the braces. *)
-let tcl_name nm =
-  if String.exists nm ~f:(fun c -> Char.is_whitespace c || String.mem "{}\\" c)
-  then raise_s [%message "Sdc: name not usable in SDC" nm];
-  "{" ^ nm ^ "}"
+(* Names go into SDC braced (a list of them, space separated); refuse what
+   would break the braces. *)
+let tcl_names names =
+  List.iter names ~f:(fun nm ->
+    if String.exists nm ~f:(fun c -> Char.is_whitespace c || String.mem "{}\\" c)
+    then raise_s [%message "Sdc: name not usable in SDC" nm]);
+  "{" ^ String.concat ~sep:" " names ^ "}"
 ;;
+
+let tcl_name nm = tcl_names [ nm ]
 
 let sdc t ~(stage : Stage.t) ~system_clock =
   let b = Buffer.create 1024 in
@@ -488,6 +591,21 @@ let sdc t ~(stage : Stage.t) ~system_clock =
      | Signoff -> "signoff");
   List.iter t.loop_breaks ~f:(fun e -> line "set_disable_timing [get_pins %s]" (pin e));
   List.iter t.false_paths_through ~f:(fun e -> line "set_false_path -through [get_pins %s]" (pin e));
+  List.iter t.false_paths_from ~f:(fun f ->
+    line
+      "set_false_path -from [get_cells %s] -to [%s]"
+      (tcl_names (List.map f.from ~f:(fun i -> t.prefix ^ i)))
+      (match f.to_ with
+       | All_registers -> "all_registers"
+       | All_outputs -> "all_outputs"));
+  List.iter t.max_delays ~f:(fun d ->
+    line
+      "set_max_delay %.4f%s -to [get_pins %s]"
+      d.delay_ns
+      (match d.from with
+       | [] -> ""
+       | f -> Printf.sprintf " -from [get_cells %s]" (tcl_names (List.map f ~f:(fun i -> t.prefix ^ i))))
+      (tcl_names (List.map d.to_ ~f:(fun e -> t.prefix ^ Endpoint.to_string e))));
   (match stage with
    | Pnr ->
      if not (List.is_empty t.clocks)
