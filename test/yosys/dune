@@ -1,8 +1,8 @@
-; Verilog generators for the yosys smoke checks (yosys_tdc.sh,
+; Verilog generators for the yosys smoke checks (yosys_tdc.sh, yosys_vernier.sh,
 ; yosys_capture.sh). Not run by `dune runtest`: yosys is not a build
 ; dependency.
 (executables
- (names gen_tdc gen_capture gen_island)
+ (names gen_tdc gen_capture gen_island gen_vernier)
  (libraries hardcaml_clockless hardcaml stdio)
  (preprocess
   (pps ppx_jane)))
