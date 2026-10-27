@@ -91,7 +91,12 @@
     follows one cycle later, so the new select has a whole cycle to reach the
     muxes. [settle_cycles * T] must cover the worst line delay plus clk->Q,
     clock skew and select fan-out: at 50 MHz, 3 before layout (5% margin),
-    4 with margin.
+    4 with margin. Both bounds are signoff STA checks ({!Sdc.vernier}, given
+    the clock period and the smallest [settle_cycles] the host will load):
+    every line mux select within one period of the clock edge, and every
+    path from a launch flop through its line and the XOR to the output mux
+    within [settle_cycles] periods. The host must never load a smaller
+    [settle_cycles], nor run a faster clock, than the SDC was checked for.
 
     Hence, per line (that is, between edges of the same direction on a pin):
     an edge that needs a different select must come at least
@@ -111,15 +116,26 @@
     - {e Range fault}: in coarse or full mode, a fraction whose mapped
       position lies past the last tap (at clocks where the line is shorter
       than a cycle). The tap is clamped and the pin drops to bypass.
-    Both are sticky per pin ([overrun], [range_fault]; one-cycle
-    [overrun_event]/[range_event] pulses for counters), and the pin stays in
-    bypass ([fallback]) until the host clears them with [clear_flags] and
-    both lines are quiet.
+    Both set sticky per-pin flags ([overrun], [range_fault]; one-cycle
+    [overrun_event]/[range_event] pulses for counters) and put the pin in
+    bypass ([fallback]). Acknowledging and re-arming are separate:
+    [clear_flags] clears the flags only, and the pin stays in bypass until
+    the host writes its mode again ([mode_write], also with an unchanged
+    value; in the chip only while every engine is held). The re-arm applies
+    together with the mode, at the first edge where a mode change may apply
+    (below), whether or not the flags were cleared.
 
-    A host change of [mode] applies at the first edge where both lines of the
-    pin are quiet and no request is being mapped (in the chip, mode changes
-    happen while every engine is held, so at once). With healthy lines both
-    inputs of every switched mux are then equal and the pin does not move.
+    A host change of [mode] (and a re-arm) applies at the first edge where
+    both lines of the pin have {e settled} ([settle_cycles + 2] edges since
+    their last launch: the drain bound already covers the XOR, which the
+    output mux switches to, and the two cycles are margin beyond it) and no
+    request is being mapped;
+    in the chip, mode changes happen while every engine is held, so at once.
+    The mode applied is the [mode] input at that edge, so [mode] must hold
+    the written value by the time [mode_write] is high. A fault discards a
+    pending re-arm, including a mode write in the fault's cycle: re-arming
+    after it takes a new write. With healthy lines both inputs of every
+    switched mux are then equal and the pin does not move.
     This, like every select change, assumes the mux2 cell does not glitch
     when its select changes with equal data inputs (true of a
     transmission-gate mux; check the cell).
@@ -146,6 +162,16 @@
     - [offset]: added position, in 1/2^{!position_frac_bits} coarse steps
       ({!offset_bits} bits, up to 4 steps): aligns the line to [d_align].
     - [ratio]: fine taps per coarse step, R = 8 + [ratio] / 2 (8 .. 15.5).
+    The hardware trusts these: a [scale] that is not the line's coarse taps
+    per cycle scales every delay by the error, and a fraction it maps inside
+    the line raises no range fault (the range check is against the taps,
+    not the cycle). The [scale] field holds at most [2^coarse_bits - 1/16]
+    taps per cycle (63.9 for 40 taps): at clocks slower than that many
+    coarse steps (in Event_sim, 36 ns at the fast corner, 53 ns typical, 85
+    ns slow; so below about 28 MHz at the fast corner) no correct constant
+    exists and the pin must stay in bypass. {!Calibration.fit} refuses
+    constants that do not fit their fields rather than clipping them.
+
     For a fraction [a] the position is
     [p = round(a * scale / 2^(fraction_bits + scale_frac_bits - position_frac_bits)) + offset],
     in 1/2^position_frac_bits coarse steps. Full: coarse = [p / 2^pf], fine
@@ -175,8 +201,12 @@
     [mismatch] (sticky, cleared by [clear_flags]): with both lines quiet for
     [settle_cycles + 2] cycles, the synchronised XOR differs from the level:
     a broken line in the current configuration, in any mode (also while
-    bypassed). It misses an even number of lost toggles and a line stuck at
-    the right level.
+    bypassed), or one slower than the drain bound. It misses an even number
+    of lost toggles and a line stuck at the right level. The 2-flop
+    loopback synchroniser gets the two cycles after the drain bound, which
+    STA checks to the output mux, not to the synchroniser on the same XOR
+    net: a line within a wire delay and a setup time of the bound may set a
+    false [mismatch] (a diagnostic only; the pin is not affected).
 
     {2 Model}
 
@@ -287,11 +317,15 @@ module type S = sig
       ; level : 'a list (** per pin: the requested level; a change is an edge *)
       ; fraction : 'a list (** per pin: where in the cycle the edge goes *)
       ; mode : 'a list (** per pin, host: {!Mode.to_int} *)
+      ; mode_write : 'a list
+      (** per pin, host: high for a cycle when the host writes the pin's
+          mode, even with an unchanged value; re-arms the pin after a fault *)
       ; settle_cycles : 'a (** host *)
       ; scale : 'a list (** per line, host *)
       ; offset : 'a list (** per line, host *)
       ; ratio : 'a list (** per line, host *)
-      ; clear_flags : 'a list (** per pin: clears the sticky flags and the fallback *)
+      ; clear_flags : 'a list
+      (** per pin: clears the sticky flags; does not leave the fallback *)
       }
     [@@deriving hardcaml]
   end
@@ -426,7 +460,14 @@ module Calibration : sig
       line, least-squares coarse and fine steps (both launch directions
       averaged) and zero-code delay; [d_align_ps] = the largest zero-code
       delay plus [margin_ps] (default 0), so every offset is non-negative.
-      Codes are rounded and clamped to their fields. *)
+      Codes are rounded; raises if one does not fit its field (a scale
+      outside [1 .. 2^(coarse_bits + scale_frac_bits) - 1], e.g. a clock
+      slower than the scale field covers; an offset outside
+      [0 .. 2^offset_bits - 1]; in [Full], a ratio outside
+      [0 .. 2^ratio_bits - 1]), since the hardware would use a clipped
+      constant without a fault. The host then keeps the pin in bypass. In
+      [Coarse] the fine sweeps are not read: [ratio] is 0 and
+      [fine_step_ps] NaN. *)
   val fit
     :  ?margin_ps:float
     -> coarse_taps:int

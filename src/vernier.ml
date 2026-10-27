@@ -125,6 +125,7 @@ module type S = sig
       ; level : 'a list
       ; fraction : 'a list
       ; mode : 'a list
+      ; mode_write : 'a list
       ; settle_cycles : 'a
       ; scale : 'a list
       ; offset : 'a list
@@ -247,6 +248,7 @@ module Make (Config : Config) : S = struct
       ; level : 'a list [@length pins]
       ; fraction : 'a list [@length pins] [@bits fraction_bits]
       ; mode : 'a list [@length pins] [@bits 2]
+      ; mode_write : 'a list [@length pins]
       ; settle_cycles : 'a [@bits settle_bits]
       ; scale : 'a list [@length lines] [@bits scale_bits]
       ; offset : 'a list [@length lines] [@bits offset_bits]
@@ -568,15 +570,15 @@ module Make (Config : Config) : S = struct
           ; fine_bypass = mode_is Coarse
           }
         , mine &: ~:quiet &: ~:same
-        , quiet
         , settled
         , pend )
       in
-      let rise, over_r, quiet_r, settled_r, pend_r = line 0 in
-      let fall, over_f, quiet_f, settled_f, pend_f = line 1 in
-      (* Mode changes apply only where both lines are quiet and no request is
-         being mapped. *)
-      let mode_ok = quiet_r &: quiet_f &: ~:s0_edge in
+      let rise, over_r, settled_r, pend_r = line 0 in
+      let fall, over_f, settled_f, pend_f = line 1 in
+      (* Mode changes switch the output mux too: they wait until both lines
+         have settled (two cycles after quiet, margin beyond the drain bound
+         that covers the XOR), and no request is being mapped. *)
+      let mode_ok = settled_r &: settled_f &: ~:s0_edge in
       active_mode <== (reg spec ~enable:mode_ok (List.nth_exn i.mode p) -- nm "mode");
       let launched = wire 1 in
       let level_d = mux2 pend_r vdd (mux2 pend_f gnd launched) in
@@ -590,13 +592,15 @@ module Make (Config : Config) : S = struct
       let overrun = sticky "overrun" overrun_event in
       let range_fault = sticky "range_fault" range_event in
       (* A fault drops the pin to bypass at once: the pin shows the requested
-         level at cycle resolution. It returns once the flags are cleared and
-         both lines are quiet, so the switch back moves no edge in flight. *)
-      let fallback =
-        reg_fb spec ~width:1 ~f:(fun q ->
-          overrun_event |: range_event |: (q &: ~:(mode_ok &: ~:overrun &: ~:range_fault)))
-        -- nm "fallback"
-      in
+         level at cycle resolution. Only a mode write re-arms it, applied with
+         the mode (at [mode_ok]), so the switch back moves no edge in flight;
+         clearing the flags only acknowledges the fault. A fault discards a
+         pending re-arm, and a mode write in the cycle of a fault. *)
+      let fault = overrun_event |: range_event in
+      let rearm_pending = wire 1 in
+      let rearm = (List.nth_exn i.mode_write p |: rearm_pending) &: ~:fault in
+      rearm_pending <== (reg spec (rearm &: ~:mode_ok) -- nm "rearm_pending");
+      let fallback = reg_fb spec ~width:1 ~f:(fun q -> fault |: (q &: ~:(rearm &: mode_ok))) -- nm "fallback" in
       { rise
       ; fall
       ; level = level_d
@@ -697,16 +701,35 @@ module Calibration = struct
     (!sy -. (slope *. !sx)) /. n, slope
   ;;
 
-  let clamp lo hi x = Int.max lo (Int.min hi x)
+  (* A constant that does not fit its field is an error: the hardware would
+     use a clipped constant without a fault (see the mli). *)
+  let field ~what ~line ~lo ~hi x =
+    let r = Float.round_nearest x in
+    if not (Float.is_finite r && Float.(r >= of_int lo && r <= of_int hi))
+    then
+      raise_s
+        [%message
+          "Vernier.Calibration.fit: constant out of range" (what : string) (line : int) (x : float) (lo : int) (hi : int)];
+    Float.to_int r
+  ;;
 
   let fit ?(margin_ps = 0.) ~coarse_taps ~period_ps ~(mode : Mode.t) (lines : line array) =
     (match mode with
      | Coarse | Full -> ()
      | Bypass | Fine -> raise_s [%message "Vernier.Calibration.fit: only Coarse and Full are calibrated"]);
+    if coarse_taps < 2 || coarse_taps > 64
+    then raise_s [%message "Vernier.Calibration.fit: coarse_taps must be 2..64" (coarse_taps : int)];
+    if not Float.(is_finite period_ps && period_ps > 0.)
+    then raise_s [%message "Vernier.Calibration.fit: bad period" (period_ps : float)];
+    if Array.is_empty lines then raise_s [%message "Vernier.Calibration.fit: no lines"];
+    let full = Mode.equal mode Full in
     let avg a b = Array.map2_exn a b ~f:(fun x y -> (x +. y) /. 2.) in
     let coarse_fit = Array.map lines ~f:(fun l -> fit_line (avg l.rising.coarse l.falling.coarse)) in
     let coarse_step = Array.map coarse_fit ~f:snd in
-    let fine_step = Array.map lines ~f:(fun l -> snd (fit_line (avg l.rising.fine l.falling.fine))) in
+    (* the fine sweeps are read in Full only: ratio is unused in Coarse *)
+    let fine_step =
+      Array.map lines ~f:(fun l -> if full then snd (fit_line (avg l.rising.fine l.falling.fine)) else Float.nan)
+    in
     let zero = Array.map coarse_fit ~f:fst in
     let skew_ps =
       Array.map lines ~f:(fun l -> fst (fit_line l.rising.coarse) -. fst (fit_line l.falling.coarse))
@@ -716,16 +739,25 @@ module Calibration = struct
     (* coarse mode rounds to the nearest tap: half a step more *)
     let half = match mode with Coarse -> 0.5 | _ -> 0. in
     let scale_max = (1 lsl (num_bits_to_represent (coarse_taps - 1) + scale_frac_bits)) - 1 in
-    { scale =
-        Array.map coarse_step ~f:(fun c ->
-          clamp 1 scale_max (Float.iround_nearest_exn (period_ps /. c *. Float.of_int (1 lsl scale_frac_bits))))
-    ; offset =
-        Array.mapi zero ~f:(fun i z ->
-          clamp 0 ((1 lsl offset_bits) - 1)
-            (Float.iround_nearest_exn (((d_align_ps -. z) /. coarse_step.(i) +. half) *. units)))
-    ; ratio =
-        Array.mapi coarse_step ~f:(fun i c ->
-          clamp 0 ((1 lsl ratio_bits) - 1) (Float.iround_nearest_exn ((c /. fine_step.(i) -. 8.) *. 2.)))
+    (* in field order, so the first bad field is the one reported *)
+    let scale =
+      (* 0 would be the identity: a scale must be at least 1 *)
+      Array.mapi coarse_step ~f:(fun line c ->
+        field ~what:"scale" ~line ~lo:1 ~hi:scale_max (period_ps /. c *. Float.of_int (1 lsl scale_frac_bits)))
+    in
+    let offset =
+      Array.mapi zero ~f:(fun line z ->
+        field ~what:"offset" ~line ~lo:0 ~hi:((1 lsl offset_bits) - 1)
+          (((d_align_ps -. z) /. coarse_step.(line) +. half) *. units))
+    in
+    let ratio =
+      Array.mapi coarse_step ~f:(fun line c ->
+        if full then field ~what:"ratio" ~line ~lo:0 ~hi:((1 lsl ratio_bits) - 1) ((c /. fine_step.(line) -. 8.) *. 2.)
+        else 0)
+    in
+    { scale
+    ; offset
+    ; ratio
     ; d_align_ps
     ; coarse_step_ps = coarse_step
     ; fine_step_ps = fine_step

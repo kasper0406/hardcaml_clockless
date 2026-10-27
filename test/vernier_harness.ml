@@ -124,6 +124,7 @@ type t =
 let set t name v = Event_sim.set_input_int t.sim name v ~at:(Event_sim.now t.sim)
 
 let clear_flags t ~pin v = set t (Printf.sprintf "clear_flags_%d" pin) v
+let mode_write t ~pin v = set t (Printf.sprintf "mode_write_%d" pin) v
 
 let set_constants t (c : constants) =
   Array.iteri c.scale ~f:(fun l v -> set t (Printf.sprintf "scale_%d" l) v);
@@ -148,7 +149,8 @@ let create ?(config = base_config) ?(settle = 4) ?(constants = identity) ?(mode 
     set t (Printf.sprintf "level_%d" p) 0;
     set t (Printf.sprintf "fraction_%d" p) 0;
     set_mode t ~pin:p mode;
-    set t (Printf.sprintf "clear_flags_%d" p) 0
+    set t (Printf.sprintf "clear_flags_%d" p) 0;
+    set t (Printf.sprintf "mode_write_%d" p) 0
   done;
   set t "settle_cycles" settle;
   set_constants t constants;
