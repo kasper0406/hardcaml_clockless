@@ -358,3 +358,95 @@ let%expect_test "sdc: names that would break SDC are refused" =
     ("Sdc: name not usable in SDC" "clk two")
     |}]
 ;;
+
+(* A TDC whose first sample stage is flop cells: the flops are protected
+   instances with stable names, so constraints need not resolve generated
+   names from a synthesised netlist. *)
+let dfrbpq : Cell.Flop.t =
+  { cell = "sg13cmos5l_dfrbpq_1"; clk = "CLK"; d = "D"; reset_n = "RESET_B"; q = "Q" }
+;;
+
+let tdc_cells () =
+  let library = force lib in
+  let open Signal in
+  let clk = input "clk" 1 in
+  let hit = input "hit" 1 in
+  let sampled =
+    T.Analog.create
+      ~first_stage:(library, dfrbpq)
+      ~name:"tdc"
+      (Cells (library, "sg13cmos5l_buf_1"))
+      ~clock:clk
+      ~hit
+  in
+  Sdc.create (Circuit.create_exn ~name:"top" [ output "sampled" sampled ]) |> Sdc.tdc ~name:"tdc"
+;;
+
+let tdc_cells_good =
+  {|
+module top(clk, hit, sampled);
+  input clk;
+  input hit;
+  output [2:0] sampled;
+  wire tdc_stage0__X;
+  wire tdc_stage1__X;
+  wire tdc_sample0_q;
+  wire tdc_sample1_q;
+  wire tdc_sample2_q;
+  wire _1_;
+  sg13cmos5l_buf_1 tdc_stage0 (.A(hit), .X(tdc_stage0__X));
+  sg13cmos5l_buf_1 tdc_stage1 (.A(tdc_stage0__X), .X(tdc_stage1__X));
+  sg13cmos5l_dfrbpq_1 tdc_sample0 (.CLK(clk), .D(hit), .RESET_B(_1_), .Q(tdc_sample0_q));
+  sg13cmos5l_dfrbpq_1 tdc_sample1 (.CLK(clk), .D(tdc_stage0__X), .RESET_B(_1_), .Q(tdc_sample1_q));
+  sg13cmos5l_dfrbpq_1 tdc_sample2 (.CLK(clk), .D(tdc_stage1__X), .RESET_B(_1_), .Q(tdc_sample2_q));
+  sg13cmos5l_tiehi _13_ (.L_HI(_1_));
+  assign sampled = { tdc_sample2_q, tdc_sample1_q, tdc_sample0_q };
+endmodule
+|}
+;;
+
+let%expect_test "tdc with flop-cell first stage: protected instances, SDC, check" =
+  let t = tdc_cells () in
+  List.iter (Sdc.instances t) ~f:(fun (i : Sdc.Instance.t) ->
+    printf "%s %s (%s)\n" i.name i.cell (String.concat ~sep:" " (List.map i.pins ~f:fst)));
+  print_endline (Sdc.rsz_dont_touch_rx t);
+  print_string (Sdc.sdc t ~stage:Pnr ~system_clock:"clk");
+  let check netlist =
+    match Sdc.check t ~library:(force tlib) (Netlist.of_string netlist) with
+    | [] -> print_endline "ok"
+    | errors -> List.iter errors ~f:print_endline
+  in
+  let edit ~from ~to_ =
+    if not (String.is_substring tdc_cells_good ~substring:from) then failwith ("edit: no " ^ from);
+    String.substr_replace_first tdc_cells_good ~pattern:from ~with_:to_
+  in
+  check tdc_cells_good;
+  print_s
+    [%sexp
+      (Sdc.dont_touch_list t ~library:(force tlib) (Netlist.of_string tdc_cells_good)
+       : string list Or_error.t)];
+  (* a sampling flop renamed by synthesis, rewired, or resized *)
+  check (edit ~from:"sg13cmos5l_dfrbpq_1 tdc_sample1" ~to_:"sg13cmos5l_dfrbpq_1 _10_");
+  check (edit ~from:".D(tdc_stage0__X), .RESET_B" ~to_:".D(hit), .RESET_B");
+  check (edit ~from:"sg13cmos5l_dfrbpq_1 tdc_sample2" ~to_:"sg13cmos5l_dfrbpq_2 tdc_sample2");
+  [%expect {|
+    tdc_sample0 sg13cmos5l_dfrbpq_1 (CLK D RESET_B Q)
+    tdc_sample1 sg13cmos5l_dfrbpq_1 (CLK D RESET_B Q)
+    tdc_sample2 sg13cmos5l_dfrbpq_1 (CLK D RESET_B Q)
+    tdc_stage0 sg13cmos5l_buf_1 (A X)
+    tdc_stage1 sg13cmos5l_buf_1 (A X)
+    ^(hit|sampled\\?\[0\\?\]|sampled\\?\[1\\?\]|sampled\\?\[2\\?\]|tdc_sample0|tdc_sample0__Q|tdc_sample0_q|tdc_sample1|tdc_sample1__Q|tdc_sample1_q|tdc_sample2|tdc_sample2__Q|tdc_sample2_q|tdc_stage0|tdc_stage0__X|tdc_stage1|tdc_stage1__X)$
+    # hardcaml_clockless islands (PnR): append after the system clock is created.
+    set_false_path -through [get_pins {tdc_stage0/A}]
+    ok
+    (Ok
+     (hit sampled[0] sampled[1] sampled[2] tdc_sample0 tdc_sample0_q tdc_sample1
+      tdc_sample1_q tdc_sample2 tdc_sample2_q tdc_stage0 tdc_stage0__X tdc_stage1
+      tdc_stage1__X))
+    missing instance tdc_sample1 (sg13cmos5l_dfrbpq_1)
+    net tdc_stage0__X has an extra load _10_/D (sg13cmos5l_dfrbpq_1)
+    net tdc_stage0__X is split: tdc_stage0/X on tdc_stage0__X; tdc_sample1/D on hit; tdc_stage1/A on tdc_stage0__X
+    net hit has an extra load tdc_sample1/D (sg13cmos5l_dfrbpq_1)
+    instance tdc_sample2 is sg13cmos5l_dfrbpq_2, expected sg13cmos5l_dfrbpq_1
+    |}]
+;;
