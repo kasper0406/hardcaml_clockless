@@ -135,6 +135,7 @@ struct
     ; reconfig : int
     ; stale : int
     ; flagged : bool
+    ; loss_mark : bool
     ; bank : int
     ; time : int
     ; phase : int
@@ -143,8 +144,7 @@ struct
 
   type run =
     { events : event list
-    ; pin_flags : (int * int) list
-    ; global_flags : int list
+    ; flags : Capture_oracle.flags
     ; status : (string * int) list
     ; rises : int array (* node0 rising edges *)
     ; sim : Event_sim.t
@@ -192,7 +192,9 @@ struct
     setup sim;
     let events = Queue.create () in
     let pin_flags = Queue.create () in
-    let global_flags = Queue.create () in
+    let faults = Queue.create () in
+    let resync = Queue.create () in
+    let runts = Queue.create () in
     let clk_phases = Queue.create () in
     let x_outputs = ref 0 in
     (* Status counts, from the [_now] pulses and the events. *)
@@ -222,7 +224,11 @@ struct
           ; reconfig = g "reconfig"
           ; stale = g "stale"
           ; flagged =
-              g "fault" <> 0 || g "overflow" <> 0 || g "order_error" <> 0 || g "pattern_error" <> 0
+              (let fl = List.map [ "fault"; "overflow"; "order_error"; "pattern_error" ] ~f:g in
+               (* an unknown flag is an X output, not a flag *)
+               if List.exists fl ~f:(fun v -> v < 0) then Int.incr x_outputs;
+               List.exists fl ~f:(fun v -> v > 0))
+          ; loss_mark = g "fault" > 0 || g "overflow" > 0
           ; bank = g "bank"
           ; time = g "time"
           ; phase = g "phase"
@@ -241,16 +247,19 @@ struct
           lor flag "status_merge_error_now"
         in
         if pf <> 0 then Queue.enqueue pin_flags (c, pf);
-        if flag "status_fault_now" <> 0
-           || flag "status_overflow_now" <> 0
-           || flag "status_runt_now" <> 0
-           || flag "status_resyncing" <> 0
-        then Queue.enqueue global_flags c;
+        if flag "status_fault_now" <> 0 || flag "status_overflow_now" <> 0
+        then Queue.enqueue faults c;
+        if flag "status_resyncing" <> 0 then Queue.enqueue resync c;
+        if flag "status_runt_now" <> 0 then Queue.enqueue runts c;
         if get sim "event_valid" < 0 then Int.incr x_outputs)
     done;
     { events = Queue.to_list events
-    ; pin_flags = Queue.to_list pin_flags
-    ; global_flags = Queue.to_list global_flags
+    ; flags =
+        { pin = Queue.to_list pin_flags
+        ; faults = Queue.to_list faults
+        ; resync = Queue.to_list resync
+        ; runts = Queue.to_list runts
+        }
     ; status =
         List.map status_names ~f:(fun nm ->
           if String.is_suffix nm ~suffix:"_count"
@@ -269,24 +278,27 @@ struct
   let range_periods = 1 lsl R.count_width
   let bins = 2 * n
 
+  (* The oracle's coverage contract (Capture_oracle), in cycles, from the
+     drain's structure: a record waits at most for the other unread records
+     (2 slots per bank) plus synchronisation before it is read, and leaves
+     the pipeline 3 cycles later. With no edge for [quiet_cycles], the
+     pointers and levels are synchronised and stable, the FIFO is drained and
+     the level and count checks have run. *)
+  let windows =
+    { Capture_oracle.in_flight = 4
+    ; back = 4
+    ; before = (2 * Cfg.slots) + 4
+    ; after = 5
+    ; event_age = (2 * Cfg.slots) + 8
+    }
+  ;;
+
+  let quiet_cycles = (2 * Cfg.slots) + 6
+
   (* Mean ring period (fs) from node0's rising edges. *)
   let period_fs (r : run) =
     let xs = Array.sub r.rises ~pos:10 ~len:(Array.length r.rises - 10) in
     Float.of_int (xs.(Array.length xs - 1) - xs.(0)) /. Float.of_int (Array.length xs - 1)
-  ;;
-
-  (* Code density: bin widths (fs) from a phase histogram of samples at times
-     uncorrelated with the ring. *)
-  let calibrate ~period phases =
-    let hist = Array.create ~len:bins 0 in
-    List.iter phases ~f:(fun p -> if p >= 0 && p < bins then hist.(p) <- hist.(p) + 1);
-    let total = Float.of_int (List.length phases) in
-    let width = Array.map hist ~f:(fun h -> Float.of_int h /. total *. period) in
-    let start = Array.create ~len:bins 0. in
-    for p = 1 to bins - 1 do
-      start.(p) <- start.(p - 1) +. width.(p - 1)
-    done;
-    width, start
   ;;
 
   (* Absolute time estimate of a timed event: the node0 rise that starts its
@@ -320,6 +332,11 @@ struct
   ;;
 
   let oracle (r : run) ~edges ~est ~match_tol =
+    let cycle_of_time t = (t + clock_period - 1) / clock_period in
+    let deadline =
+      Capture_oracle.deadlines ~quiet_cycles ~end_cycle:r.cycles
+        (List.map edges ~f:(fun (t, _) -> cycle_of_time t))
+    in
     Capture_oracle.check
       ~pins:Cfg.pins
       ~edges:(with_levels edges)
@@ -332,122 +349,215 @@ struct
            ; reconfig = e.reconfig
            ; stale = e.stale
            ; flagged = e.flagged
+           ; loss_mark = e.loss_mark
            ; est = (if e.untimed then None else est e)
            }))
-      ~pin_flags:r.pin_flags
-      ~global_flags:r.global_flags
-      ~cycle_of_time:(fun t -> (t + clock_period - 1) / clock_period)
+      ~flags:r.flags
+      ~cycle_of_time
       ~cycle_time:(fun c -> c * clock_period)
       ~match_tol
-      ~back:4
-      ~fwd:400
+      ~windows
+      ~deadline
       ~end_cycle:r.cycles
+  ;;
+
+  (* Calibration, as fractions of the ring period so that it carries over to
+     another run at the same corner: code-density bin widths, the constant
+     delay from the pin to the capture (edge time minus estimate), and an
+     offset per (pin, polarity, bank) on top of it. *)
+  type calibration =
+    { width : float array
+    ; start : float array
+    ; offset : float (* fs *)
+    ; class_offset : ((int * bool * int) * float) list (* fs *)
+    }
+
+  let calibrated_bins phases =
+    let hist = Array.create ~len:bins 0 in
+    List.iter phases ~f:(fun p -> if p >= 0 && p < bins then hist.(p) <- hist.(p) + 1);
+    let total = Float.of_int (List.length phases) in
+    let width = Array.map hist ~f:(fun h -> Float.of_int h /. total) in
+    let start = Array.create ~len:bins 0. in
+    for p = 1 to bins - 1 do
+      start.(p) <- start.(p - 1) +. width.(p - 1)
+    done;
+    width, start
+  ;;
+
+  let estimate_with (r : run) (cal : calibration) ~k_offset =
+    let period = period_fs r in
+    let width = Array.map cal.width ~f:(fun w -> w *. period) in
+    let start = Array.map cal.start ~f:(fun s -> s *. period) in
+    fun (e : event) ->
+      (* a single-pin event's class is known before matching: correct it
+         before validation, so the validated times are the reported ones *)
+      let class_offset =
+        if Int.popcount e.changed = 1
+        then (
+          let pin = Int.ctz e.changed in
+          List.Assoc.find cal.class_offset (pin, e.pins land (1 lsl pin) <> 0, e.bank) ~equal:Poly.equal
+          |> Option.value ~default:0.)
+        else 0.
+      in
+      Option.map (estimate r ~width ~start ~k_offset e) ~f:(fun t ->
+        t + Float.iround_nearest_exn (cal.offset +. class_offset))
+  ;;
+
+  (* The counters' start offset (the enable race) is per run: the one whose
+     estimates match the most edges to within a third of a ring period (a
+     wrong offset is a whole period off). *)
+  let best_k_offset (r : run) cal ~edges =
+    let tol = Float.iround_nearest_exn (period_fs r /. 3.) in
+    List.map (List.range (-4) 5) ~f:(fun k_offset ->
+      let s = oracle r ~edges ~est:(estimate_with r cal ~k_offset) ~match_tol:tol in
+      s.timed, k_offset)
+    |> List.max_elt ~compare:(fun (a, _) (b, _) -> Int.compare a b)
+    |> Option.value_exn
+    |> snd
+  ;;
+
+  let match_tol = Event_sim.of_ns 2.
+  let cls (edge : Capture_oracle.edge) (e : event) = edge.pin, edge.level, e.bank
+
+  (* Residuals (edge time minus estimate) of the validated attributions of
+     a summary, by number of pins in the event. *)
+  let residuals (r : run) (s : Capture_oracle.summary) =
+    let by_cycle = Hashtbl.create (module Int) in
+    List.iter r.events ~f:(fun e -> Hashtbl.set by_cycle ~key:e.cycle ~data:e);
+    List.filter_map s.matches ~f:(fun (ev, edge, k) ->
+      Option.map ev.est ~f:(fun t ->
+        k, cls edge (Hashtbl.find_exn by_cycle ev.cycle), Float.of_int (edge.time - t)))
+  ;;
+
+  (* Fit a calibration to a run: bins from its captures' phases, then the
+     offsets from its single-pin attributions. *)
+  let fit (r : run) ~edges =
+    let width, start = calibrated_bins (List.filter_map r.events ~f:(fun e -> Option.some_if (not e.untimed) e.phase)) in
+    let cal0 = { width; start; offset = 0.; class_offset = [] } in
+    let median xs =
+      let a = List.sort xs ~compare:Float.compare |> Array.of_list in
+      if Array.is_empty a then 0. else a.(Array.length a / 2)
+    in
+    (* The delay from pin to capture is unknown here (it can exceed a ring
+       period): per counter offset, its median at a wide tolerance; then the
+       pair that matches best. *)
+    let cal1, k_offset =
+      List.map [ -2; -1; 0; 1; 2 ] ~f:(fun k_offset ->
+        let wide =
+          oracle r ~edges ~est:(estimate_with r cal0 ~k_offset) ~match_tol:(Event_sim.of_ns 3.)
+        in
+        let offset =
+          median (List.filter_map (residuals r wide) ~f:(fun (k, _, x) -> Option.some_if (k = 1) x))
+        in
+        { cal0 with offset }, k_offset)
+      |> List.max_elt ~compare:(fun (c1, k1) (c2, k2) ->
+        let score c k =
+          (oracle r ~edges ~est:(estimate_with r c ~k_offset:k)
+             ~match_tol:(Float.iround_nearest_exn (period_fs r /. 3.))).timed
+        in
+        Int.compare (score c1 k1) (score c2 k2))
+      |> Option.value_exn
+    in
+    let singles =
+      residuals r (oracle r ~edges ~est:(estimate_with r cal1 ~k_offset) ~match_tol)
+      |> List.filter_map ~f:(fun (k, c, x) -> Option.some_if (k = 1) (c, x))
+    in
+    let mean xs = List.sum (module Float) xs ~f:Fn.id /. Float.of_int (Int.max 1 (List.length xs)) in
+    let m = mean (List.map singles ~f:snd) in
+    let class_offset =
+      List.sort_and_group singles ~compare:(fun (a, _) (b, _) -> Poly.compare a b)
+      |> List.map ~f:(fun g -> fst (List.hd_exn g), mean (List.map g ~f:snd) -. m)
+    in
+    (* The delay is only known modulo the ring period (the counter offset
+       absorbs whole periods): keep it in (-P/2, P/2] so that a run with
+       another counter start finds its offset in [best_k_offset]'s range. *)
+    let p = period_fs r in
+    let offset = cal1.offset +. m in
+    let offset = offset -. (p *. Float.round_nearest (offset /. p)) in
+    { cal1 with offset; class_offset }
   ;;
 
   type timing =
     { summary : Capture_oracle.summary
-    ; period : float
+    ; period : float (* ps *)
     ; bin_min : float
     ; bin_max : float
     ; offset_ps : float
-    ; rms_ps : float
-    ; worst_ps : float
-    ; rms_class_ps : float (* after per (pin, polarity, bank) offsets from the other half *)
-    ; worst_class_ps : float
-    ; samples : int
-    ; outliers : int (* |error| > 3 mean bins *)
-    ; outlier_list : (int * int * float) list (* output cycle, pin, error ps *)
+    ; singles : float list (* ps, residuals of validated single-pin attributions *)
+    ; multi : float list (* ps, validated attributions of multi-pin events *)
     ; k_offset : int
     }
 
-  let analyse ?(calib = `Captures) (r : run) ~edges =
+  (* Validate a run against a calibration (by default fitted to the same
+     run, so in-sample). *)
+  let analyse ?calibration (r : run) ~edges =
+    let cal = match calibration with Some c -> c | None -> fit r ~edges in
+    let k_offset = best_k_offset r cal ~edges in
+    let summary = oracle r ~edges ~est:(estimate_with r cal ~k_offset) ~match_tol in
+    let res = residuals r summary |> List.map ~f:(fun (k, _, x) -> k, x /. 1000.) in
     let period = period_fs r in
-    let phases =
-      match calib with
-      | `Captures -> List.filter_map r.events ~f:(fun e -> if e.untimed then None else Some e.phase)
-      | `Clk_sampler -> r.clk_phases
-    in
-    let width, start = calibrate ~period phases in
-    (* Pass 1: wide tolerance, find the counter offset and the constant delay. *)
-    let try_offset k_offset =
-      let est e = estimate r ~width ~start ~k_offset e in
-      let s = oracle r ~edges ~est ~match_tol:(Event_sim.of_ns 3.) in
-      let res =
-        List.filter_map s.matches ~f:(fun (ev, edge, k) ->
-          if k = 1 then Option.map ev.est ~f:(fun t -> edge.time - t) else None)
-      in
-      s.timed, res, k_offset
-    in
-    let _, res, k_offset =
-      List.map [ -2; -1; 0; 1; 2 ] ~f:try_offset
-      |> List.max_elt ~compare:(fun (a, _, _) (b, _, _) -> Int.compare a b)
-      |> Option.value_exn
-    in
-    let median xs =
-      let a = List.sort xs ~compare:Int.compare |> Array.of_list in
-      if Array.is_empty a then 0 else a.(Array.length a / 2)
-    in
-    let offset = median res in
-    (* Pass 2: with the offset; attribution tolerance 2 ns. *)
-    let est e = Option.map (estimate r ~width ~start ~k_offset e) ~f:(fun t -> t + offset) in
-    let summary = oracle r ~edges ~est ~match_tol:(Event_sim.of_ns 2.) in
-    let singles =
-      List.filter_map summary.matches ~f:(fun (ev, edge, k) ->
-        if k = 1
-        then (
-          let e = List.find_exn r.events ~f:(fun x -> x.cycle = ev.cycle) in
-          Option.map ev.est ~f:(fun t -> (edge.pin, edge.level, e.bank, ev.cycle), Float.of_int (edge.time - t)))
-        else None)
-    in
-    let stats xs =
-      let nn = Float.of_int (List.length xs) in
-      let rms = Float.sqrt (List.sum (module Float) xs ~f:(fun x -> x *. x) /. nn) in
-      let worst = List.fold xs ~init:0. ~f:(fun a x -> Float.max a (Float.abs x)) in
-      rms, worst
-    in
-    let errs = List.map singles ~f:snd in
-    let mean_err = List.sum (module Float) errs ~f:Fn.id /. Float.of_int (Int.max 1 (List.length errs)) in
-    let errs = List.map errs ~f:(fun x -> x -. mean_err) in
-    let rms, worst = stats errs in
-    (* Per-class offsets estimated on even samples, applied to odd ones. *)
-    let first, second = List.partition_tf (List.mapi singles ~f:(fun i x -> i, x)) ~f:(fun (i, _) -> i % 2 = 0) in
-    let tbl = Hashtbl.Poly.create () in
-    let cls (p, l, b, _) = p, l, b in
-    List.iter first ~f:(fun (_, (c, e)) -> Hashtbl.add_multi tbl ~key:(cls c) ~data:e);
-    let class_mean c =
-      match Hashtbl.find tbl c with
-      | Some xs -> List.sum (module Float) xs ~f:Fn.id /. Float.of_int (List.length xs)
-      | None -> mean_err
-    in
-    let rms_class, worst_class = stats (List.map second ~f:(fun (_, (c, e)) -> e -. class_mean (cls c))) in
-    let bin = period /. Float.of_int bins in
     let ps x = x /. 1000. in
     { summary
     ; period = ps period
-    ; bin_min = ps (Array.fold width ~init:Float.infinity ~f:Float.min)
-    ; bin_max = ps (Array.fold width ~init:0. ~f:Float.max)
-    ; offset_ps = ps (Float.of_int offset +. mean_err)
-    ; rms_ps = ps rms
-    ; worst_ps = ps worst
-    ; rms_class_ps = ps rms_class
-    ; worst_class_ps = ps worst_class
-    ; samples = List.length errs
-    ; outliers = List.count errs ~f:(fun x -> Float.(abs x > 3. *. bin))
-    ; outlier_list =
-        List.filter_map singles ~f:(fun ((p, _, _, c), e) ->
-          let e = e -. mean_err in
-          if Float.(abs e > 3. *. bin) then Some (c, p, ps e) else None)
+    ; bin_min = ps (period *. Array.fold cal.width ~init:Float.infinity ~f:Float.min)
+    ; bin_max = ps (period *. Array.fold cal.width ~init:0. ~f:Float.max)
+    ; offset_ps = ps cal.offset
+    ; singles = List.filter_map res ~f:(fun (k, x) -> Option.some_if (k = 1) x)
+    ; multi = List.filter_map res ~f:(fun (k, x) -> Option.some_if (k > 1) x)
     ; k_offset
     }
   ;;
 
-  let pp_timing ~corner t =
+  let rms xs =
+    Float.sqrt (List.sum (module Float) xs ~f:(fun x -> x *. x) /. Float.of_int (Int.max 1 (List.length xs)))
+  ;;
+
+  let worst xs = List.fold xs ~init:0. ~f:(fun a x -> Float.max a (Float.abs x))
+
+  let quantile xs q =
+    let a = List.map xs ~f:Float.abs |> List.sort ~compare:Float.compare |> Array.of_list in
+    if Array.is_empty a
+    then 0.
+    else a.(Int.max 0 (Float.iround_up_exn (q *. Float.of_int (Array.length a)) - 1))
+  ;;
+
+  (* Timing, separately from accounting: how many edges were validated
+     against their true time, and the error distribution of those. *)
+  let pp_timing_stats ~bin ~edges ~no_estimate singles multi =
+    let n_s = List.length singles
+    and n_m = List.length multi in
+    Printf.sprintf
+      "timing: %d of %d edges validated within 2 ns (%.1f%%), %d timed attributions without an estimate\n     single-pin events: %d, rms %.1f ps (%.2f bins), p99 %.1f ps, worst %.1f ps (%.2f bins), >3 bins %d, >0.5 ns %d, >half a ring period %d\n     multi-pin events: %d attributions, rms %.1f ps, worst %.1f ps"
+      (n_s + n_m) edges
+      (100. *. Float.of_int (n_s + n_m) /. Float.of_int (Int.max 1 edges))
+      no_estimate n_s (rms singles) (rms singles /. bin) (quantile singles 0.99) (worst singles)
+      (worst singles /. bin)
+      (List.count singles ~f:(fun x -> Float.(abs x > 3. *. bin)))
+      (List.count singles ~f:(fun x -> Float.(abs x > 500.)))
+      (* a whole period off still matches within 2 ns at fast corners *)
+      (List.count singles ~f:(fun x -> Float.(abs x > bin *. of_int bins /. 2.)))
+      n_m (rms multi) (worst multi)
+  ;;
+
+  let pp_latency (s : Capture_oracle.summary) =
+    Printf.sprintf
+      "per-pin flag latency: %d errors covered, max %d cycles (deadline: end of the first %d-cycle quiet stretch)"
+      (List.length s.latencies)
+      (List.fold s.latencies ~init:0 ~f:Int.max)
+      quiet_cycles
+  ;;
+
+  let pp_timing ~corner ?(calibrated = "on this run") t =
     let bin = t.period /. Float.of_int bins in
     Printf.sprintf
-      "%-4s %s\n     ring %.0f ps (mean bin %.1f ps, calibrated bins %.0f..%.0f ps), delay pin->capture %.0f ps\n     single-edge error: %d events, rms %.1f ps (%.2f bins), worst %.1f ps (%.2f bins); per-class offsets: rms %.1f ps (%.2f bins), worst %.1f ps (%.2f bins); >3 bins: %d"
-      corner (Capture_oracle.pp t.summary) t.period bin t.bin_min t.bin_max t.offset_ps t.samples
-      t.rms_ps (t.rms_ps /. bin) t.worst_ps (t.worst_ps /. bin) t.rms_class_ps (t.rms_class_ps /. bin)
-      t.worst_class_ps (t.worst_class_ps /. bin) t.outliers
+      "%-4s %s\n     ring %.0f ps (mean bin %.1f ps, calibrated %s: bins %.0f..%.0f ps), delay pin->capture %.0f ps\n     %s\n     %s"
+      corner (Capture_oracle.pp t.summary) t.period bin calibrated t.bin_min t.bin_max
+      (* the delay is known modulo the ring period *)
+      (Float.mod_float t.offset_ps t.period -. if Float.(Float.mod_float t.offset_ps t.period > 0.) then t.period else 0.)
+      (pp_timing_stats ~bin ~edges:t.summary.edges ~no_estimate:t.summary.no_estimate t.singles t.multi)
+      (pp_latency t.summary)
+    ^ "\n     "
+    ^ Capture_oracle.pp_resyncs t.summary
   ;;
 
   (* Edge-to-event latency of the matched, unflagged, timed single-pin
@@ -486,15 +596,27 @@ struct
     then "none"
     else
       Printf.sprintf "%d events, min %d, median %d, p99 %d, max %d; %s" n a.(0) a.(n / 2)
-        a.(Int.min (n - 1) (n * 99 / 100)) a.(n - 1)
+        a.(Int.max 0 (((n * 99) + 99) / 100 - 1)) a.(n - 1)
         (List.sort_and_group (Array.to_list a) ~compare:Int.compare
          |> List.map ~f:(fun g -> Printf.sprintf "%d:%d" (List.hd_exn g) (List.length g))
          |> String.concat ~sep:" ")
   ;;
 
   (* Random edges on all pins: gaps mostly 0..[mean_gap*2] ns, a fraction
-     [near] of them 0..2 ns (near-coincident), deterministic. *)
-  let random_edges ?(min_same_pin_ns = 0.) ~seed ~count ~start_ns ~mean_gap_ns ~near () =
+     [near] of them 0..2 ns (near-coincident), deterministic. After every
+     [quiet_every] edges, [quiet_ns] without edges, so that the drain's
+     checks run and flag deadlines are bounded (Capture_oracle). *)
+  let random_edges
+    ?(min_same_pin_ns = 0.)
+    ?(quiet_every = Int.max_value)
+    ?(quiet_ns = 400.)
+    ~seed
+    ~count
+    ~start_ns
+    ~mean_gap_ns
+    ~near
+    ()
+    =
     let rng = Random.State.make [| seed |] in
     let last = Array.create ~len:Cfg.pins (-(Event_sim.of_ns 1e6)) in
     let min_same = Event_sim.of_ns min_same_pin_ns in
@@ -507,6 +629,7 @@ struct
           then Random.State.float rng 2.
           else Random.State.float rng (2. *. mean_gap_ns)
         in
+        let gap = if (count - k) % quiet_every = 0 && k < count then gap +. quiet_ns else gap in
         let t = t + Event_sim.of_ns gap + 1 in
         (* Pins toggle at most every [min_same_pin_ns] (pad limit). *)
         let ready = List.filter (List.init Cfg.pins ~f:Fn.id) ~f:(fun p -> t - last.(p) >= min_same) in
@@ -620,7 +743,9 @@ struct
     let r = simulate ?wire_load ~path ~edges ~cycles () in
     let t = analyse r ~edges in
     let flag_cycles =
-      List.map r.pin_flags ~f:fst @ r.global_flags |> List.sort ~compare:Int.compare |> Array.of_list
+      List.map r.flags.pin ~f:fst @ r.flags.faults @ r.flags.resync @ r.flags.runts
+      |> List.sort ~compare:Int.compare
+      |> Array.of_list
     in
     let outcome (_, t0, a, b) =
       let c0 = t0 / clock_period in

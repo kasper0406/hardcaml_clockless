@@ -1,7 +1,13 @@
 (* Pin_capture gate run: random edges on 4 pins at typ/slow/fast with the
    real circuit, in chunks (each chunk a fresh simulation with its own seed,
-   so the run can be split). Reports per corner: oracle summary (unflagged
-   errors), calibrated single-edge error, snapshot race margin, status.
+   so the run can be split), with a quiet stretch every 50 edges so that the
+   oracle's flag deadlines are bounded (Capture_oracle). Per corner, the
+   calibration (bins, delay, per-class offsets) is fitted to a separate run
+   first and then frozen. Reports per corner: oracle accounting (unflagged
+   errors, late flags), timing (edges validated against their true time and
+   the error distribution of those), per-pin flag latency, snapshot race
+   margin, status counts. Exits 1 on any unflagged error, unjudged edge or
+   unknown (X) flag.
 
    Usage: capture_gate.exe [EDGES_PER_CORNER [SEED [NEAR [MIN_SAME_PIN_NS [SLOTS [WIRES]]]]]]
    SLOTS is the slots per bank (2..4, default 2); WIRES is [1k] (the
@@ -34,37 +40,53 @@ let () =
   let near = if Array.length argv > 3 then Float.of_string argv.(3) else 0.1 in
   let min_same = if Array.length argv > 4 then Float.of_string argv.(4) else 5. in
   let chunk = 5000 in
+  let failed = ref false in
+  let run ~path ~seed ~sim_seed ~count ~setup =
+    let edges =
+      T.random_edges ~min_same_pin_ns:min_same ~quiet_every:50 ~seed ~count ~start_ns:800.
+        ~mean_gap_ns:60. ~near ()
+    in
+    let cycles = (List.last_exn edges |> fst) / T.clock_period + 450 in
+    edges, T.simulate ~seed:sim_seed ~wire_load ~path ~edges ~cycles ~setup ()
+  in
   List.iter Hardcaml_clockless_test.Capture_timing.corners ~f:(fun (corner, file) ->
     let path = "test/" ^ file in
     let t0 = Unix.gettimeofday () in
-    let totals = Array.create ~len:8 0 in
-    let rms_acc = ref 0. and n_acc = ref 0 and worst = ref 0. and bin = ref 0. and outliers = ref 0 in
+    (* Calibration run: its own seed, not validated. *)
+    let calibration =
+      let edges, r = run ~path ~seed:((seed * 1000) + 999) ~sim_seed:999 ~count:chunk ~setup:(fun _ -> ()) in
+      T.fit r ~edges
+    in
+    let totals = Array.create ~len:13 0 in
+    let singles = ref [] and multi = ref [] and latencies = ref [] in
+    let bin = ref 0. in
     let race_min = ref Float.infinity in
     let lat_all = ref [] and lat_iso = ref [] in
+    let x_outputs = ref 0 in
     let errors = ref [] in
     let status = Hashtbl.create (module String) in
     let chunks = (per_corner + chunk - 1) / chunk in
     for k = 0 to chunks - 1 do
-      let edges =
-        T.random_edges ~min_same_pin_ns:min_same ~seed:((seed * 1000) + k) ~count:chunk ~start_ns:800.
-          ~mean_gap_ns:60. ~near ()
-      in
-      let cycles = (List.last_exn edges |> fst) / T.clock_period + 450 in
       let race = ref None in
-      let r = T.simulate ~seed:k ~wire_load ~path ~edges ~cycles ~setup:(fun sim -> race := Some (T.watch_race sim)) () in
-      let t = T.analyse r ~edges in
+      let edges, r =
+        run ~path ~seed:((seed * 1000) + k) ~sim_seed:k ~count:chunk
+          ~setup:(fun sim -> race := Some (T.watch_race sim))
+      in
+      let t = T.analyse ~calibration r ~edges in
       let all, isolated = T.latencies t ~edges in
       lat_all := all @ !lat_all;
       lat_iso := isolated @ !lat_iso;
       let s = t.summary in
+      x_outputs := !x_outputs + r.x_outputs;
       List.iteri
-        [ s.edges; s.timed; s.untimed; s.flagged_lost; s.flagged_bad; s.unflagged_lost; s.unflagged_phantom; s.pending ]
+        [ s.edges; s.timed; s.untimed; s.flagged_lost; s.flagged_bad; s.unflagged_lost
+        ; s.unflagged_phantom; s.late; s.pending; s.no_estimate; s.resyncs; s.resync_next_marked
+        ; s.resync_rebaselined ]
         ~f:(fun i v -> totals.(i) <- totals.(i) + v);
       errors := !errors @ s.errors;
-      rms_acc := !rms_acc +. (t.rms_class_ps *. t.rms_class_ps *. Float.of_int t.samples);
-      n_acc := !n_acc + t.samples;
-      worst := Float.max !worst t.worst_class_ps;
-      outliers := !outliers + t.outliers;
+      singles := t.singles @ !singles;
+      multi := t.multi @ !multi;
+      latencies := s.latencies @ !latencies;
       bin := t.period /. Float.of_int T.bins;
       let m = T.race_margins (Option.value_exn !race) ~edges |> List.map ~f:Event_sim.to_ps in
       race_min := List.fold m ~init:!race_min ~f:Float.min;
@@ -72,19 +94,25 @@ let () =
         if String.is_suffix nm ~suffix:"count" then Hashtbl.update status nm ~f:(fun o -> Option.value o ~default:0 + v));
       eprintf "%s chunk %d/%d done (%.0fs)\n%!" corner (k + 1) chunks (Unix.gettimeofday () -. t0)
     done;
-    let rms = Float.sqrt (!rms_acc /. Float.of_int !n_acc) in
     printf
-      "%-4s edges %d: timed %d, untimed %d, lost+flagged %d, bad+flagged %d | UNFLAGGED: lost %d, phantom %d | pending %d\n"
-      corner totals.(0) totals.(1) totals.(2) totals.(3) totals.(4) totals.(5) totals.(6) totals.(7);
-    printf
-      "     single-edge error (per-class offsets): %d events, rms %.1f ps (%.2f bins), worst %.1f ps (%.2f bins), >3 bins %d; race margin min %.0f ps\n"
-      !n_acc rms (rms /. !bin) !worst (!worst /. !bin) !outliers !race_min;
+      "%-4s edges %d: timed %d, untimed %d, lost+flagged %d, bad+flagged %d | UNFLAGGED: lost %d, phantom %d (late flag %d) | pending %d\n"
+      corner totals.(0) totals.(1) totals.(2) totals.(3) totals.(4) totals.(5) totals.(6) totals.(7)
+      totals.(8);
+    printf "     %s\n"
+      (T.pp_timing_stats ~bin:!bin ~edges:totals.(0) ~no_estimate:totals.(9) !singles !multi);
+    printf "     per-pin flag latency: %d errors covered, max %d cycles (deadline: end of the first %d-cycle quiet stretch); race margin min %.0f ps\n"
+      (List.length !latencies) (List.fold !latencies ~init:0 ~f:Int.max) T.quiet_cycles !race_min;
     printf "     edge -> event latency, clock edges (first at or after the edge = 1): all %s\n"
       (T.pp_latencies !lat_all);
     printf "       no other edge within 100 ns: %s\n" (T.pp_latencies !lat_iso);
+    printf "     resyncs %d: first event after it loss-marked %d, levels re-baselined by an untimed event %d\n"
+      totals.(10) totals.(11) totals.(12);
     printf "     counts: %s\n"
       (Hashtbl.to_alist status |> List.sort ~compare:Poly.compare
        |> List.map ~f:(fun (k, v) -> Printf.sprintf "%s=%d" k v) |> String.concat ~sep:" ");
     List.iter (List.take !errors 10) ~f:(printf "     %s\n");
-    printf "     (%.0f s)\n%!" (Unix.gettimeofday () -. t0))
+    printf "     (%.0f s)\n%!" (Unix.gettimeofday () -. t0);
+    printf "     X on flags or event payloads: %d\n" !x_outputs;
+    if totals.(5) + totals.(6) + totals.(8) + !x_outputs > 0 then failed := true);
+  if !failed then Stdlib.exit 1
 ;;
