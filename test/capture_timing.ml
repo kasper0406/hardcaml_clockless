@@ -13,11 +13,26 @@ let corners =
   ]
 ;;
 
-module R = Ring.Make (struct
+(* The baseline for reported numbers: the library's default wire load
+   ("1k"), pre-layout. [Flat] (1 fF per net) is kept for regressions. *)
+let baseline_wire_load : Event_sim.Config.wire_load = Liberty_default
+
+let wire_load_name (wire_load : Event_sim.Config.wire_load) path =
+  match wire_load with
+  | Flat -> "flat 1 fF"
+  | Liberty_default ->
+    Printf.sprintf "Liberty %s" (Timing_library.default_wire_load (Timing_library.load path)).name
+  | _ -> "other"
+;;
+
+(* L and E measured for both samplers of this ring (the clk sampler and the
+   capture slots) by test_pin_capture_timing.ml. *)
+module R = Ring.Make_timed (struct
     let lengths = [ 17 ]
     let johnson_bits = 4
     let gray_width = 6
     let counter_settle_stages = 9
+    let counter_earliest_change_stages = 4
   end)
 
 module Make (Slots : sig
@@ -105,7 +120,9 @@ struct
        :: Cap.O.(to_list (map2 port_names o ~f:Signal.output)))
   ;;
 
-  let config ?(seed = 0) () = { Event_sim.Config.default with seed }
+  let config ?(seed = 0) ?(wire_load = baseline_wire_load) () =
+    { Event_sim.Config.default with seed; wire_load }
+  ;;
 
   (* One run: [edges] are (time fs, pin) toggles from the levels [initial].
      Samples the outputs every cycle (mid-cycle, after the edge they were
@@ -146,9 +163,11 @@ struct
 
   let get sim nm = Option.value (Event_sim.to_int sim nm) ~default:(-1)
 
-  let simulate ?(seed = 0) ?(initial = 0) ?(setup = fun (_ : Event_sim.t) -> ()) ~path ~(edges : (int * int) list) ~cycles () =
+  (* A simulation of the circuit, started: ring enabled at 5 ns, drain
+     cleared for 3 cycles, every pin enabled at [initial]. *)
+  let start ?(seed = 0) ?wire_load ?(initial = 0) ~path () =
     let tl = Timing_library.load path in
-    let sim = Event_sim.create ~config:(config ~seed ()) tl (circuit tl.library) in
+    let sim = Event_sim.create ~config:(config ~seed ?wire_load ()) tl (circuit tl.library) in
     Event_sim.set_input_int sim "enable" 0 ~at:0;
     Event_sim.set_input_int sim "enable" 1 ~at:(Event_sim.of_ns 5.);
     Event_sim.set_input_int sim "clear" 1 ~at:0;
@@ -156,6 +175,11 @@ struct
     Event_sim.set_input_int sim "pins" initial ~at:0;
     Event_sim.set_input_int sim "pin_enable" ((1 lsl Cfg.pins) - 1) ~at:0;
     Event_sim.add_clock sim "clock" ~period:clock_period;
+    tl, sim
+  ;;
+
+  let simulate ?seed ?wire_load ?(initial = 0) ?(setup = fun (_ : Event_sim.t) -> ()) ~path ~(edges : (int * int) list) ~cycles () =
+    let _, sim = start ?seed ?wire_load ~initial ~path () in
     let level = Array.init Cfg.pins ~f:(fun p -> (initial lsr p) land 1) in
     List.iter (List.sort edges ~compare:(fun (a, _) (b, _) -> Int.compare a b)) ~f:(fun (t, p) ->
       level.(p) <- 1 - level.(p);
@@ -426,6 +450,48 @@ struct
       t.worst_class_ps (t.worst_class_ps /. bin) t.outliers
   ;;
 
+  (* Edge-to-event latency of the matched, unflagged, timed single-pin
+     attributions (not untimed, merged or flagged events), in clock edges: the first rising clock edge at or after the pin edge is 1, and
+     the event is on the outputs (valid) after that many edges. All events,
+     and those whose edge had no other edge on any pin within [quiet_ns]
+     (no backlog in the FIFO, no burst). *)
+  let latencies ?(quiet_ns = 100.) (t : timing) ~edges =
+    let times = List.map edges ~f:fst |> List.sort ~compare:Int.compare |> Array.of_list in
+    let quiet = Event_sim.of_ns quiet_ns in
+    let isolated time =
+      (* the edge itself is the only one within [quiet] *)
+      let near =
+        match
+          ( Array.binary_search times ~compare:Int.compare `First_greater_than_or_equal_to (time - quiet)
+          , Array.binary_search times ~compare:Int.compare `Last_less_than_or_equal_to (time + quiet) )
+        with
+        | Some lo, Some hi -> hi - lo + 1
+        | _ -> 0
+      in
+      near = 1
+    in
+    let all =
+      List.filter_map t.summary.matches ~f:(fun (ev, (edge : Capture_oracle.edge), k) ->
+        Option.some_if
+          (k = 1)
+          (edge.time, ev.cycle - ((edge.time + clock_period - 1) / clock_period) + 1))
+    in
+    List.map all ~f:snd, List.filter_map all ~f:(fun (time, l) -> Option.some_if (isolated time) l)
+  ;;
+
+  let pp_latencies xs =
+    let a = List.sort xs ~compare:Int.compare |> Array.of_list in
+    let n = Array.length a in
+    if n = 0
+    then "none"
+    else
+      Printf.sprintf "%d events, min %d, median %d, p99 %d, max %d; %s" n a.(0) a.(n / 2)
+        a.(Int.min (n - 1) (n * 99 / 100)) a.(n - 1)
+        (List.sort_and_group (Array.to_list a) ~compare:Int.compare
+         |> List.map ~f:(fun g -> Printf.sprintf "%d:%d" (List.hd_exn g) (List.length g))
+         |> String.concat ~sep:" ")
+  ;;
+
   (* Random edges on all pins: gaps mostly 0..[mean_gap*2] ns, a fraction
      [near] of them 0..2 ns (near-coincident), deterministic. *)
   let random_edges ?(min_same_pin_ns = 0.) ~seed ~count ~start_ns ~mean_gap_ns ~near () =
@@ -538,7 +604,7 @@ struct
     ; other : int
     }
 
-  let collision_sweep ~path ~deltas_ps ~reps ~seed =
+  let collision_sweep ?wire_load ~path ~deltas_ps ~reps ~seed () =
     let rng = Random.State.make [| seed |] in
     let spacing = Event_sim.of_ns 160. in
     let pairs =
@@ -551,7 +617,7 @@ struct
     in
     let edges = List.concat_map pairs ~f:(fun (d, t0, a, b) -> [ t0, a; t0 + Event_sim.of_ps (Float.of_int d), b ]) in
     let cycles = ((List.last_exn pairs |> fun (_, t, _, _) -> t) / clock_period) + 450 in
-    let r = simulate ~path ~edges ~cycles () in
+    let r = simulate ?wire_load ~path ~edges ~cycles () in
     let t = analyse r ~edges in
     let flag_cycles =
       List.map r.pin_flags ~f:fst @ r.global_flags |> List.sort ~compare:Int.compare |> Array.of_list
@@ -589,6 +655,304 @@ struct
     table, t
   ;;
 
+
+  (* ---- Counter-selection margins of both samplers ------------------------ *)
+
+  (* The capture slots sample the ring through a data buffer and the slot's
+     mux, [D = sel ? fresh : Q]: while a slot is selected (from one write to
+     its bank to the next), its D pins follow the ring. So with the pins
+     quiet for [quiet] the selected slot of each bank shows the ring at its D
+     pins; then one rise and one fall of pin 0 write each bank once and
+     select the next slot, for every slot in turn. [quiet] covers a full
+     counter cycle at the slow corner, so every counter bit changes both
+     ways in every window (checked).
+
+     Each record's flops hang off several clock leaves: a D transition is
+     moved into the bank trunk's frame by subtracting that flop's clock
+     arrival after the trunk (measured at the writes; the spread over writes
+     is reported). Apertures come from the flop's tables at the D slew and
+     its own clock slew. At each write the pointer moves the selects: the
+     written slot's mux turns to Q and the next slot's to the ring. Both
+     changes must come after the hold time of the flops just clocked; after
+     the quiet windows, more writes take each bank's pointer through all its
+     states, and the smallest signed margin over every write is reported
+     (a select change missing where one is due raises). The clk sampler is
+     measured in the same run (here the ring also drives the capture's data
+     buffers). *)
+  type slot_margin =
+    { label : string
+    ; w : Ring_margins.wavefront
+    ; a : Ring_margins.counter
+    ; b : Ring_margins.counter
+    ; skew_ps : float (* spread of clock arrival over the record's flops *)
+    ; skew_jitter_ps : float (* largest change of one flop's arrival between writes *)
+    ; d_delay_ps : float * float (* ring net -> slot D, min/max over node bits *)
+    ; handoff_ps : float (* select change at a write, after CLK + hold, signed *)
+    ; ordered : bool (* the wavefront at the D pins, in the trunk frame, is in order *)
+    }
+
+  let flop_cell = "sg13cmos5l_dfrbpq_1"
+
+  let sampler_margins ?wire_load ?(quiet = Event_sim.of_ns 2400.) ~path () =
+    let tl, sim = start ?wire_load ~path () in
+    let first = Event_sim.of_ns 300. in
+    let gap = Event_sim.of_ns 200. in
+    let window k = first + (k * (quiet + gap)) in
+    let in_window t =
+      List.find (List.init Cfg.slots ~f:Fn.id) ~f:(fun k -> t >= window k && t < window k + quiet)
+    in
+    (* One write per bank after each window, then more, 200 ns apart, until
+       each pointer has been through all its states. *)
+    let write_pair t =
+      Event_sim.set_input sim "pins[0]" V1 ~at:(t + Event_sim.of_ns 40.);
+      Event_sim.set_input sim "pins[0]" V0 ~at:(t + Event_sim.of_ns 120.)
+    in
+    for k = 0 to Cfg.slots - 1 do
+      write_pair (window k + quiet)
+    done;
+    for k = Cfg.slots to Cap.ptr_range - 1 do
+      write_pair (window Cfg.slots + ((k - Cfg.slots) * gap))
+    done;
+    let end_time = window Cfg.slots + ((Cap.ptr_range - Cfg.slots) * gap) in
+    let rising name = function
+      | Event_sim.Value.V1 -> true
+      | V0 -> false
+      | X -> raise_s [%message "X after warm-up" (name : string)]
+    in
+    let warm t = t >= Event_sim.of_ns 200. in
+    (* The ring nets and counters, with the clk sampler's apertures. *)
+    let raw_nodes = Queue.create () in
+    let clk_changes = [| Queue.create (); Queue.create () |] in
+    let clk_record name ~f =
+      Event_sim.on_change sim name (fun ~time v ->
+        if warm time
+        then (
+          let r = rising name v in
+          let setup, hold =
+            Ring_margins.aperture tl ~cell:flop_cell ~rising:r ~d_slew:(Event_sim.slew_ns sim name)
+              ~clock_slew:(Event_sim.slew_ns sim "clock")
+          in
+          f { Ring_margins.time; setup; hold } r))
+    in
+    for i = 0 to n - 1 do
+      clk_record (Printf.sprintf "ring_node%d" i) ~f:(fun t r -> Queue.enqueue raw_nodes (i, r, t))
+    done;
+    List.iteri [ "a"; "b" ] ~f:(fun c tag ->
+      for i = 0 to R.counter_width - 1 do
+        clk_record (Printf.sprintf "ring_count_%s[%d]" tag i) ~f:(fun t _ ->
+          Queue.enqueue clk_changes.(c) t)
+      done);
+    (* Bank trunks: clock rises. *)
+    let trunk = Hashtbl.create (module String) in
+    List.iter [ "r", "clkr/X"; "f", "clkf/Y" ] ~f:(fun (bank, pin) ->
+      Event_sim.on_change sim (Printf.sprintf "%s_%s" name pin) (fun ~time v ->
+        if Event_sim.Value.equal v V1 && warm time then Hashtbl.add_multi trunk ~key:bank ~data:time));
+    (* Slot flops: D transitions (time, rising, slew) in the window of their
+       slot; clock rises (time, slew); select changes. *)
+    let fields = [ "nodes", n; "count_a", R.counter_width; "count_b", R.counter_width ] in
+    let d = Hashtbl.Poly.create () in
+    let clk = Hashtbl.Poly.create () in
+    let sel = Hashtbl.Poly.create () in
+    List.iter [ "r"; "f" ] ~f:(fun bank ->
+      for slot = 0 to Cfg.slots - 1 do
+        List.iter fields ~f:(fun (field, width) ->
+          for i = 0 to width - 1 do
+            let key = bank, slot, field, i in
+            let inst = Printf.sprintf "%s_%s_s%d_%s%d" name bank slot field i in
+            Event_sim.on_change sim (inst ^ "_mux/X") (fun ~time v ->
+              match in_window time with
+              | Some k when k = slot ->
+                Hashtbl.add_multi d ~key ~data:(time, rising inst v, Event_sim.slew_ns sim (inst ^ "_mux/X"))
+              | _ -> ());
+            Event_sim.on_change sim (inst ^ "/CLK") (fun ~time v ->
+              if Event_sim.Value.equal v V1 && warm time
+              then Hashtbl.add_multi clk ~key ~data:(time, Event_sim.slew_ns sim (inst ^ "/CLK")));
+            Event_sim.on_change sim (inst ^ "_mux/S") (fun ~time _ ->
+              if warm time then Hashtbl.add_multi sel ~key ~data:time)
+          done)
+      done);
+    Event_sim.run_until sim end_time;
+    let raw = Ring_margins.of_node_transitions ~n (Queue.to_list raw_nodes) in
+    let s = R.select_threshold n in
+    let clk_sampler =
+      { label = "clk sampler"
+      ; w = raw
+      ; a = Ring_margins.counter raw ~first:0 ~s (Queue.to_list clk_changes.(0))
+      ; b = Ring_margins.counter raw ~first:n ~s (Queue.to_list clk_changes.(1))
+      ; skew_ps = 0.
+      ; skew_jitter_ps = 0.
+      ; d_delay_ps = 0., 0.
+      ; handoff_ps = Float.nan
+      ; ordered = true
+      }
+    in
+    (* Raw transitions of node i: (time, wavefront index). *)
+    let raw_of_node =
+      Array.init n ~f:(fun i ->
+        Array.filter_mapi raw.tr ~f:(fun q (t : Ring_margins.transition) ->
+          Option.some_if (q % n = i) (t.time, q)))
+    in
+    let slot_margin bank slot =
+      let trunk_rises = Hashtbl.find_exn trunk bank |> List.sort ~compare:Int.compare |> Array.of_list in
+      if Array.length trunk_rises <> Cap.ptr_range
+      then raise_s [%message "expected one write per pointer state" bank (Array.length trunk_rises : int)];
+      let handoff = ref Int.max_value in
+      (* Per flop: clock arrival after the trunk (mean, and its spread over
+         writes) and clock slew; the select handoff after each write. *)
+      let clock_of ((_, _, field, i) as key) =
+        let flop_hold clock_slew =
+          List.map [ true; false ] ~f:(fun rising ->
+            snd (Ring_margins.aperture tl ~cell:flop_cell ~rising ~d_slew:0.05 ~clock_slew))
+          |> List.fold ~init:Int.min_value ~f:Int.max
+        in
+        let rises = Hashtbl.find_exn clk key |> List.sort ~compare:Poly.compare |> Array.of_list in
+        let sels = Hashtbl.find_multi sel key |> List.sort ~compare:Int.compare |> Array.of_list in
+        (* Write [w] (the trunk's [w]-th rise) writes slot [w mod slots] and
+           selects the next: both change their select. *)
+        Array.iteri trunk_rises ~f:(fun w tw ->
+          let clk, clock_slew =
+            Array.find rises ~f:(fun (t, _) -> t >= tw && t - tw < Event_sim.of_ns 2.)
+            |> Option.value_exn ~message:"no clock edge for a write"
+          in
+          let due = slot = w % Cfg.slots || slot = (w + 1) % Cfg.slots in
+          match Array.find sels ~f:(fun t -> t > tw - Event_sim.of_ns 1. && t - tw < Event_sim.of_ns 5.) with
+          | Some t -> handoff := Int.min !handoff (t - clk - flop_hold clock_slew)
+          | None ->
+            if due
+            then raise_s [%message "no select change at a write" bank (slot : int) field (i : int) (w : int)]);
+        let rises = Array.to_list rises in
+        let offsets =
+          List.map rises ~f:(fun (t, _) ->
+            let k =
+              Array.binary_search trunk_rises ~compare:Int.compare `Last_less_than_or_equal_to t
+              |> Option.value_exn
+            in
+            t - trunk_rises.(k))
+        in
+        let mean = List.sum (module Int) offsets ~f:Fn.id / List.length offsets in
+        let spread = List.fold offsets ~init:0 ~f:(fun a o -> Int.max a (abs (o - mean))) in
+        let slew = List.sum (module Float) rises ~f:snd /. Float.of_int (List.length rises) in
+        mean, spread, slew
+      in
+      let transitions key =
+        let offset, spread, clock_slew = clock_of key in
+        ( List.map (Hashtbl.find_multi d key) ~f:(fun (time, r, d_slew) ->
+            let setup, hold =
+              Ring_margins.aperture tl ~cell:flop_cell ~rising:r ~d_slew ~clock_slew
+            in
+            time, r, { Ring_margins.time = time - offset; setup; hold })
+        , offset
+        , spread )
+      in
+      (* Node bits: each D transition follows the latest transition of its
+         ring node, whose wavefront index it takes. *)
+      let indexed = Hashtbl.create (module Int) in
+      let delays = ref [] in
+      let offsets = ref [] in
+      let spreads = ref [] in
+      for i = 0 to n - 1 do
+        let ts, offset, spread = transitions (bank, slot, "nodes", i) in
+        offsets := offset :: !offsets;
+        spreads := spread :: !spreads;
+        List.iter ts ~f:(fun (time, _, t) ->
+          match
+            Array.binary_search raw_of_node.(i) ~compare:(fun (x, _) t -> Int.compare x t)
+              `Last_less_than_or_equal_to time
+          with
+          | Some k ->
+            let raw_time, q = raw_of_node.(i).(k) in
+            delays := (time - raw_time) :: !delays;
+            if Hashtbl.mem indexed q then raise_s [%message "two D transitions for one node transition" (q : int)];
+            Hashtbl.set indexed ~key:q ~data:t
+          | None -> ())
+      done;
+      (* The run of consecutive indices from the first rise of node 0. *)
+      let qs = Hashtbl.keys indexed |> List.sort ~compare:Int.compare in
+      let q0 = List.find_exn qs ~f:(fun q -> q % (2 * n) = 0 && Hashtbl.mem indexed (q + 1)) in
+      let rec last q = if Hashtbl.mem indexed (q + 1) then last (q + 1) else q in
+      let q1 = last q0 in
+      if q1 - q0 + 1 < List.length qs - (2 * n)
+      then raise_s [%message "gaps in the D-pin wavefront" (q0 : int) (q1 : int)];
+      let tr = Array.init (q1 - q0 + 1) ~f:(fun k -> Hashtbl.find_exn indexed (q0 + k)) in
+      let w = Ring_margins.wavefront ~n tr in
+      let ordered =
+        Array.for_alli tr ~f:(fun k (t : Ring_margins.transition) -> k = 0 || t.time > tr.(k - 1).time)
+      in
+      let changes field =
+        List.concat_map (List.init R.counter_width ~f:Fn.id) ~f:(fun i ->
+          let ts, offset, spread = transitions (bank, slot, field, i) in
+          offsets := offset :: !offsets;
+          spreads := spread :: !spreads;
+          (* every bit must change both ways in the window *)
+          if not (List.exists ts ~f:(fun (_, r, _) -> r) && List.exists ts ~f:(fun (_, r, _) -> not r))
+          then raise_s [%message "counter bit did not toggle in the window" bank (slot : int) field (i : int)];
+          List.map ts ~f:(fun (_, _, t) -> t))
+      in
+      let ps x = Event_sim.to_ps x in
+      let fold f init l = List.fold l ~init ~f in
+      let a = Ring_margins.counter w ~first:0 ~s (changes "count_a") in
+      let b = Ring_margins.counter w ~first:n ~s (changes "count_b") in
+      { label = Printf.sprintf "bank %s slot %d" bank slot
+      ; w
+      ; a
+      ; b
+      ; skew_ps = ps (fold Int.max Int.min_value !offsets - fold Int.min Int.max_value !offsets)
+      ; skew_jitter_ps = ps (fold Int.max 0 !spreads)
+      ; d_delay_ps = ps (fold Int.min Int.max_value !delays), ps (fold Int.max 0 !delays)
+      ; handoff_ps = ps !handoff
+      ; ordered
+      }
+    in
+    clk_sampler
+    :: List.concat_map [ "r"; "f" ] ~f:(fun bank ->
+      List.init Cfg.slots ~f:(fun slot -> slot_margin bank slot))
+  ;;
+
+  let pp_sampler_margin m =
+    let s = R.select_threshold n in
+    let lo, hi = m.d_delay_ps in
+    Printf.sprintf
+      "%-14s %s%s"
+      m.label
+      (Ring_margins.pp_counters m.w ~s m.a m.b)
+      (if String.equal m.label "clk sampler"
+       then ""
+       else
+         Printf.sprintf
+           "\n                    ring -> D %.0f..%.0f ps, clock skew in the record %.0f ps (+-%.0f between writes), select handoff %.0f ps after hold, wavefront in order: %b"
+           lo hi m.skew_ps m.skew_jitter_ps m.handoff_ps m.ordered)
+  ;;
+
+  (* Whether a set of samplers meets the asserted bounds: margins of at
+     least [min_stages], in-order wavefronts, select handoffs after hold. *)
+  let samplers_ok ~min_stages ms =
+    List.for_all ms ~f:(fun m ->
+      Float.(Ring_margins.worst m.a m.b >= min_stages)
+      && m.ordered
+      && (String.equal m.label "clk sampler" || Float.(m.handoff_ps > 0.)))
+  ;;
+
+  (* One line for a set of samplers: the phases safe for all of them, the
+     smallest margin and handoff, the largest change of a clock arrival. *)
+  let pp_margin_summary ms =
+    let fold f init g = List.fold ms ~init ~f:(fun acc m -> f acc (g m)) in
+    let slots = List.filter ms ~f:(fun m -> not (String.equal m.label "clk sampler")) in
+    let s = R.select_threshold n in
+    Printf.sprintf
+      "%d samplers: safe phases A [%d, %d%+d) B [%d, %d%+d), s=%d, smallest margin %.1f stages; select handoff >= %.0f ps after hold, wavefronts in order: %b, clock arrival +-%.0f ps between writes"
+      (List.length ms)
+      (fold Int.max 0 (fun m -> m.a.safe_from))
+      (2 * n)
+      (fold Int.min Int.max_value (fun m -> m.a.safe_until))
+      (fold Int.max 0 (fun m -> m.b.safe_from))
+      (2 * n)
+      (fold Int.min Int.max_value (fun m -> m.b.safe_until))
+      s
+      (fold Float.min Float.infinity (fun m -> Ring_margins.worst m.a m.b))
+      (List.fold slots ~init:Float.infinity ~f:(fun a m -> Float.min a m.handoff_ps))
+      (List.for_all ms ~f:(fun m -> m.ordered))
+      (List.fold slots ~init:0. ~f:(fun a m -> Float.max a m.skew_jitter_ps))
+  ;;
 end
 
 include Make (struct

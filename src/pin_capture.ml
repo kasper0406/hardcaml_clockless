@@ -59,8 +59,11 @@
       Several changed pins = near-coincident edges reported as one event.
     - The ring time is decoded from the record ({!Ring.S.decode}).
     - Events leave the third pipeline stage combinationally, 2 cycles after
-      the read (6-7 cycles after the edge), so the overwrite check below can
-      be applied to the event itself.
+      the read, so the overwrite check below can be applied to the event
+      itself. An edge with the FIFO empty, the bank order aligned and the
+      drain not resynchronising is an event after the 5th or 6th rising
+      clock edge at or after it (Event_sim, three corners); a backlog or a
+      runt re-alignment adds cycles (test/test_pin_capture_timing.ml).
 
     {2 Integrity checks (everything is flagged, nothing silently wrong)}
 
@@ -646,7 +649,9 @@ module Make (C : Config) (R : Ring.S) = struct
           while t.ring.time < c.time do
             Ring.Ideal.step t.ring
           done;
-          let a, b = Ring.Ideal.counts t.ring in
+          (* As a capture reads them: the old value until [E] stages after
+             the edge (the decoder never reads a counter in [[0, L)]). *)
+          let a, b = Ring.Ideal.counts ~earliest:R.counter_earliest_change_stages t.ring in
           let nodes =
             Array.foldi t.ring.nodes ~init:0 ~f:(fun i acc v -> if v then acc lor (1 lsl i) else acc)
           in

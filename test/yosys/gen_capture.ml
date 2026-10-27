@@ -6,11 +6,14 @@ open! Base
 open Hardcaml
 open Hardcaml_clockless
 
-module R = Ring.Make (struct
+(* L and E as measured for this ring and Pin_capture in
+   test/test_pin_capture_timing.ml (pre-layout, Liberty 1k wire load). *)
+module R = Ring.Make_timed (struct
     let lengths = [ 17 ]
     let johnson_bits = 4
     let gray_width = 6
     let counter_settle_stages = 9
+    let counter_earliest_change_stages = 4
   end)
 
 let () =
