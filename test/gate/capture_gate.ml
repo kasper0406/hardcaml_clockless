@@ -40,6 +40,7 @@ let () =
     let totals = Array.create ~len:8 0 in
     let rms_acc = ref 0. and n_acc = ref 0 and worst = ref 0. and bin = ref 0. and outliers = ref 0 in
     let race_min = ref Float.infinity in
+    let lat_all = ref [] and lat_iso = ref [] in
     let errors = ref [] in
     let status = Hashtbl.create (module String) in
     let chunks = (per_corner + chunk - 1) / chunk in
@@ -52,6 +53,9 @@ let () =
       let race = ref None in
       let r = T.simulate ~seed:k ~wire_load ~path ~edges ~cycles ~setup:(fun sim -> race := Some (T.watch_race sim)) () in
       let t = T.analyse r ~edges in
+      let all, isolated = T.latencies t ~edges in
+      lat_all := all @ !lat_all;
+      lat_iso := isolated @ !lat_iso;
       let s = t.summary in
       List.iteri
         [ s.edges; s.timed; s.untimed; s.flagged_lost; s.flagged_bad; s.unflagged_lost; s.unflagged_phantom; s.pending ]
@@ -75,6 +79,9 @@ let () =
     printf
       "     single-edge error (per-class offsets): %d events, rms %.1f ps (%.2f bins), worst %.1f ps (%.2f bins), >3 bins %d; race margin min %.0f ps\n"
       !n_acc rms (rms /. !bin) !worst (!worst /. !bin) !outliers !race_min;
+    printf "     edge -> event latency, clock edges (first after the edge = 1): all %s\n"
+      (T.pp_latencies !lat_all);
+    printf "       no other edge within 100 ns: %s\n" (T.pp_latencies !lat_iso);
     printf "     counts: %s\n"
       (Hashtbl.to_alist status |> List.sort ~compare:Poly.compare
        |> List.map ~f:(fun (k, v) -> Printf.sprintf "%s=%d" k v) |> String.concat ~sep:" ");

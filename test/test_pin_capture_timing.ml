@@ -22,6 +22,11 @@
      (held out): ~0.6 bin rms (30/47/76 ps fast/typ/slow; bins 50/77/123 ps
      mean), <= 2.2 bins worst except rare multi-pin-burst outliers beyond 3
      bins (gate: none at typ and fast, 3 in 30k at slow, worst 0.74 ns);
+   - edge-to-event latency (gate, 105k edges): the event is on the outputs
+     after the 5th rising clock edge at or after the pin edge (median, every
+     corner); 5-6 for an edge with no other edge within 100 ns, except when
+     the drain is re-aligning the bank order after a runt (9); p99 7 and max
+     10 under the random load (backlog of near-coincident edges);
    - snapshot race (pin -> D before pin -> bank clock): >= 280/422/656 ps
      fast/typ/slow;
    - collisions: two pins within ~200-475 ps (fast-slow) cancel in the XOR /
@@ -106,6 +111,9 @@ let%expect_test "random edges at three corners: attribution, flags, calibrated t
     let t = T.analyse r ~edges in
     print_endline (T.pp_timing ~corner t);
     List.iter (List.take t.summary.errors 5) ~f:(printf "     %s\n");
+    let all, isolated = T.latencies t ~edges in
+    printf "     edge -> event latency, clock edges (first after the edge = 1): all %s\n" (T.pp_latencies all);
+    printf "       no other edge within 100 ns: %s\n" (T.pp_latencies isolated);
     let m = T.race_margins (Option.value_exn !race) ~edges |> List.map ~f:Event_sim.to_ps in
     printf
       "     snapshot race (pin->D before pin->CLK): %d isolated edges, min %.0f ps, median %.0f ps\n"
@@ -118,16 +126,22 @@ let%expect_test "random edges at three corners: attribution, flags, calibrated t
     typ  edges 2000: timed 1777, untimed 77, lost+flagged 146, bad+flagged 124 | UNFLAGGED: lost 0, phantom 0 | pending 0
          ring 2610 ps (mean bin 76.8 ps, calibrated bins 29..162 ps), delay pin->capture -451 ps
          single-edge error: 1751 events, rms 60.6 ps (0.79 bins), worst 187.0 ps (2.44 bins); per-class offsets: rms 47.9 ps (0.62 bins), worst 151.3 ps (1.97 bins); >3 bins: 0
+         edge -> event latency, clock edges (first after the edge = 1): all 1751 events, min 5, median 5, p99 7, max 9; 5:1391 6:324 7:31 8:1 9:4
+           no other edge within 100 ns: 42 events, min 5, median 5, p99 6, max 6; 5:40 6:2
          snapshot race (pin->D before pin->CLK): 1528 isolated edges, min 422 ps, median 496 ps
          X on outputs: 0; status: capture_fault=1 fault_count=3 overflow=1 overflow_count=34 lost_edge=15 lost_edge_count=13 level_mismatch=15 level_mismatch_count=53 merge_error=13 merge_error_count=1 empty_count=15 stale_count=60 runt_count=6 resyncing=0
     slow edges 2000: timed 1766, untimed 101, lost+flagged 133, bad+flagged 113 | UNFLAGGED: lost 0, phantom 0 | pending 0
          ring 4185 ps (mean bin 123.1 ps, calibrated bins 41..254 ps), delay pin->capture -635 ps
          single-edge error: 1702 events, rms 97.6 ps (0.79 bins), worst 311.2 ps (2.53 bins); per-class offsets: rms 74.5 ps (0.61 bins), worst 223.3 ps (1.81 bins); >3 bins: 0
+         edge -> event latency, clock edges (first after the edge = 1): all 1702 events, min 5, median 5, p99 7, max 9; 5:1301 6:371 7:28 8:1 9:1
+           no other edge within 100 ns: 42 events, min 5, median 5, p99 6, max 6; 5:37 6:5
          snapshot race (pin->D before pin->CLK): 1528 isolated edges, min 656 ps, median 774 ps
          X on outputs: 0; status: capture_fault=1 fault_count=3 overflow=1 overflow_count=32 lost_edge=7 lost_edge_count=9 level_mismatch=15 level_mismatch_count=64 merge_error=15 merge_error_count=3 empty_count=31 stale_count=71 runt_count=3 resyncing=0
     fast edges 2000: timed 1796, untimed 52, lost+flagged 152, bad+flagged 134 | UNFLAGGED: lost 0, phantom 0 | pending 0
          ring 1692 ps (mean bin 49.8 ps, calibrated bins 19..91 ps), delay pin->capture -1998 ps
          single-edge error: 1772 events, rms 37.8 ps (0.76 bins), worst 197.4 ps (3.97 bins); per-class offsets: rms 31.0 ps (0.62 bins), worst 206.0 ps (4.14 bins); >3 bins: 1
+         edge -> event latency, clock edges (first after the edge = 1): all 1772 events, min 5, median 5, p99 7, max 10; 5:1432 6:309 7:28 8:1 9:1 10:1
+           no other edge within 100 ns: 42 events, min 5, median 5, p99 6, max 6; 5:40 6:2
          snapshot race (pin->D before pin->CLK): 1528 isolated edges, min 280 ps, median 330 ps
          X on outputs: 0; status: capture_fault=1 fault_count=3 overflow=1 overflow_count=36 lost_edge=14 lost_edge_count=9 level_mismatch=15 level_mismatch_count=34 merge_error=14 merge_error_count=1 empty_count=14 stale_count=63 runt_count=3 resyncing=0
     |}]

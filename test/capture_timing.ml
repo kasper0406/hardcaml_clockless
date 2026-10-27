@@ -450,6 +450,45 @@ struct
       t.worst_class_ps (t.worst_class_ps /. bin) t.outliers
   ;;
 
+  (* Edge-to-event latency of the timed single-pin attributions, in clock
+     edges: the first rising clock edge at or after the pin edge is 1, and
+     the event is on the outputs (valid) after that many edges. All events,
+     and those whose edge had no other edge on any pin within [quiet_ns]
+     (no backlog in the FIFO, no burst). *)
+  let latencies ?(quiet_ns = 100.) (t : timing) ~edges =
+    let times = List.map edges ~f:fst |> List.sort ~compare:Int.compare |> Array.of_list in
+    let quiet = Event_sim.of_ns quiet_ns in
+    let isolated time =
+      (match Array.binary_search times ~compare:Int.compare `Last_strictly_less_than time with
+       | Some k -> time - times.(k) > quiet
+       | None -> true)
+      &&
+      match Array.binary_search times ~compare:Int.compare `First_strictly_greater_than time with
+      | Some k -> times.(k) - time > quiet
+      | None -> true
+    in
+    let all =
+      List.filter_map t.summary.matches ~f:(fun (ev, (edge : Capture_oracle.edge), k) ->
+        Option.some_if
+          (k = 1)
+          (edge.time, ev.cycle - ((edge.time + clock_period - 1) / clock_period) + 1))
+    in
+    List.map all ~f:snd, List.filter_map all ~f:(fun (time, l) -> Option.some_if (isolated time) l)
+  ;;
+
+  let pp_latencies xs =
+    let a = List.sort xs ~compare:Int.compare |> Array.of_list in
+    let n = Array.length a in
+    if n = 0
+    then "none"
+    else
+      Printf.sprintf "%d events, min %d, median %d, p99 %d, max %d; %s" n a.(0) a.(n / 2)
+        a.(Int.min (n - 1) (n * 99 / 100)) a.(n - 1)
+        (List.sort_and_group (Array.to_list a) ~compare:Int.compare
+         |> List.map ~f:(fun g -> Printf.sprintf "%d:%d" (List.hd_exn g) (List.length g))
+         |> String.concat ~sep:" ")
+  ;;
+
   (* Random edges on all pins: gaps mostly 0..[mean_gap*2] ns, a fraction
      [near] of them 0..2 ns (near-coincident), deterministic. *)
   let random_edges ?(min_same_pin_ns = 0.) ~seed ~count ~start_ns ~mean_gap_ns ~near () =
