@@ -1311,18 +1311,23 @@ struct
         )
       done;
       let ps x = Event_sim.to_ps x in
+      (* lag: earliest tag D minus latest data D; margin: the earliest
+         tag D less its hold, minus the latest data D plus its setup, each
+         taken over all bits *)
       let margins =
         Hashtbl.to_alist events
         |> List.filter_map ~f:(fun ((_, _, on), xs) ->
           let data = List.filter xs ~f:(fun (t, _, _, _) -> not t) in
           let tags = List.filter xs ~f:(fun (t, _, _, _) -> t) in
-          match
-            ( List.max_elt data ~compare:(fun (_, a, _, _) (_, b, _, _) -> Int.compare a b)
-            , List.min_elt tags ~compare:(fun (_, a, _, _) (_, b, _, _) -> Int.compare a b) )
-          with
-          | Some (_, td, setup, _), Some (_, tt, _, hold) ->
-            Some (on, ps (tt - td), ps (tt - td - setup - hold))
-          | _ -> None)
+          let fold l f init g = List.fold l ~init ~f:(fun a x -> f a (g x)) in
+          if List.is_empty data || List.is_empty tags
+          then None
+          else (
+            let td = fold data Int.max Int.min_value (fun (_, t, _, _) -> t) in
+            let tt = fold tags Int.min Int.max_value (fun (_, t, _, _) -> t) in
+            let data_req = fold data Int.max Int.min_value (fun (_, t, setup, _) -> t + setup) in
+            let tag_req = fold tags Int.min Int.max_value (fun (_, t, _, hold) -> t - hold) in
+            Some (on, ps (tt - td), ps (tag_req - data_req))))
       in
       let worst on f =
         List.filter margins ~f:(fun (o, _, _) -> Bool.equal o on)

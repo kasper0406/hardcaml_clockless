@@ -1124,9 +1124,13 @@ module Make (C : Config) (R : Ring.S) = struct
       let stable_all =
         wr ==: wr_p &: (wf ==: wf_p) &: (mg ==: mg_p) &: (lv ==: lv_p) &: valid_r &: valid_f
       in
-      let resync_done = resync &: stable_all &: (ar_cnt ==:. 0) in
+      (* a new start (an event in flight found overwritten or implausible)
+         wins over completion *)
       let late_ovf_w = wire 1 in
       let implausible_w = wire 1 in
+      let resync_done =
+        resync &: stable_all &: (ar_cnt ==:. 0) &: ~:late_ovf_w &: ~:implausible_w
+      in
       let start_resync = fault_now |: torn |: ovf_now |: ovf_tag |: late_ovf_w |: implausible_w in
       (* D-13: the first event delivered after a resync that discarded
          captures is marked [lost]. The first event to enter the pipeline
