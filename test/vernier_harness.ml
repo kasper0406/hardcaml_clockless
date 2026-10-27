@@ -102,17 +102,18 @@ let realistic_config ~seed =
 type constants =
   { scale : int array
   ; offset : int array
-  ; ratio : int
-  ; skew : int
+  ; ratio : int array
   }
 
-let null_constants =
-  { scale = Array.create ~len:(2 * pins) 0; offset = Array.create ~len:(2 * pins) 0; ratio = 0; skew = 0 }
+(* scale 0: the fraction is the coarse tap (fine mode: the fine tap) *)
+let identity =
+  { scale = Array.create ~len:(2 * pins) 0
+  ; offset = Array.create ~len:(2 * pins) 0
+  ; ratio = Array.create ~len:(2 * pins) 0
+  }
 ;;
 
-let of_calibration (c : Vernier.Calibration.t) =
-  { scale = c.scale; offset = c.offset; ratio = c.ratio; skew = c.skew }
-;;
+let of_calibration (c : Vernier.Calibration.t) = { scale = c.scale; offset = c.offset; ratio = c.ratio }
 
 type t =
   { sim : Event_sim.t
@@ -122,11 +123,12 @@ type t =
 
 let set t name v = Event_sim.set_input_int t.sim name v ~at:(Event_sim.now t.sim)
 
+let clear_flags t ~pin v = set t (Printf.sprintf "clear_flags_%d" pin) v
+
 let set_constants t (c : constants) =
   Array.iteri c.scale ~f:(fun l v -> set t (Printf.sprintf "scale_%d" l) v);
   Array.iteri c.offset ~f:(fun l v -> set t (Printf.sprintf "offset_%d" l) v);
-  set t "ratio" c.ratio;
-  set t "skew" (c.skew land ((1 lsl Vernier.skew_bits) - 1))
+  Array.iteri c.ratio ~f:(fun l v -> set t (Printf.sprintf "ratio_%d" l) v)
 ;;
 
 (* Run to the middle of cycle [k] (inputs set there are registered at edge
@@ -135,7 +137,9 @@ let cycle t = Event_sim.now t.sim / period
 let goto t k = Event_sim.run_until t.sim ((k * period) + (period / 2))
 let wait t n = goto t (cycle t + n)
 
-let create ?(config = base_config) ?(settle = 4) ?(constants = null_constants) path =
+let set_mode t ~pin (m : Vernier.Mode.t) = set t (Printf.sprintf "mode_%d" pin) (Vernier.Mode.to_int m)
+
+let create ?(config = base_config) ?(settle = 4) ?(constants = identity) ?(mode = Vernier.Mode.Full) path =
   let tl = Timing_library.load path in
   let sim = Event_sim.create ~config tl (circuit tl.library) in
   let t = { sim; edges = Array.init pins ~f:(fun _ -> Queue.create ()); level = Array.create ~len:pins 0 } in
@@ -143,15 +147,11 @@ let create ?(config = base_config) ?(settle = 4) ?(constants = null_constants) p
   for p = 0 to pins - 1 do
     set t (Printf.sprintf "level_%d" p) 0;
     set t (Printf.sprintf "fraction_%d" p) 0;
-    set t (Printf.sprintf "bypass_%d" p) 0;
-    set t (Printf.sprintf "line_mode_%d" p) 0
+    set_mode t ~pin:p mode;
+    set t (Printf.sprintf "clear_flags_%d" p) 0
   done;
   set t "settle_cycles" settle;
   set_constants t constants;
-  set t "raw" 0;
-  set t "raw_coarse" 0;
-  set t "raw_fine" 0;
-  set t "clear_flags" 0;
   Event_sim.add_clock sim "clock" ~period;
   for p = 0 to pins - 1 do
     Event_sim.on_change sim (Printf.sprintf "out_%d" p) (fun ~time v -> Queue.enqueue t.edges.(p) (time, v))

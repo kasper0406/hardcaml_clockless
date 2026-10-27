@@ -100,7 +100,6 @@ type mode =
   | Full
   | Coarse_only
   | Fine_only
-  | Direct
 
 (* Delay (ns) from the launch flop's clock edge to [out], for a launch flop
    Q going [q_rise], select [coarse]/[fine], [line] 0 (rise line, XOR pin A)
@@ -112,7 +111,6 @@ let line_delay t ~mode ~line ~q_rise ~other ~coarse ~fine =
     | Full -> true, true
     | Coarse_only -> true, false
     | Fine_only -> false, true
-    | Direct -> false, false
   in
   let cn = t.coarse_taps
   and fn = t.fine_taps in

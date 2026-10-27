@@ -14,36 +14,35 @@ type flop =
   ; q : string
   }
 
-module Line_mode = struct
+module Mode = struct
   type t =
+    | Bypass
+    | Coarse
+    | Fine
     | Full
-    | Coarse_only
-    | Fine_only
-    | Direct
   [@@deriving sexp_of, equal, enumerate]
 
   let to_int = function
-    | Full -> 0
-    | Coarse_only -> 1
-    | Fine_only -> 2
-    | Direct -> 3
+    | Bypass -> 0
+    | Coarse -> 1
+    | Fine -> 2
+    | Full -> 3
   ;;
 
   let uses_coarse = function
-    | Full | Coarse_only -> true
-    | Fine_only | Direct -> false
+    | Bypass | Coarse | Full -> true
+    | Fine -> false
   ;;
 
   let uses_fine = function
-    | Full | Fine_only -> true
-    | Coarse_only | Direct -> false
+    | Bypass | Fine | Full -> true
+    | Coarse -> false
   ;;
 end
 
 let scale_frac_bits = 4
 let position_frac_bits = 6
 let offset_bits = 8
-let skew_bits = 7
 let ratio_bits = 4
 let settle_bits = 3
 let model_extra_bits = 4
@@ -117,7 +116,6 @@ module type S = sig
   val coarse_bits : int
   val fine_bits : int
   val scale_bits : int
-  val ratio_bits : int
   val model_ticks_bits : int
 
   module I : sig
@@ -126,17 +124,12 @@ module type S = sig
       ; clear : 'a
       ; level : 'a list
       ; fraction : 'a list
-      ; bypass : 'a list
-      ; line_mode : 'a list
+      ; mode : 'a list
       ; settle_cycles : 'a
       ; scale : 'a list
       ; offset : 'a list
-      ; ratio : 'a
-      ; skew : 'a
-      ; raw : 'a
-      ; raw_coarse : 'a
-      ; raw_fine : 'a
-      ; clear_flags : 'a
+      ; ratio : 'a list
+      ; clear_flags : 'a list
       }
     [@@deriving hardcaml]
   end
@@ -145,11 +138,14 @@ module type S = sig
     type 'a t =
       { out : 'a list
       ; loopback : 'a list
-      ; active_bypass : 'a list
+      ; line_out : 'a list
       ; active_mode : 'a list
-      ; rate_violation : 'a list
-      ; saturated : 'a list
+      ; fallback : 'a list
+      ; overrun : 'a list
+      ; range_fault : 'a list
       ; mismatch : 'a list
+      ; overrun_event : 'a list
+      ; range_event : 'a list
       ; model_toggle : 'a list
       ; model_ticks : 'a list
       }
@@ -173,13 +169,8 @@ module type S = sig
         { fraction : 'a
         ; scale : 'a
         ; offset : 'a
-        ; skew : 'a
-        ; apply_skew : 'a
         ; ratio : 'a
         ; mode : 'a
-        ; raw : 'a
-        ; raw_coarse : 'a
-        ; raw_fine : 'a
         }
       [@@deriving hardcaml]
     end
@@ -188,7 +179,7 @@ module type S = sig
       type 'a t =
         { coarse : 'a
         ; fine : 'a
-        ; saturated : 'a
+        ; range_fault : 'a
         }
       [@@deriving hardcaml]
     end
@@ -207,6 +198,7 @@ module type S = sig
     type pin_out =
       { out : Signal.t
       ; loopback : Signal.t
+      ; line_out : Signal.t * Signal.t
       ; model_toggle : Signal.t * Signal.t
       ; model_ticks : Signal.t * Signal.t
       }
@@ -246,7 +238,6 @@ module Make (Config : Config) : S = struct
   let coarse_bits = num_bits_to_represent (coarse_taps - 1)
   let fine_bits = num_bits_to_represent (fine_taps - 1)
   let scale_bits = coarse_bits + scale_frac_bits
-  let ratio_bits = ratio_bits
   let model_ticks_bits = fraction_bits + model_extra_bits
 
   module I = struct
@@ -255,17 +246,12 @@ module Make (Config : Config) : S = struct
       ; clear : 'a
       ; level : 'a list [@length pins]
       ; fraction : 'a list [@length pins] [@bits fraction_bits]
-      ; bypass : 'a list [@length pins]
-      ; line_mode : 'a list [@length pins] [@bits 2]
+      ; mode : 'a list [@length pins] [@bits 2]
       ; settle_cycles : 'a [@bits settle_bits]
       ; scale : 'a list [@length lines] [@bits scale_bits]
       ; offset : 'a list [@length lines] [@bits offset_bits]
-      ; ratio : 'a [@bits ratio_bits]
-      ; skew : 'a [@bits skew_bits]
-      ; raw : 'a
-      ; raw_coarse : 'a [@bits coarse_bits]
-      ; raw_fine : 'a [@bits fine_bits]
-      ; clear_flags : 'a
+      ; ratio : 'a list [@length lines] [@bits ratio_bits]
+      ; clear_flags : 'a list [@length pins]
       }
     [@@deriving hardcaml]
   end
@@ -274,11 +260,14 @@ module Make (Config : Config) : S = struct
     type 'a t =
       { out : 'a list [@length pins]
       ; loopback : 'a list [@length pins]
-      ; active_bypass : 'a list [@length pins]
+      ; line_out : 'a list [@length lines]
       ; active_mode : 'a list [@length pins] [@bits 2]
-      ; rate_violation : 'a list [@length pins]
-      ; saturated : 'a list [@length pins]
+      ; fallback : 'a list [@length pins]
+      ; overrun : 'a list [@length pins]
+      ; range_fault : 'a list [@length pins]
       ; mismatch : 'a list [@length pins]
+      ; overrun_event : 'a list [@length pins]
+      ; range_event : 'a list [@length pins]
       ; model_toggle : 'a list [@length lines]
       ; model_ticks : 'a list [@length lines] [@bits model_ticks_bits]
       }
@@ -302,13 +291,8 @@ module Make (Config : Config) : S = struct
         { fraction : 'a [@bits fraction_bits]
         ; scale : 'a [@bits scale_bits]
         ; offset : 'a [@bits offset_bits]
-        ; skew : 'a [@bits skew_bits]
-        ; apply_skew : 'a
         ; ratio : 'a [@bits ratio_bits]
         ; mode : 'a [@bits 2]
-        ; raw : 'a
-        ; raw_coarse : 'a [@bits coarse_bits]
-        ; raw_fine : 'a [@bits fine_bits]
         }
       [@@deriving hardcaml]
     end
@@ -317,57 +301,54 @@ module Make (Config : Config) : S = struct
       type 'a t =
         { coarse : 'a [@bits coarse_bits]
         ; fine : 'a [@bits fine_bits]
-        ; saturated : 'a
+        ; range_fault : 'a
         }
       [@@deriving hardcaml]
     end
 
     let pf = position_frac_bits
 
-    (* Position width: integer part up to 2^coarse_bits (scale) plus offset,
-       plus a sign bit for the skew. *)
-    let pw = Int.max (coarse_bits + pf) offset_bits + 2
-
     let create (i : Signal.t I.t) : Signal.t O.t =
       I.Of_signal.assert_widths i;
+      let mode_is m = i.mode ==:. Mode.to_int m in
+      let max_c = of_int_trunc ~width:coarse_bits (coarse_taps - 1) in
+      let max_f = of_int_trunc ~width:fine_bits (fine_taps - 1) in
+      (* position p in 1/2^pf coarse steps; its integer part fits coarse_bits
+         + 1 bits (scale < 2^coarse_bits, offset < 4 steps) *)
+      let pw = Int.max (coarse_bits + pf) offset_bits + 1 in
       let shift = fraction_bits + scale_frac_bits - pf in
       let prod = uresize (i.fraction *: i.scale) ~width:(fraction_bits + scale_bits + 1) in
       let p = srl (prod +:. (1 lsl (shift - 1))) ~by:shift |> uresize ~width:pw in
       let p = p +: uresize i.offset ~width:pw in
-      let p = mux2 i.apply_skew (p +: sresize i.skew ~width:pw) p in
-      (* negative after a skew: clamp to 0 *)
-      let p = mux2 (msb p) (zero pw) p in
-      let mode_is m = i.mode ==:. Line_mode.to_int m in
-      let max_c = of_int_trunc ~width:coarse_bits (coarse_taps - 1) in
-      let max_f = of_int_trunc ~width:fine_bits (fine_taps - 1) in
-      (* fine = round(x * R) with R = 8 + ratio/2 fine steps per coarse step,
-         x in 1/2^pf coarse steps: the fraction of a step in full mode, the
-         whole position (below 2 steps) in fine-only mode. *)
-      let xw = pf + 1 in
-      let x_clipped = p >=:. 1 lsl xw in
-      let x =
-        mux2
-          (mode_is Fine_only)
-          (mux2 x_clipped (ones xw) (sel_bottom p ~width:xw))
-          (uresize (sel_bottom p ~width:pf) ~width:xw)
-      in
-      let fw = xw + 6 in
-      let x16k = uresize (sll (uresize x ~width:fw) ~by:4) ~width:fw +: uresize (x *: i.ratio) ~width:fw in
-      let f = srl (x16k +:. (1 lsl pf)) ~by:(pf + 1) in
-      let f_over = f >: uresize max_f ~width:fw in
-      let fine = mux2 f_over max_f (sel_bottom f ~width:fine_bits) in
-      let c = srl (mux2 (mode_is Coarse_only) (p +:. (1 lsl (pf - 1))) p) ~by:pf in
+      let c = srl p ~by:pf in
       let c_over = c >: uresize max_c ~width:pw in
-      let coarse = mux2 c_over max_c (sel_bottom c ~width:coarse_bits) in
-      (* past the end of the coarse line: the latest tap *)
-      let full_fine = mux2 c_over max_f fine in
-      let mode_coarse = mux i.mode [ coarse; coarse; zero coarse_bits; zero coarse_bits ] in
-      let mode_fine = mux i.mode [ full_fine; zero fine_bits; fine; zero fine_bits ] in
-      let mode_sat = mux i.mode [ c_over |: f_over; c_over; x_clipped |: f_over; gnd ] in
-      let clamp v m = mux2 (v >: m) m v in
-      { O.coarse = mux2 i.raw (clamp i.raw_coarse max_c) mode_coarse
-      ; fine = mux2 i.raw (clamp i.raw_fine max_f) mode_fine
-      ; saturated = ~:(i.raw) &: mode_sat
+      (* fine = round(rho * R), R = 8 + ratio / 2 fine steps per coarse step,
+         rho = the remainder in 1/2^pf steps *)
+      let rho = sel_bottom p ~width:pf in
+      let fw = pf + ratio_bits + 2 in
+      let x = uresize (sll (uresize rho ~width:fw) ~by:4) ~width:fw +: uresize (rho *: i.ratio) ~width:fw in
+      let f = srl (x +:. (1 lsl pf)) ~by:(pf + 1) in
+      let f_over = f >: uresize max_f ~width:fw in
+      let identity = i.scale ==:. 0 in
+      let f_frac = uresize i.fraction ~width:(Int.max fraction_bits coarse_bits) in
+      let clamp_c v = mux2 (v >: uresize max_c ~width:(width v)) max_c (sel_bottom v ~width:coarse_bits) in
+      let low_fine = sel_bottom (uresize i.fraction ~width:(Int.max fraction_bits fine_bits)) ~width:fine_bits in
+      let fine_direct = mux2 (low_fine >: max_f) max_f low_fine in
+      let coarse = mux2 identity (clamp_c f_frac) (mux2 c_over max_c (sel_bottom c ~width:coarse_bits)) in
+      let fine =
+        mux2
+          (mode_is Fine)
+          fine_direct
+          (mux2
+             (identity |: mode_is Coarse)
+             (zero fine_bits)
+             (mux2 (c_over |: f_over) max_f (sel_bottom f ~width:fine_bits)))
+      in
+      { O.coarse = mux2 (mode_is Fine) (zero coarse_bits) coarse
+      ; fine
+      ; range_fault =
+          ~:identity
+          &: (mode_is Coarse &: c_over |: (mode_is Full &: (c_over |: f_over)))
       }
     ;;
   end
@@ -383,6 +364,7 @@ module Make (Config : Config) : S = struct
     type pin_out =
       { out : Signal.t
       ; loopback : Signal.t
+      ; line_out : Signal.t * Signal.t
       ; model_toggle : Signal.t * Signal.t
       ; model_ticks : Signal.t * Signal.t
       }
@@ -457,7 +439,7 @@ module Make (Config : Config) : S = struct
           out_pin
       in
       let z = zero model_ticks_bits in
-      { out; loopback = x; model_toggle = gnd, gnd; model_ticks = z, z }
+      { out; loopback = x; line_out = r, f; model_toggle = gnd, gnd; model_ticks = z, z }
     ;;
 
     (* Behavioural line: a launch at edge [m] with delay [d] ticks toggles
@@ -497,7 +479,7 @@ module Make (Config : Config) : S = struct
       let f, ft, fk = model_line m ~clock ~clear p.fall in
       let x = r ^: f in
       let level = reg (Reg_spec.create ~clock ~clear ()) p.level in
-      { out = mux2 p.bypass level x; loopback = x; model_toggle = rt, ft; model_ticks = rk, fk }
+      { out = mux2 p.bypass level x; loopback = x; line_out = r, f; model_toggle = rt, ft; model_ticks = rk, fk }
     ;;
 
     let create ~name implementation ~clock ~clear pins =
@@ -511,141 +493,143 @@ module Make (Config : Config) : S = struct
     ;;
   end
 
+
   module Control = struct
-    type line_state =
-      { select : Signal.t Line_select.t
-      ; violation : Signal.t
-      ; quiet : Signal.t
-      ; settled : Signal.t
+    type t =
+      { rise : Signal.t Line_select.t
+      ; fall : Signal.t Line_select.t
+      ; level : Signal.t
+      ; bypass : Signal.t
+      ; active_mode : Signal.t
+      ; fallback : Signal.t
+      ; overrun : Signal.t
+      ; range_fault : Signal.t
+      ; mismatch : Signal.t
+      ; overrun_event : Signal.t
+      ; range_event : Signal.t
       }
 
     let create ~name scope (i : Signal.t I.t) ~loopback ~pin:p =
       let ( -- ) = Scope.naming scope in
       let nm s = Printf.sprintf "%s_p%d_%s" name p s in
       let spec = Reg_spec.create ~clock:i.clock ~clear:i.clear () in
-      let cmode = List.nth_exn i.line_mode p in
-      (* stage 0 *)
+      let clear_flags = List.nth_exn i.clear_flags p in
+      (* stage 0: register the request *)
       let req = List.nth_exn i.level p in
       let lvl = reg spec req -- nm "lvl" in
       let s0_edge = reg spec (req ^: lvl) -- nm "s0_edge" in
       let s0_fall = reg spec ~:req -- nm "s0_fall" in
       let s0_frac = reg spec (List.nth_exn i.fraction p) -- nm "s0_frac" in
       let active_mode = wire 2 in
-      let active_bypass = wire 1 in
-      (* per line *)
-      let parity = Array.init 2 ~f:(fun _ -> wire 1) in
+      let mode_is m = active_mode ==:. Mode.to_int m in
+      let vernier = ~:(mode_is Bypass) in
+      (* one mapper per pin: a pin has at most one edge per cycle *)
+      let line_const l = List.nth_exn l (2 * p), List.nth_exn l ((2 * p) + 1) in
+      let pick l = let r, f = line_const l in mux2 s0_fall f r in
+      let m =
+        Map.create
+          { Map.I.fraction = s0_frac
+          ; scale = pick i.scale
+          ; offset = pick i.offset
+          ; ratio = pick i.ratio
+          ; mode = active_mode
+          }
+      in
       let line k =
-        let l = (2 * p) + k in
+        let ln s = nm (Printf.sprintf "%s_%s" (if k = 0 then "r" else "f") s) in
         let pend = wire 1 in
         let iw = settle_bits + 1 in
         let idle =
-          reg_fb
-            spec
-            ~clear_to:(ones iw)
-            ~width:iw
-            ~f:(fun x -> mux2 pend (zero iw) (mux2 (x ==: ones iw) x (x +:. 1)))
-          -- nm (Printf.sprintf "l%d_idle" k)
+          reg_fb spec ~clear_to:(ones iw) ~width:iw ~f:(fun x ->
+            mux2 pend (zero iw) (mux2 (x ==: ones iw) x (x +:. 1)))
+          -- ln "idle"
         in
         let s = uresize i.settle_cycles ~width:(iw + 1) in
         let since = uresize idle ~width:(iw + 1) +:. 1 in
         let quiet = ~:pend &: (since >=: s) in
         let settled = ~:pend &: (since >=: s +:. 2) in
-        let mine = s0_edge &: (if k = 0 then ~:s0_fall else s0_fall) in
-        let m =
-          Map.create
-            { Map.I.fraction = s0_frac
-            ; scale = List.nth_exn i.scale l
-            ; offset = List.nth_exn i.offset l
-            ; skew = i.skew
-            ; apply_skew = parity.(k)
-            ; ratio = i.ratio
-            ; mode = active_mode
-            ; raw = i.raw
-            ; raw_coarse = i.raw_coarse
-            ; raw_fine = i.raw_fine
-            }
-        in
+        let mine = s0_edge &: if k = 0 then ~:s0_fall else s0_fall in
         let sel_c = wire coarse_bits in
         let sel_f = wire fine_bits in
         let same = m.coarse ==: sel_c &: (m.fine ==: sel_f) in
         let update = mine &: (quiet |: same) in
-        sel_c <== (reg spec ~enable:update m.coarse -- nm (Printf.sprintf "l%d_coarse" k));
-        sel_f <== (reg spec ~enable:update m.fine -- nm (Printf.sprintf "l%d_fine" k));
-        pend <== (reg spec mine -- nm (Printf.sprintf "l%d_pend" k));
-        parity.(k) <== (reg spec (parity.(k) ^: pend) -- nm (Printf.sprintf "l%d_parity" k));
-        let mode_is v = active_mode ==:. Line_mode.to_int v in
-        ( { select =
-              { Line_select.launch = parity.(k) ^: pend
-              ; coarse = sel_c
-              ; fine = sel_f
-              ; coarse_bypass = mode_is Fine_only |: mode_is Direct
-              ; fine_bypass = mode_is Coarse_only |: mode_is Direct
-              }
-          ; violation = mine &: ~:quiet &: ~:same
-          ; quiet
-          ; settled
+        sel_c <== (reg spec ~enable:update m.coarse -- ln "coarse");
+        sel_f <== (reg spec ~enable:update m.fine -- ln "fine");
+        pend <== (reg spec mine -- ln "pend");
+        let parity = reg_fb spec ~width:1 ~f:(fun q -> q ^: pend) -- ln "parity" in
+        ( { Line_select.launch = parity ^: pend
+          ; coarse = sel_c
+          ; fine = sel_f
+          ; coarse_bypass = mode_is Fine
+          ; fine_bypass = mode_is Coarse
           }
-        , pend
-        , mine &: m.saturated )
+        , mine &: ~:quiet &: ~:same
+        , quiet
+        , settled
+        , pend )
       in
-      let r, pend_r, sat_r = line 0 in
-      let f, pend_f, sat_f = line 1 in
-      (* Mode changes only where both lines are quiet and no request is
+      let rise, over_r, quiet_r, settled_r, pend_r = line 0 in
+      let fall, over_f, quiet_f, settled_f, pend_f = line 1 in
+      (* Mode changes apply only where both lines are quiet and no request is
          being mapped. *)
-      let mode_ok = r.quiet &: f.quiet &: ~:s0_edge in
-      active_mode <== (reg spec ~enable:mode_ok cmode -- nm "mode");
-      active_bypass
-      <== (reg
-             spec
-             ~clear_to:vdd
-             ~enable:mode_ok
-             (List.nth_exn i.bypass p)
-           -- nm "bypass");
+      let mode_ok = quiet_r &: quiet_f &: ~:s0_edge in
+      active_mode <== (reg spec ~enable:mode_ok (List.nth_exn i.mode p) -- nm "mode");
       let launched = wire 1 in
       let level_d = mux2 pend_r vdd (mux2 pend_f gnd launched) in
       launched <== (reg spec level_d -- nm "launched");
       let sync = pipeline spec ~n:2 loopback -- nm "loopback_sync" in
       let sticky name x =
-        reg_fb spec ~width:1 ~f:(fun q -> mux2 i.clear_flags gnd q |: x) -- nm name
+        reg_fb spec ~width:1 ~f:(fun q -> mux2 clear_flags gnd q |: x) -- nm name
       in
-      let mismatch = r.settled &: f.settled &: (sync ^: launched) in
-      ( r.select
-      , f.select
-      , level_d
-      , active_bypass
-      , active_mode
-      , sticky "rate_violation" (r.violation |: f.violation)
-      , sticky "saturated" (sat_r |: sat_f)
-      , sticky "mismatch" mismatch )
+      let overrun_event = reg spec (vernier &: (over_r |: over_f)) -- nm "overrun_event" in
+      let range_event = reg spec (s0_edge &: m.range_fault) -- nm "range_event" in
+      let overrun = sticky "overrun" overrun_event in
+      let range_fault = sticky "range_fault" range_event in
+      (* A fault drops the pin to bypass at once, until the flags are cleared:
+         the pin shows the requested level at cycle resolution. *)
+      let fallback = overrun |: range_fault in
+      { rise
+      ; fall
+      ; level = level_d
+      ; bypass = mode_is Bypass |: fallback
+      ; active_mode
+      ; fallback
+      ; overrun
+      ; range_fault
+      ; mismatch = sticky "mismatch" (settled_r &: settled_f &: (sync ^: launched))
+      ; overrun_event
+      ; range_event
+      }
     ;;
   end
 
   let create ?(name = "vernier") implementation scope (i : Signal.t I.t) =
     I.Of_signal.assert_widths i;
     let loopbacks = List.init pins ~f:(fun _ -> wire 1) in
-    let ctl =
-      List.mapi loopbacks ~f:(fun p loopback -> Control.create ~name scope i ~loopback ~pin:p)
-    in
+    let ctl = List.mapi loopbacks ~f:(fun p loopback -> Control.create ~name scope i ~loopback ~pin:p) in
     let analog =
       Analog.create
         ~name
         implementation
         ~clock:i.clock
         ~clear:i.clear
-        (List.map ctl ~f:(fun (rise, fall, level, bypass, _, _, _, _) ->
-           { Analog.rise; fall; level; bypass }))
+        (List.map ctl ~f:(fun (c : Control.t) ->
+           { Analog.rise = c.rise; fall = c.fall; level = c.level; bypass = c.bypass }))
     in
     List.iter2_exn loopbacks analog ~f:(fun w a -> w <== a.loopback);
-    let pick f = List.map ctl ~f in
+    let pair f = List.concat_map analog ~f:(fun a -> let r, f = f a in [ r; f ]) in
     { O.out = List.map analog ~f:(fun a -> a.out)
     ; loopback = List.map analog ~f:(fun a -> a.loopback)
-    ; active_bypass = pick (fun (_, _, _, b, _, _, _, _) -> b)
-    ; active_mode = pick (fun (_, _, _, _, m, _, _, _) -> m)
-    ; rate_violation = pick (fun (_, _, _, _, _, v, _, _) -> v)
-    ; saturated = pick (fun (_, _, _, _, _, _, s, _) -> s)
-    ; mismatch = pick (fun (_, _, _, _, _, _, _, m) -> m)
-    ; model_toggle = List.concat_map analog ~f:(fun a -> [ fst a.model_toggle; snd a.model_toggle ])
-    ; model_ticks = List.concat_map analog ~f:(fun a -> [ fst a.model_ticks; snd a.model_ticks ])
+    ; line_out = pair (fun a -> a.line_out)
+    ; active_mode = List.map ctl ~f:(fun c -> c.active_mode)
+    ; fallback = List.map ctl ~f:(fun c -> c.fallback)
+    ; overrun = List.map ctl ~f:(fun c -> c.overrun)
+    ; range_fault = List.map ctl ~f:(fun c -> c.range_fault)
+    ; mismatch = List.map ctl ~f:(fun c -> c.mismatch)
+    ; overrun_event = List.map ctl ~f:(fun c -> c.overrun_event)
+    ; range_event = List.map ctl ~f:(fun c -> c.range_event)
+    ; model_toggle = pair (fun a -> a.model_toggle)
+    ; model_ticks = pair (fun a -> a.model_ticks)
     }
   ;;
 
@@ -678,11 +662,11 @@ module Calibration = struct
   type t =
     { scale : int array
     ; offset : int array
-    ; ratio : int
-    ; skew : int
-    ; reference_ps : float
+    ; ratio : int array
+    ; d_align_ps : float
     ; coarse_step_ps : float array
     ; fine_step_ps : float array
+    ; skew_ps : float array
     }
   [@@deriving sexp_of]
 
@@ -706,75 +690,37 @@ module Calibration = struct
 
   let clamp lo hi x = Int.max lo (Int.min hi x)
 
-  let fit ?(margin_ps = 0.) ?ratio ~coarse_taps ~period_ps ~(mode : Line_mode.t) (lines : line array) =
+  let fit ?(margin_ps = 0.) ~coarse_taps ~period_ps ~(mode : Mode.t) (lines : line array) =
+    (match mode with
+     | Coarse | Full -> ()
+     | Bypass | Fine -> raise_s [%message "Vernier.Calibration.fit: only Coarse and Full are calibrated"]);
     let avg a b = Array.map2_exn a b ~f:(fun x y -> (x +. y) /. 2.) in
-    let fine_step =
-      Array.map lines ~f:(fun l ->
-        if Line_mode.uses_fine mode then snd (fit_line (avg l.rising.fine l.falling.fine)) else 1.)
+    let coarse_fit = Array.map lines ~f:(fun l -> fit_line (avg l.rising.coarse l.falling.coarse)) in
+    let coarse_step = Array.map coarse_fit ~f:snd in
+    let fine_step = Array.map lines ~f:(fun l -> snd (fit_line (avg l.rising.fine l.falling.fine))) in
+    let zero = Array.map coarse_fit ~f:fst in
+    let skew_ps =
+      Array.map lines ~f:(fun l -> fst (fit_line l.rising.coarse) -. fst (fit_line l.falling.coarse))
     in
-    let ratio_of c f = c /. f in
-    let coarse_step =
-      Array.mapi lines ~f:(fun i l ->
-        if Line_mode.uses_coarse mode
-        then snd (fit_line (avg l.rising.coarse l.falling.coarse))
-        else (
-          (* fine-only: a virtual coarse step of R fine steps *)
-          let r =
-            match ratio with
-            | Some k -> 8. +. (Float.of_int k /. 2.)
-            | None -> raise_s [%message "Vernier.Calibration.fit: fine-only needs ~ratio"]
-          in
-          r *. fine_step.(i)))
-    in
-    (* Zero-code delay per direction: the intercept of the axis that is used. *)
-    let zero (s : sweep) =
-      if Line_mode.uses_coarse mode
-      then fst (fit_line s.coarse)
-      else if Line_mode.uses_fine mode
-      then fst (fit_line s.fine)
-      else s.coarse.(0)
-    in
-    let z_rise = Array.map lines ~f:(fun l -> zero l.rising) in
-    let z_fall = Array.map lines ~f:(fun l -> zero l.falling) in
-    let reference_ps =
-      Array.fold (Array.append z_rise z_fall) ~init:Float.neg_infinity ~f:Float.max +. margin_ps
-    in
+    let d_align_ps = Array.fold zero ~init:Float.neg_infinity ~f:Float.max +. margin_ps in
     let units = Float.of_int (1 lsl position_frac_bits) in
-    let skew =
-      Array.mapi lines ~f:(fun i _ -> (z_rise.(i) -. z_fall.(i)) /. coarse_step.(i))
-      |> Array.fold ~init:0. ~f:( +. )
-      |> fun x -> x /. Float.of_int (Array.length lines) *. units
-    in
-    let half_range = 1 lsl (skew_bits - 1) in
-    let ratio =
-      match ratio with
-      | Some k -> k
-      | None ->
-        let r =
-          Array.map2_exn coarse_step fine_step ~f:ratio_of
-          |> Array.fold ~init:0. ~f:( +. )
-          |> fun x -> x /. Float.of_int (Array.length lines)
-        in
-        clamp 0 ((1 lsl ratio_bits) - 1) (Float.iround_nearest_exn ((r -. 8.) *. 2.))
-    in
+    (* coarse mode rounds to the nearest tap: half a step more *)
+    let half = match mode with Coarse -> 0.5 | _ -> 0. in
     let scale_max = (1 lsl (num_bits_to_represent (coarse_taps - 1) + scale_frac_bits)) - 1 in
     { scale =
         Array.map coarse_step ~f:(fun c ->
-          clamp
-            0
-            scale_max
-            (Float.iround_nearest_exn (period_ps /. c *. Float.of_int (1 lsl scale_frac_bits))))
+          clamp 1 scale_max (Float.iround_nearest_exn (period_ps /. c *. Float.of_int (1 lsl scale_frac_bits))))
     ; offset =
-        Array.mapi lines ~f:(fun i _ ->
-          clamp
-            0
-            ((1 lsl offset_bits) - 1)
-            (Float.iround_nearest_exn ((reference_ps -. z_rise.(i)) /. coarse_step.(i) *. units)))
-    ; ratio
-    ; skew = clamp (-half_range) (half_range - 1) (Float.iround_nearest_exn skew)
-    ; reference_ps
+        Array.mapi zero ~f:(fun i z ->
+          clamp 0 ((1 lsl offset_bits) - 1)
+            (Float.iround_nearest_exn (((d_align_ps -. z) /. coarse_step.(i) +. half) *. units)))
+    ; ratio =
+        Array.mapi coarse_step ~f:(fun i c ->
+          clamp 0 ((1 lsl ratio_bits) - 1) (Float.iround_nearest_exn ((c /. fine_step.(i) -. 8.) *. 2.)))
+    ; d_align_ps
     ; coarse_step_ps = coarse_step
     ; fine_step_ps = fine_step
+    ; skew_ps
     }
   ;;
 end
