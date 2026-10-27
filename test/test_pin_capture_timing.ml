@@ -15,13 +15,29 @@
      are safe in phases [9, 2n + 4) after their edge: L = 9, E = 4, which
      leaves >= 6.2 stages on both sides (>= 5.0 with flat wires). At a
      write, the slot selects change >= 476 ps after the hold time;
-   - zero unflagged errors: every edge is reported with the right pin and
-     level, or covered by a flag;
-   - single-edge error after code-density calibration (from the captures'
-     own phases, on the same run) and per (pin, polarity, bank) offsets
-     (held out): ~0.6 bin rms (30/47/76 ps fast/typ/slow; bins 50/77/123 ps
-     mean), <= 2.2 bins worst except rare multi-pin-burst outliers beyond 3
-     bins (gate: none at typ and fast, 3 in 30k at slow, worst 0.74 ns);
+   - accounting against Capture_oracle's contract (per-pin flags by the end
+     of the next 10-cycle quiet stretch; fault, overflow and runt windows;
+     flagged events cover only their pins): in the gate (105k edges, a
+     400 ns quiet stretch every 50 edges) one unflagged error, at slow: in a
+     burst of four edges on four pins within 2.7 ns, pin 1's edge came out
+     with the right pin and level but a time 1.9 us off (a capture record
+     with a wrong period count; no flag on the event, the level and count
+     checks pass, and the order check only catches backward steps). The old
+     400-cycle flag slack had hidden it behind a later, unrelated flag. With
+     flat wires the gate finds one more of the same kind (typ), and at fast
+     a single-pin event one ring period off (1.04 ns): the 2 ns attribution
+     tolerance exceeds the ring period there, so the timing report counts
+     errors beyond half a ring period separately;
+   - timing, separately: 89-91% of edges validated against their true time
+     within 2 ns; single-pin events, calibration fitted to a separate run
+     and frozen: 0.6 bin rms (30/47/74 ps fast/typ/slow; bins 50/77/123 ps
+     mean), p99 72/116/188 ps, rare multi-pin-burst outliers beyond 3 bins
+     (gate: 0/2/2 in ~30k, worst 0.84 ns at slow); events merging several
+     pins: 168-408 ps rms, worst 1.1 ns (one time for edges up to a merge
+     window apart);
+   - per-pin flags come <= 8 cycles after the error (gate); overflow and
+     fault resyncs (D-13): no event after a resync carries a loss mark and
+     levels are re-established silently, not by an untimed event;
    - edge-to-event latency (gate, 105k edges): the event is on the outputs
      after the 5th rising clock edge at or after the pin edge (median, every
      corner); 5-6 for an edge with no other edge within 100 ns, except when
@@ -102,14 +118,25 @@ let%expect_test "counter selection margins of the capture slots and the clk samp
 
 let%expect_test "random edges at three corners: attribution, flags, calibrated time (Liberty 1k wire load)" =
   List.iter T.corners ~f:(fun (corner, path) ->
-    let edges = T.random_edges ~min_same_pin_ns:5. ~seed:11 ~count:2000 ~start_ns:800. ~mean_gap_ns:60. ~near:0.1 () in
-    let cycles = (List.last_exn edges |> fst) / T.clock_period + 450 in
+    let random seed count =
+      let edges =
+        T.random_edges ~min_same_pin_ns:5. ~quiet_every:50 ~seed ~count ~start_ns:800.
+          ~mean_gap_ns:60. ~near:0.1 ()
+      in
+      edges, (List.last_exn edges |> fst) / T.clock_period + 450
+    in
+    (* Calibration fitted to a separate run, then frozen. *)
+    let calibration =
+      let edges, cycles = random 12 1000 in
+      T.fit (T.simulate ~path ~edges ~cycles ()) ~edges
+    in
+    let edges, cycles = random 11 2000 in
     let race = ref None in
     let r =
       T.simulate ~path ~edges ~cycles ~setup:(fun sim -> race := Some (T.watch_race sim)) ()
     in
-    let t = T.analyse r ~edges in
-    print_endline (T.pp_timing ~corner t);
+    let t = T.analyse ~calibration r ~edges in
+    print_endline (T.pp_timing ~corner ~calibrated:"on a separate run" t);
     List.iter (List.take t.summary.errors 5) ~f:(printf "     %s\n");
     let all, isolated = T.latencies t ~edges in
     printf "     edge -> event latency, clock edges (first at or after the edge = 1): all %s\n" (T.pp_latencies all);
@@ -123,27 +150,39 @@ let%expect_test "random edges at three corners: attribution, flags, calibrated t
     printf "     X on outputs: %d; status: %s\n" r.x_outputs
       (String.concat ~sep:" " (List.map r.status ~f:(fun (k, v) -> Printf.sprintf "%s=%d" k v))));
   [%expect {|
-    typ  edges 2000: timed 1777, untimed 77, lost+flagged 146, bad+flagged 124 | UNFLAGGED: lost 0, phantom 0 | pending 0
-         ring 2610 ps (mean bin 76.8 ps, calibrated bins 29..162 ps), delay pin->capture -451 ps
-         single-edge error: 1751 events, rms 60.6 ps (0.79 bins), worst 187.0 ps (2.44 bins); per-class offsets: rms 47.9 ps (0.62 bins), worst 151.3 ps (1.97 bins); >3 bins: 0
-         edge -> event latency, clock edges (first at or after the edge = 1): all 1751 events, min 5, median 5, p99 7, max 9; 5:1391 6:324 7:31 8:1 9:4
-           no other edge within 100 ns: 42 events, min 5, median 5, p99 6, max 6; 5:40 6:2
-         snapshot race (pin->D before pin->CLK): 1528 isolated edges, min 422 ps, median 496 ps
-         X on outputs: 0; status: capture_fault=1 fault_count=3 overflow=1 overflow_count=34 lost_edge=15 lost_edge_count=13 level_mismatch=15 level_mismatch_count=53 merge_error=13 merge_error_count=1 empty_count=15 stale_count=60 runt_count=6 resyncing=0
-    slow edges 2000: timed 1766, untimed 101, lost+flagged 133, bad+flagged 113 | UNFLAGGED: lost 0, phantom 0 | pending 0
-         ring 4185 ps (mean bin 123.1 ps, calibrated bins 41..254 ps), delay pin->capture -635 ps
-         single-edge error: 1702 events, rms 97.6 ps (0.79 bins), worst 311.2 ps (2.53 bins); per-class offsets: rms 74.5 ps (0.61 bins), worst 223.3 ps (1.81 bins); >3 bins: 0
-         edge -> event latency, clock edges (first at or after the edge = 1): all 1702 events, min 5, median 5, p99 7, max 9; 5:1301 6:371 7:28 8:1 9:1
-           no other edge within 100 ns: 42 events, min 5, median 5, p99 6, max 6; 5:37 6:5
-         snapshot race (pin->D before pin->CLK): 1528 isolated edges, min 656 ps, median 774 ps
-         X on outputs: 0; status: capture_fault=1 fault_count=3 overflow=1 overflow_count=32 lost_edge=7 lost_edge_count=9 level_mismatch=15 level_mismatch_count=64 merge_error=15 merge_error_count=3 empty_count=31 stale_count=71 runt_count=3 resyncing=0
-    fast edges 2000: timed 1796, untimed 52, lost+flagged 152, bad+flagged 134 | UNFLAGGED: lost 0, phantom 0 | pending 0
-         ring 1692 ps (mean bin 49.8 ps, calibrated bins 19..91 ps), delay pin->capture -1998 ps
-         single-edge error: 1772 events, rms 37.8 ps (0.76 bins), worst 197.4 ps (3.97 bins); per-class offsets: rms 31.0 ps (0.62 bins), worst 206.0 ps (4.14 bins); >3 bins: 1
-         edge -> event latency, clock edges (first at or after the edge = 1): all 1772 events, min 5, median 5, p99 7, max 10; 5:1432 6:309 7:28 8:1 9:1 10:1
-           no other edge within 100 ns: 42 events, min 5, median 5, p99 6, max 6; 5:40 6:2
-         snapshot race (pin->D before pin->CLK): 1528 isolated edges, min 280 ps, median 330 ps
-         X on outputs: 0; status: capture_fault=1 fault_count=3 overflow=1 overflow_count=36 lost_edge=14 lost_edge_count=9 level_mismatch=15 level_mismatch_count=34 merge_error=14 merge_error_count=1 empty_count=14 stale_count=63 runt_count=3 resyncing=0
+    typ  edges 2000: timed 1777, untimed 77, lost+flagged 146, bad+flagged 123 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+         ring 2610 ps (mean bin 76.8 ps, calibrated on a separate run: bins 25..180 ps), delay pin->capture -459 ps
+         timing: 1777 of 2000 edges validated within 2 ns (88.8%), 0 timed attributions without an estimate
+         single-pin events: 1755, rms 53.3 ps (0.69 bins), p99 134.7 ps, worst 178.5 ps (2.33 bins), >3 bins 0, >0.5 ns 0, >half a ring period 0
+         multi-pin events: 22 attributions, rms 267.5 ps, worst 537.4 ps
+         per-pin flag latency: 8 errors covered, max 5 cycles (deadline: end of the first 10-cycle quiet stretch)
+         resyncs 27: first event after it loss-marked 0, levels re-baselined by an untimed event 1
+         edge -> event latency, clock edges (first at or after the edge = 1): all 1755 events, min 5, median 5, p99 7, max 9; 5:1398 6:323 7:29 8:1 9:4
+           no other edge within 100 ns: 51 events, min 5, median 5, p99 6, max 6; 5:49 6:2
+         snapshot race (pin->D before pin->CLK): 1530 isolated edges, min 422 ps, median 496 ps
+         X on outputs: 0; status: capture_fault=1 fault_count=3 overflow=1 overflow_count=34 lost_edge=15 lost_edge_count=13 level_mismatch=15 level_mismatch_count=53 merge_error=13 merge_error_count=1 empty_count=13 stale_count=60 runt_count=6 resyncing=0
+    slow edges 2000: timed 1775, untimed 97, lost+flagged 128, bad+flagged 108 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+         ring 4185 ps (mean bin 123.1 ps, calibrated on a separate run: bins 46..241 ps), delay pin->capture -680 ps
+         timing: 1775 of 2000 edges validated within 2 ns (88.8%), 0 timed attributions without an estimate
+         single-pin events: 1707, rms 83.3 ps (0.68 bins), p99 204.1 ps, worst 261.9 ps (2.13 bins), >3 bins 0, >0.5 ns 0, >half a ring period 0
+         multi-pin events: 68 attributions, rms 410.4 ps, worst 843.1 ps
+         per-pin flag latency: 11 errors covered, max 5 cycles (deadline: end of the first 10-cycle quiet stretch)
+         resyncs 24: first event after it loss-marked 0, levels re-baselined by an untimed event 1
+         edge -> event latency, clock edges (first at or after the edge = 1): all 1707 events, min 5, median 5, p99 7, max 9; 5:1304 6:371 7:30 8:1 9:1
+           no other edge within 100 ns: 51 events, min 5, median 5, p99 6, max 6; 5:45 6:6
+         snapshot race (pin->D before pin->CLK): 1530 isolated edges, min 656 ps, median 774 ps
+         X on outputs: 0; status: capture_fault=1 fault_count=2 overflow=1 overflow_count=32 lost_edge=7 lost_edge_count=8 level_mismatch=15 level_mismatch_count=61 merge_error=15 merge_error_count=2 empty_count=34 stale_count=68 runt_count=2 resyncing=0
+    fast edges 2000: timed 1795, untimed 51, lost+flagged 154, bad+flagged 136 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+         ring 1692 ps (mean bin 49.8 ps, calibrated on a separate run: bins 21..109 ps), delay pin->capture -267 ps
+         timing: 1795 of 2000 edges validated within 2 ns (89.8%), 0 timed attributions without an estimate
+         single-pin events: 1773, rms 33.3 ps (0.67 bins), p99 82.7 ps, worst 99.0 ps (1.99 bins), >3 bins 0, >0.5 ns 0, >half a ring period 0
+         multi-pin events: 22 attributions, rms 162.6 ps, worst 286.8 ps
+         per-pin flag latency: 5 errors covered, max 4 cycles (deadline: end of the first 10-cycle quiet stretch)
+         resyncs 29: first event after it loss-marked 0, levels re-baselined by an untimed event 1
+         edge -> event latency, clock edges (first at or after the edge = 1): all 1773 events, min 5, median 5, p99 7, max 10; 5:1439 6:305 7:27 8:1 10:1
+           no other edge within 100 ns: 51 events, min 5, median 5, p99 6, max 6; 5:49 6:2
+         snapshot race (pin->D before pin->CLK): 1530 isolated edges, min 280 ps, median 330 ps
+         X on outputs: 0; status: capture_fault=1 fault_count=3 overflow=1 overflow_count=36 lost_edge=14 lost_edge_count=9 level_mismatch=15 level_mismatch_count=35 merge_error=14 merge_error_count=1 empty_count=12 stale_count=61 runt_count=2 resyncing=0
     |}]
 ;;
 
@@ -167,13 +206,13 @@ let%expect_test "collision window: two pins delta apart, at three corners (Liber
       printf "%d:%d/%d/%d/%d " c.delta_ps c.merged c.separate c.flagged c.other);
     printf "\n");
   [%expect {|
-    typ  edges 468: timed 315, untimed 153, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    typ  edges 468: timed 315, untimed 153, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
          merged into one event up to 575 ps; always separate from 600 ps
          delta(ps):merged/separate/flagged/other 0:0/0/6/0 25:0/0/6/0 50:0/0/6/0 75:0/0/6/0 100:0/0/6/0 125:0/0/6/0 150:0/0/6/0 175:0/0/6/0 200:0/0/6/0 225:0/0/6/0 250:0/0/6/0 275:0/0/6/0 300:0/0/6/0 325:2/0/4/0 350:4/0/2/0 375:5/0/1/0 400:6/0/0/0 425:6/0/0/0 450:5/1/0/0 475:5/1/0/0 500:4/2/0/0 525:2/4/0/0 550:0/6/0/0 575:2/4/0/0 600:0/6/0/0 700:0/6/0/0 800:0/6/0/0 900:0/6/0/0 1000:0/6/0/0 1100:0/6/0/0 1200:0/6/0/0 1300:0/6/0/0 1400:0/6/0/0 1500:0/6/0/0 1600:0/6/0/0 1700:0/6/0/0 1800:0/6/0/0 1900:0/6/0/0 2000:0/6/0/0
-    slow edges 468: timed 225, untimed 243, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    slow edges 468: timed 225, untimed 243, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
          merged into one event up to 900 ps; always separate from 1000 ps
          delta(ps):merged/separate/flagged/other 0:0/0/6/0 25:0/0/6/0 50:0/0/6/0 75:0/0/6/0 100:0/0/6/0 125:0/0/6/0 150:0/0/6/0 175:0/0/6/0 200:0/0/6/0 225:0/0/6/0 250:0/0/6/0 275:0/0/6/0 300:0/0/6/0 325:0/0/6/0 350:0/0/6/0 375:0/0/6/0 400:0/0/6/0 425:0/0/6/0 450:0/0/6/0 475:0/0/6/0 500:1/0/5/0 525:3/0/3/0 550:5/0/1/0 575:5/0/1/0 600:5/0/1/0 700:5/1/0/0 800:4/2/0/0 900:1/5/0/0 1000:0/6/0/0 1100:0/6/0/0 1200:0/6/0/0 1300:0/6/0/0 1400:0/6/0/0 1500:0/6/0/0 1600:0/6/0/0 1700:0/6/0/0 1800:0/6/0/0 1900:0/6/0/0 2000:0/6/0/0
-    fast edges 468: timed 367, untimed 101, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    fast edges 468: timed 367, untimed 101, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
          merged into one event up to 350 ps; always separate from 375 ps
          delta(ps):merged/separate/flagged/other 0:0/0/6/0 25:0/0/6/0 50:0/0/6/0 75:0/0/6/0 100:0/0/6/0 125:0/0/6/0 150:0/0/6/0 175:0/0/6/0 200:0/0/6/0 225:3/0/3/0 250:5/0/1/0 275:6/0/0/0 300:5/1/0/0 325:3/3/0/0 350:1/5/0/0 375:0/6/0/0 400:0/6/0/0 425:0/6/0/0 450:0/6/0/0 475:0/6/0/0 500:0/6/0/0 525:0/6/0/0 550:0/6/0/0 575:0/6/0/0 600:0/6/0/0 700:0/6/0/0 800:0/6/0/0 900:0/6/0/0 1000:0/6/0/0 1100:0/6/0/0 1200:0/6/0/0 1300:0/6/0/0 1400:0/6/0/0 1500:0/6/0/0 1600:0/6/0/0 1700:0/6/0/0 1800:0/6/0/0 1900:0/6/0/0 2000:0/6/0/0
     |}]
@@ -206,16 +245,24 @@ let%expect_test "slots = 3 and 4 per bank (random edges at typ, counter selectio
   run (module struct let slots = 3 end);
   run (module struct let slots = 4 end);
   [%expect {|
-    slots 3: typ  edges 2000: timed 1904, untimed 79, lost+flagged 17, bad+flagged 12 | UNFLAGGED: lost 0, phantom 0 | pending 0
-         ring 2610 ps (mean bin 76.8 ps, calibrated bins 33..187 ps), delay pin->capture -458 ps
-         single-edge error: 1864 events, rms 64.3 ps (0.84 bins), worst 182.1 ps (2.37 bins); per-class offsets: rms 49.3 ps (0.64 bins), worst 155.2 ps (2.02 bins); >3 bins: 0
+    slots 3: typ  edges 2000: timed 1904, untimed 79, lost+flagged 17, bad+flagged 12 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+         ring 2610 ps (mean bin 76.8 ps, calibrated on this run: bins 33..187 ps), delay pin->capture -458 ps
+         timing: 1904 of 2000 edges validated within 2 ns (95.2%), 0 timed attributions without an estimate
+         single-pin events: 1864, rms 49.5 ps (0.64 bins), p99 124.0 ps, worst 164.2 ps (2.14 bins), >3 bins 0, >0.5 ns 0, >half a ring period 0
+         multi-pin events: 40 attributions, rms 296.0 ps, worst 534.7 ps
+         per-pin flag latency: 8 errors covered, max 5 cycles (deadline: end of the first 12-cycle quiet stretch)
+         resyncs 2: first event after it loss-marked 0, levels re-baselined by an untimed event 0
          typ  counter selection: 7 samplers: safe phases A [8, 34+4) B [9, 34+4), s=15, smallest margin 6.4 stages; select handoff >= 701 ps after hold, wavefronts in order: true, clock arrival +-0 ps between writes; ok true
          slow counter selection: 7 samplers: safe phases A [8, 34+4) B [9, 34+4), s=15, smallest margin 6.5 stages; select handoff >= 1089 ps after hold, wavefronts in order: true, clock arrival +-0 ps between writes; ok true
          fast counter selection: 7 samplers: safe phases A [8, 34+5) B [9, 34+4), s=15, smallest margin 6.5 stages; select handoff >= 476 ps after hold, wavefronts in order: true, clock arrival +-0 ps between writes; ok true
          status: capture_fault=1 fault_count=2 overflow=0 overflow_count=0 lost_edge=15 lost_edge_count=8 level_mismatch=15 level_mismatch_count=48 merge_error=15 merge_error_count=2 empty_count=21 stale_count=41 runt_count=6 resyncing=0
-    slots 4: typ  edges 2000: timed 1896, untimed 83, lost+flagged 21, bad+flagged 13 | UNFLAGGED: lost 0, phantom 0 | pending 0
-         ring 2610 ps (mean bin 76.8 ps, calibrated bins 26..167 ps), delay pin->capture -490 ps
-         single-edge error: 1858 events, rms 62.2 ps (0.81 bins), worst 192.7 ps (2.51 bins); per-class offsets: rms 47.5 ps (0.62 bins), worst 153.8 ps (2.00 bins); >3 bins: 0
+    slots 4: typ  edges 2000: timed 1896, untimed 83, lost+flagged 21, bad+flagged 13 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+         ring 2610 ps (mean bin 76.8 ps, calibrated on this run: bins 26..167 ps), delay pin->capture -490 ps
+         timing: 1896 of 2000 edges validated within 2 ns (94.8%), 0 timed attributions without an estimate
+         single-pin events: 1858, rms 48.4 ps (0.63 bins), p99 122.9 ps, worst 164.5 ps (2.14 bins), >3 bins 0, >0.5 ns 0, >half a ring period 0
+         multi-pin events: 38 attributions, rms 318.1 ps, worst 566.1 ps
+         per-pin flag latency: 8 errors covered, max 5 cycles (deadline: end of the first 14-cycle quiet stretch)
+         resyncs 3: first event after it loss-marked 0, levels re-baselined by an untimed event 0
          typ  counter selection: 9 samplers: safe phases A [8, 34+5) B [9, 34+4), s=15, smallest margin 6.2 stages; select handoff >= 701 ps after hold, wavefronts in order: true, clock arrival +-0 ps between writes; ok true
          slow counter selection: 9 samplers: safe phases A [8, 34+4) B [9, 34+4), s=15, smallest margin 6.2 stages; select handoff >= 1089 ps after hold, wavefronts in order: true, clock arrival +-0 ps between writes; ok true
          fast counter selection: 9 samplers: safe phases A [8, 34+5) B [9, 34+4), s=15, smallest margin 6.3 stages; select handoff >= 476 ps after hold, wavefronts in order: true, clock arrival +-0 ps between writes; ok true
@@ -232,7 +279,7 @@ let%expect_test "pins high at reset: no false lost_edge with the real edge count
   List.iter r.events ~f:(fun e ->
     printf "cycle %3d: %s pins %x changed %x\n" e.cycle (if e.untimed then "untimed" else "timed  ") e.pins
       e.changed);
-  printf "pin flags: %d; status: %s\n" (List.length r.pin_flags)
+  printf "pin flags: %d; status: %s\n" (List.length r.flags.pin)
     (String.concat ~sep:" " (List.map r.status ~f:(fun (k, v) -> Printf.sprintf "%s=%d" k v)));
   [%expect {|
     cycle  55: timed   pins 4 changed 1
@@ -264,17 +311,29 @@ let%expect_test "regression, flat 1 fF wires: random edges and counter selection
     printf "     counter selection: %s; ok %b\n" (T.pp_margin_summary ms)
       (T.samplers_ok ~min_stages:min_margin_stages ms));
   [%expect {|
-    typ  edges 2000: timed 1798, untimed 49, lost+flagged 153, bad+flagged 134 | UNFLAGGED: lost 0, phantom 0 | pending 0
-         ring 1598 ps (mean bin 47.0 ps, calibrated bins 31..106 ps), delay pin->capture -1876 ps
-         single-edge error: 1772 events, rms 50.4 ps (1.07 bins), worst 149.2 ps (3.18 bins); per-class offsets: rms 37.6 ps (0.80 bins), worst 127.1 ps (2.70 bins); >3 bins: 3
+    typ  edges 2000: timed 1798, untimed 49, lost+flagged 153, bad+flagged 134 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+         ring 1598 ps (mean bin 47.0 ps, calibrated on this run: bins 31..106 ps), delay pin->capture -278 ps
+         timing: 1798 of 2000 edges validated within 2 ns (89.9%), 0 timed attributions without an estimate
+         single-pin events: 1772, rms 38.1 ps (0.81 bins), p99 96.5 ps, worst 134.2 ps (2.86 bins), >3 bins 0, >0.5 ns 0, >half a ring period 0
+         multi-pin events: 26 attributions, rms 187.0 ps, worst 466.4 ps
+         per-pin flag latency: 10 errors covered, max 5 cycles (deadline: end of the first 10-cycle quiet stretch)
+         resyncs 28: first event after it loss-marked 0, levels re-baselined by an untimed event 1
          counter selection: 5 samplers: safe phases A [10, 34+5) B [9, 34+5), s=15, smallest margin 5.2 stages; select handoff >= 595 ps after hold, wavefronts in order: true, clock arrival +-0 ps between writes; ok true
-    slow edges 2000: timed 1803, untimed 71, lost+flagged 126, bad+flagged 99 | UNFLAGGED: lost 0, phantom 0 | pending 0
-         ring 2542 ps (mean bin 74.8 ps, calibrated bins 50..142 ps), delay pin->capture -431 ps
-         single-edge error: 1761 events, rms 81.1 ps (1.08 bins), worst 236.7 ps (3.17 bins); per-class offsets: rms 61.5 ps (0.82 bins), worst 191.7 ps (2.56 bins); >3 bins: 2
+    slow edges 2000: timed 1803, untimed 71, lost+flagged 126, bad+flagged 99 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+         ring 2542 ps (mean bin 74.8 ps, calibrated on this run: bins 50..142 ps), delay pin->capture -431 ps
+         timing: 1803 of 2000 edges validated within 2 ns (90.2%), 0 timed attributions without an estimate
+         single-pin events: 1761, rms 61.4 ps (0.82 bins), p99 153.1 ps, worst 192.6 ps (2.58 bins), >3 bins 0, >0.5 ns 0, >half a ring period 0
+         multi-pin events: 42 attributions, rms 334.4 ps, worst 772.9 ps
+         per-pin flag latency: 8 errors covered, max 5 cycles (deadline: end of the first 10-cycle quiet stretch)
+         resyncs 23: first event after it loss-marked 0, levels re-baselined by an untimed event 1
          counter selection: 5 samplers: safe phases A [10, 34+5) B [9, 34+4), s=15, smallest margin 5.0 stages; select handoff >= 915 ps after hold, wavefronts in order: true, clock arrival +-0 ps between writes; ok true
-    fast edges 2000: timed 1806, untimed 34, lost+flagged 160, bad+flagged 150 | UNFLAGGED: lost 0, phantom 0 | pending 0
-         ring 1068 ps (mean bin 31.4 ps, calibrated bins 21..72 ps), delay pin->capture -2326 ps
-         single-edge error: 1790 events, rms 31.0 ps (0.99 bins), worst 101.1 ps (3.22 bins); per-class offsets: rms 24.0 ps (0.77 bins), worst 70.7 ps (2.25 bins); >3 bins: 1
+    fast edges 2000: timed 1806, untimed 34, lost+flagged 160, bad+flagged 150 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+         ring 1068 ps (mean bin 31.4 ps, calibrated on this run: bins 21..72 ps), delay pin->capture -190 ps
+         timing: 1806 of 2000 edges validated within 2 ns (90.3%), 0 timed attributions without an estimate
+         single-pin events: 1790, rms 23.9 ps (0.76 bins), p99 59.2 ps, worst 80.2 ps (2.55 bins), >3 bins 0, >0.5 ns 0, >half a ring period 0
+         multi-pin events: 16 attributions, rms 118.4 ps, worst 202.9 ps
+         per-pin flag latency: 4 errors covered, max 4 cycles (deadline: end of the first 10-cycle quiet stretch)
+         resyncs 30: first event after it loss-marked 0, levels re-baselined by an untimed event 2
          counter selection: 5 samplers: safe phases A [10, 34+5) B [9, 34+5), s=15, smallest margin 5.3 stages; select handoff >= 406 ps after hold, wavefronts in order: true, clock arrival +-0 ps between writes; ok true
     |}]
 ;;

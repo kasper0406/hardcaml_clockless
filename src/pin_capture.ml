@@ -94,6 +94,14 @@
       [2 * ptr_bits], so more than that many writes to one bank between two
       clock samples cannot be seen by the pointers; the edge counters then
       report the loss (unless a pin lost a multiple of 4 edges).
+      The contract (owner decision D-13): everything unread is discarded, no
+      exact count of lost captures is claimed (the status counter counts
+      overflow marks), the next usable event is marked as following a loss,
+      and the levels are re-established by an untimed report. Not yet
+      implemented: the marks go to the events in flight when the overflow
+      is detected (read before the gap), not to the first event after the
+      resync, and at the end of the resync the drain takes the synchronised
+      levels silently (test/capture_oracle.ml counts both).
     - {b Stale attributions.} Each record also holds every pin delayed by
       a chain of delay cells ([delay], longer than the pin -> capture clock
       delay). A pin attributed to an event must differ from its delayed copy

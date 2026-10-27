@@ -59,8 +59,7 @@ type out =
 
 type result =
   { outs : out list
-  ; pin_flags : (int * int) list
-  ; global_flags : int list
+  ; flags : Capture_oracle.flags
   ; status : Bits.t Cap.Status.t
   ; counts : int array
   (** counted from the [_now] pulses: fault overflow lost_edge level_mismatch
@@ -102,7 +101,9 @@ let run
   let driver = Cap.Model_driver.create ~n ~stages_per_cycle:spc ~initial ~edges ~captures in
   let outs = ref [] in
   let pin_flags = ref [] in
-  let global_flags = ref [] in
+  let faults = ref [] in
+  let resync = ref [] in
+  let runts = ref [] in
   let ptr_resets = ref 0 in
   let counts = Array.create ~len:8 0 in
   let model_ptr nm () =
@@ -124,8 +125,11 @@ let run
     if Bits.to_bool ev.valid then outs := { cycle = c; ev } :: !outs;
     let pf = Bits.(to_int_trunc (st.lost_edge_now |: st.level_mismatch_now |: st.merge_error_now)) in
     if pf <> 0 then pin_flags := (c, pf) :: !pin_flags;
-    if Bits.(to_bool (st.fault_now |: st.runt_now |: st.overflow_now |: st.resyncing)) && k >= 2
-    then global_flags := c :: !global_flags;
+    if k >= 2
+    then (
+      if Bits.(to_bool (st.fault_now |: st.overflow_now)) then faults := c :: !faults;
+      if Bits.to_bool st.resyncing then resync := c :: !resync;
+      if Bits.to_bool st.runt_now then runts := c :: !runts);
     if Bits.to_bool st.ptr_reset then Int.incr ptr_resets;
     let add k x = counts.(k) <- counts.(k) + x in
     let pc x = Bits.(to_int_trunc (popcount x)) in
@@ -139,8 +143,12 @@ let run
     add 7 (b st.runt_now)
   done;
   { outs = List.rev !outs
-  ; pin_flags = List.rev !pin_flags
-  ; global_flags = List.rev !global_flags
+  ; flags =
+      { pin = List.rev !pin_flags
+      ; faults = List.rev !faults
+      ; resync = List.rev !resync
+      ; runts = List.rev !runts
+      }
   ; status = Cap.Status.map o.status ~f:( ! )
   ; counts
   ; ptr_resets = !ptr_resets
@@ -168,6 +176,18 @@ let est_of_time (ev : Bits.t Cap.Event.t) ~cycle =
   base
 ;;
 
+(* The oracle's coverage contract, in cycles, as in Capture_timing. *)
+let windows =
+  { Capture_oracle.in_flight = 4
+  ; back = 4
+  ; before = (2 * Cfg.slots) + 4
+  ; after = 5
+  ; event_age = (2 * Cfg.slots) + 8
+  }
+;;
+
+let quiet_cycles = (2 * Cfg.slots) + 6
+
 let oracle ?(initial = 0) ~edges (r : result) =
   Capture_oracle.check
     ~pins:Cfg.pins
@@ -181,15 +201,17 @@ let oracle ?(initial = 0) ~edges (r : result) =
          ; reconfig = b ev.reconfig
          ; stale = b ev.stale
          ; flagged = flagged ev
+         ; loss_mark = Bits.(to_bool (ev.fault |: ev.overflow))
          ; est = (if Bits.to_bool ev.untimed then None else Some (est_of_time ev ~cycle))
          }))
-    ~pin_flags:r.pin_flags
-    ~global_flags:r.global_flags
+    ~flags:r.flags
     ~cycle_of_time
     ~cycle_time
     ~match_tol:merge_window
-    ~back:4
-    ~fwd:400
+    ~windows
+    ~deadline:
+      (Capture_oracle.deadlines ~quiet_cycles ~end_cycle:r.cycles
+         (List.map edges ~f:(fun (e : Ref.edge) -> cycle_of_time e.time)))
     ~end_cycle:r.cycles
 ;;
 
@@ -284,7 +306,7 @@ let%expect_test "random edges: events equal the Reference's, times exact, zero u
     edges 4000, captures 4000, cancelled toggles 0, reference events 3911 (49 multi-pin), timed events 3911, mismatches 0
     same-pin pulses within the merge window (both captures empty, lost_edge): 19
     status: fault 0 (0) overflow 0 (0) lost_edge f (19) level_mismatch 0 (0) merge_error 0 (0) empty 89 stale 15 resyncing 0
-    edges 4000: timed 3947, untimed 15, lost+flagged 38, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    edges 4000: timed 3947, untimed 15, lost+flagged 38, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
     |}]
 ;;
 
@@ -312,13 +334,13 @@ let%expect_test "two pins delta apart: cancelled, merged into one event, or sepa
       r.counts.(4) (Capture_oracle.pp s));
   [%expect {|
     swallow 2, merge window 5 stages
-    delta  0:  0 timed events (0 attributed to both pins), 8 untimed, empty 0, level_mismatch 16, merge_error 0 | edges 16: timed 0, untimed 16, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
-    delta  1:  0 timed events (0 attributed to both pins), 8 untimed, empty 0, level_mismatch 16, merge_error 0 | edges 16: timed 0, untimed 16, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
-    delta  2:  8 timed events (8 attributed to both pins), 0 untimed, empty 8, level_mismatch 0, merge_error 0 | edges 16: timed 16, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
-    delta  3:  8 timed events (8 attributed to both pins), 0 untimed, empty 8, level_mismatch 0, merge_error 0 | edges 16: timed 16, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
-    delta  5:  8 timed events (8 attributed to both pins), 0 untimed, empty 8, level_mismatch 0, merge_error 0 | edges 16: timed 16, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
-    delta  6: 16 timed events (0 attributed to both pins), 0 untimed, empty 0, level_mismatch 0, merge_error 0 | edges 16: timed 16, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
-    delta 12: 16 timed events (0 attributed to both pins), 0 untimed, empty 0, level_mismatch 0, merge_error 0 | edges 16: timed 16, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    delta  0:  0 timed events (0 attributed to both pins), 8 untimed, empty 0, level_mismatch 16, merge_error 0 | edges 16: timed 0, untimed 16, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    delta  1:  0 timed events (0 attributed to both pins), 8 untimed, empty 0, level_mismatch 16, merge_error 0 | edges 16: timed 0, untimed 16, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    delta  2:  8 timed events (8 attributed to both pins), 0 untimed, empty 8, level_mismatch 0, merge_error 0 | edges 16: timed 16, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    delta  3:  8 timed events (8 attributed to both pins), 0 untimed, empty 8, level_mismatch 0, merge_error 0 | edges 16: timed 16, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    delta  5:  8 timed events (8 attributed to both pins), 0 untimed, empty 8, level_mismatch 0, merge_error 0 | edges 16: timed 16, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    delta  6: 16 timed events (0 attributed to both pins), 0 untimed, empty 0, level_mismatch 0, merge_error 0 | edges 16: timed 16, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    delta 12: 16 timed events (0 attributed to both pins), 0 untimed, empty 0, level_mismatch 0, merge_error 0 | edges 16: timed 16, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
     |}]
 ;;
 
@@ -337,10 +359,12 @@ let%expect_test "bursts overflow the banks: flagged, resynchronised, nothing unf
   print_status r.status r.counts;
   let s = oracle ~edges r in
   print_endline (Capture_oracle.pp s);
+  print_endline (Capture_oracle.pp_resyncs s);
   List.iter (List.take s.errors 10) ~f:print_endline;
   [%expect {|
     status: fault 0 (0) overflow 1 (3385) lost_edge f (72) level_mismatch f (106) merge_error d (2) empty 392 stale 1906 resyncing 0
-    edges 19682: timed 3145, untimed 153, lost+flagged 16384, bad+flagged 5236 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    edges 19682: timed 3145, untimed 153, lost+flagged 16384, bad+flagged 5236 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    resyncs 1393: first event after it loss-marked 0, levels re-baselined by an untimed event 3
     |}]
 ;;
 
@@ -418,6 +442,7 @@ let%expect_test "corrupted pointer: capture_fault, auto-reset, resync, then corr
   printf "pointer reset asserted for %d cycles\n" r.ptr_resets;
   let s = oracle ~edges r in
   print_endline (Capture_oracle.pp s);
+  print_endline (Capture_oracle.pp_resyncs s);
   List.iter (List.take s.errors 10) ~f:print_endline;
   (* After recovery, events agree with the Reference again. *)
   let captures, _ = Ref.captures ~initial:0 ~enabled:all ~merge_window ~swallow edges in
@@ -440,7 +465,8 @@ let%expect_test "corrupted pointer: capture_fault, auto-reset, resync, then corr
   [%expect {|
     status: fault 1 (1) overflow 0 (0) lost_edge 9 (2) level_mismatch 9 (2) merge_error 0 (0) empty 0 stale 2 resyncing 0
     pointer reset asserted for 9 cycles
-    edges 600: timed 594, untimed 1, lost+flagged 5, bad+flagged 5 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    edges 600: timed 594, untimed 1, lost+flagged 5, bad+flagged 5 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    resyncs 2: first event after it loss-marked 0, levels re-baselined by an untimed event 0
     after recovery: 344 events, 344 expected, mismatches 0
     |}]
 ;;
@@ -463,7 +489,7 @@ let%expect_test "a pulse narrower than the XOR: lost_edge on its pin, no event" 
     cycle  66: timed   pins 2 changed 2 reconfig 0 stale 0 time 15078
     cycle  67: timed   pins 0 changed 2 reconfig 0 stale 0 time 15368
     status: fault 0 (0) overflow 0 (0) lost_edge 4 (1) level_mismatch 0 (0) merge_error 0 (0) empty 0 stale 0 resyncing 0
-    edges 4: timed 2, untimed 0, lost+flagged 2, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    edges 4: timed 2, untimed 0, lost+flagged 2, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
     |}]
 ;;
 
@@ -611,7 +637,7 @@ let%expect_test "pins high at reset: edges counted forward, no false lost_edge" 
     cycle 146: timed   pins 2 changed 4 reconfig 0 stale 0 time  6131
     cycle 156: timed   pins a changed 8 reconfig 0 stale 0 time 11541
     status: fault 0 (0) overflow 0 (0) lost_edge 0 (0) level_mismatch 0 (0) merge_error 0 (0) empty 0 stale 0 resyncing 0
-    edges 12: timed 12, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    edges 12: timed 12, untimed 0, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
     |}]
 ;;
 
@@ -632,6 +658,6 @@ let%expect_test "capture balance far below 0 between checks: merge_error, not wr
   print_endline (Capture_oracle.pp (oracle ~edges r));
   [%expect {|
     status: fault 0 (0) overflow 0 (0) lost_edge 1 (1) level_mismatch 0 (0) merge_error e (1) empty 0 stale 0 resyncing 0
-    edges 45: timed 18, untimed 0, lost+flagged 27, bad+flagged 9 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    edges 45: timed 18, untimed 0, lost+flagged 27, bad+flagged 9 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
     |}]
 ;;
