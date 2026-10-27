@@ -347,8 +347,10 @@ module Make (Config : Config) : S = struct
       { O.coarse = mux2 (mode_is Fine) (zero coarse_bits) coarse
       ; fine
       ; range_fault =
-          ~:identity
-          &: (mode_is Coarse &: c_over |: (mode_is Full &: (c_over |: f_over)))
+          mux2
+            identity
+            ((mode_is Coarse |: mode_is Full) &: (f_frac >: uresize max_c ~width:(width f_frac)))
+            (mode_is Coarse &: c_over |: (mode_is Full &: (c_over |: f_over)))
       }
     ;;
   end
@@ -540,7 +542,9 @@ module Make (Config : Config) : S = struct
         let pend = wire 1 in
         let iw = settle_bits + 1 in
         let idle =
-          reg_fb spec ~clear_to:(ones iw) ~width:iw ~f:(fun x ->
+          (* cleared to 0, not saturated: a launch flop reset from 1 sends an
+             edge into its line, so the line counts as busy after a clear *)
+          reg_fb spec ~width:iw ~f:(fun x ->
             mux2 pend (zero iw) (mux2 (x ==: ones iw) x (x +:. 1)))
           -- ln "idle"
         in

@@ -22,7 +22,11 @@ let reference ~a ~scale ~offset ~ratio ~(mode : Vernier.Mode.t) =
   | Fine -> 0, a % 16, false
   | Bypass | Coarse | Full ->
     if scale = 0
-    then Int.min a 39, 0, false
+    then (
+      (* identity: the fraction is the coarse tap; past the last tap clamps
+         and is a range fault in coarse and full mode *)
+      let over = a > 39 in
+      Int.min a 39, 0, over && ([%equal: Vernier.Mode.t] mode Coarse || [%equal: Vernier.Mode.t] mode Full))
     else (
       let p = (((a * scale) + 32) / 64) + offset in
       let c = p / 64 in
@@ -210,6 +214,41 @@ let%expect_test "control: latency, safe select updates, overruns, mode switches"
     |}]
 ;;
 
+let%expect_test "control: lines count as busy after a clear; identity range faults" =
+  let open Sim in
+  (* A launch flop reset from 1 sends an edge into its line, so a mode
+     written right after a clear must wait settle_cycles like any other. *)
+  let t = create () in
+  run t 2;
+  set (List.hd_exn t.i.mode) 2 (Vernier.Mode.to_int Full);
+  t.i.clear := Bits.gnd;
+  let applied = ref None in
+  for k = 1 to 12 do
+    step t;
+    if Option.is_none !applied && get t.o.active_mode 0 = Vernier.Mode.to_int Full then applied := Some k
+  done;
+  printf "Full requested at the clear's release: applied after %d cycles (settle 4)\n" (Option.value_exn !applied);
+  (* identity scale: the fraction is the coarse tap; past the last (39) is a
+     range fault, not a silent clamp *)
+  List.iter t.i.scale ~f:(fun p -> set p V.scale_bits 0);
+  List.iter [ 39; 45 ] ~f:(fun fraction ->
+    set (List.hd_exn t.i.clear_flags) 1 1;
+    run t 8;
+    set (List.hd_exn t.i.clear_flags) 1 0;
+    run t 8;
+    set (List.hd_exn t.i.fraction) 8 fraction;
+    set (List.hd_exn t.i.level) 1 (1 - get t.o.out 0);
+    run t 8;
+    printf "identity, full mode, fraction %d: range_fault %d, fallback %d\n" fraction (get t.o.range_fault 0)
+      (get t.o.fallback 0));
+  Queue.clear t.toggles;
+  [%expect {|
+    Full requested at the clear's release: applied after 4 cycles (settle 4)
+    identity, full mode, fraction 39: range_fault 0, fallback 0
+    identity, full mode, fraction 45: range_fault 1, fallback 1
+    |}]
+;;
+
 let%expect_test "control: mapped fractions on the ideal model land at a / 256 of a cycle" =
   let open Sim in
   let t = create () in
@@ -289,7 +328,11 @@ let%expect_test "Sdc.vernier: false paths through the XOR outputs; dont-touch co
   [%expect {|
     # hardcaml_clockless islands (PnR): append after the system clock is created.
     set_false_path -through [get_pins {vernier_p0_xor/X}]
+    set_false_path -through [get_pins {vernier_p0_r_fbyp/X}]
+    set_false_path -through [get_pins {vernier_p0_f_fbyp/X}]
     set_false_path -through [get_pins {vernier_p1_xor/X}]
+    set_false_path -through [get_pins {vernier_p1_r_fbyp/X}]
+    set_false_path -through [get_pins {vernier_p1_f_fbyp/X}]
     protected nets: 942, e.g. vernier_p0_r_cm6_0__X
     |}]
 ;;

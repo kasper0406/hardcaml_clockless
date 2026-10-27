@@ -422,14 +422,19 @@ let pin_capture t ~name ~pins ~min_edge_spacing_ns =
 (** A {!Vernier} instance [name] with [pins] pins. Its lines are
     asynchronous delay paths from the launch flops ([<name>_p<i>_{r,f}_launch])
     to the pin, and their tap selects change only while no edge is in flight,
-    so none of these paths is a single-cycle path. A false path through each
-    pin's XOR output ([<name>_p<i>_xor]) removes all of them (launch -> line
-    -> pin and loopback, select -> tap muxes -> pin) and leaves the
-    synchronous bypass path (level flop -> output mux -> pin) timed. The
-    cells themselves are protected like every [dont_touch] instance. *)
+    so none of these paths is a single-cycle path. False paths through each
+    pin's XOR output ([<name>_p<i>_xor]) and each line's output
+    ([<name>_p<i>_{r,f}_fbyp], the calibration loopback taps) remove all of
+    them (launch -> line -> pin and loopback, select -> tap muxes -> pin and
+    loopback) and leave the synchronous bypass path (level flop -> output mux
+    -> pin) timed. The cells themselves are protected like every
+    [dont_touch] instance. *)
 let vernier t ~name ~pins =
   List.fold (List.init pins ~f:Fn.id) ~init:t ~f:(fun t i ->
-    false_path_through t (output_pin t (Printf.sprintf "%s_p%d_xor" name i)))
+    List.fold
+      [ "xor"; "r_fbyp"; "f_fbyp" ]
+      ~init:t
+      ~f:(fun t s -> false_path_through t (output_pin t (Printf.sprintf "%s_p%d_%s" name i s))))
 ;;
 
 (* --- Outputs --- *)
