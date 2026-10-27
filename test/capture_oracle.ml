@@ -38,18 +38,19 @@
    lost on one pin with no level change are invisible to the level and
    count checks.
 
-   Overflow contract (owner decision D-13): an overflow discards everything
-   unread and resynchronises; the next usable event is marked as following
-   a loss, the pin levels are re-established by an untimed report, and no
-   exact count of lost captures is claimed from the overflow alone (the
-   status counter counts overflow marks, not captures). The coverage above
-   implements the first and last parts. For the other two the oracle counts,
-   per resync, whether the first event after it is marked although no new
-   fault or overflow is pending, and whether an untimed event re-baselined
-   the levels in between ({!pp_resyncs}). Pin_capture currently does
-   neither: it marks the events in flight when the overflow is detected
-   (those read before the gap), and takes the synchronised levels silently
-   when the resync ends. *)
+   Overflow contract (owner decision D-13): an overflow (or a fault, a torn
+   record or an implausible time) discards everything unread and
+   resynchronises; the first event delivered after the resync carries the
+   [lost] mark; the pin levels are re-established silently from the
+   synchronised levels (an untimed baseline, no event: as bitbanger's
+   model, D58); and no exact count of lost captures is claimed (the status
+   counter counts detections, not captures). The coverage above implements
+   the discarding and the counts. The mark is checked: for every resync
+   that follows a fault or overflow pulse, the first event that leaves
+   after the events in flight at its end ([resync_in_flight] cycles) must
+   carry it; one that does not is an error ({!ok}). A resync with no event
+   after it before the end of the run is pending. A [lost] event is not
+   otherwise distrusted: it was read after the gap. *)
 
 open! Base
 
@@ -67,7 +68,7 @@ type event =
   ; reconfig : int
   ; stale : int (* level reported without a time *)
   ; flagged : bool (* fault, overflow, order or pattern error *)
-  ; loss_mark : bool (* fault or overflow mark (the D-13 loss tag) *)
+  ; loss_mark : bool (* the D-13 [lost] mark *)
   ; est : int option (* absolute capture time estimate, timed events *)
   }
 
@@ -100,9 +101,9 @@ type summary =
   ; no_estimate : int (* timed attributions without a time estimate *)
   ; pending : int (* too close to the end to judge *)
   ; latencies : int list (* per-pin flag latency (cycles after [c]) of each error it covers *)
-  ; resyncs : int (* resync episodes *)
-  ; resync_next_marked : int (* ... whose first event after is marked, with no new fault pending *)
-  ; resync_rebaselined : int (* ... with an untimed event from the resync to that event *)
+  ; resyncs : int (* resync episodes that follow a fault or overflow pulse *)
+  ; resync_marked : int (* ... whose first event after carries [lost] *)
+  ; resync_unmarked : int (* ... whose first event after does not: an error *)
   ; matches : (event * edge * int) list (* timed event, its edge, edges in the event *)
   ; errors : string list (* the unflagged errors *)
   }
@@ -117,11 +118,18 @@ let pp s =
 
 let pp_resyncs s =
   Printf.sprintf
-    "resyncs %d: first event after it loss-marked %d, levels re-baselined by an untimed event %d"
-    s.resyncs s.resync_next_marked s.resync_rebaselined
+    "resyncs after a loss %d: first event after it marked lost %d, NOT MARKED %d (D-13)"
+    s.resyncs s.resync_marked s.resync_unmarked
 ;;
 
-let ok s = s.unflagged_lost = 0 && s.unflagged_phantom = 0 && s.pending = 0
+let ok s =
+  s.unflagged_lost = 0 && s.unflagged_phantom = 0 && s.pending = 0 && s.resync_unmarked = 0
+;;
+
+(* Cycles after the last resync cycle in which events read before the
+   resync can still leave (3 pipeline stages, read in the cycle that
+   started it). *)
+let resync_in_flight = 2
 
 (* [deadlines ~quiet_cycles ~end_cycle edge_cycles]: for each cycle [c], the
    end of the first stretch of [quiet_cycles] cycles without an edge that
@@ -339,10 +347,10 @@ let check
            (if Poly.equal j `Late then " (late flag)" else "")
            e.pin e.time c e.level
          :: !errors);
-  (* Per resync episode (a run of [resync] cycles): does the first event
-     after it carry a fault/overflow mark although no new fault or overflow
-     is pending (a loss mark), and is it an untimed report of every pin's
-     right level (a re-baseline)? *)
+  (* Per resync episode (a run of [resync] cycles) that a fault or
+     overflow pulse started (the status pulse is registered, so it shows in
+     the episode's first cycle, give or take one): does the first event
+     after it carry [lost]? *)
   let episodes =
     List.fold (Array.to_list resync) ~init:[] ~f:(fun acc c ->
       match acc with
@@ -350,32 +358,18 @@ let check
       | _ -> (c, c) :: acc)
     |> List.rev
   in
-  (* An untimed event reports every pin's level as sampled [untimed_lag]
-     cycles before it leaves: right for every pin? *)
-  let levels_ok (ev : event) =
-    let t = cycle_time (ev.cycle - untimed_lag) in
-    Array.for_alli queue ~f:(fun i q ->
-      let level =
-        match Array.binary_search q ~compare:(fun (e : edge) t -> Int.compare e.time t) `Last_less_than_or_equal_to t with
-        | Some k -> q.(k).level
-        | None -> if Array.is_empty q then ev.pins land (1 lsl i) <> 0 else not q.(0).level
-      in
-      Bool.equal level (ev.pins land (1 lsl i) <> 0))
+  let pulses = sorted flags.faults in
+  let after_loss =
+    List.filter episodes ~f:(fun (lo, _) ->
+      match first_in pulses (lo - 1) with
+      | Some f -> f <= lo + 1
+      | None -> false)
   in
-  let after_resync =
-    let evs = List.sort events ~compare:(fun (a : event) b -> Int.compare a.cycle b.cycle) in
-    let pulses = sorted flags.faults in
-    List.map episodes ~f:(fun (_, hi) ->
-      match List.find evs ~f:(fun e -> e.cycle > hi) with
-      | None -> false, false
-      | Some next ->
-        let new_pulse =
-          match first_in pulses (next.cycle - 4) with
-          | Some f -> f <= next.cycle + 1 (* the status pulse is registered *)
-          | None -> false
-        in
-        ( next.loss_mark && not new_pulse
-        , next.untimed && levels_ok next ))
+  let evs = List.sort events ~compare:(fun (a : event) b -> Int.compare a.cycle b.cycle) in
+  let marks =
+    List.filter_map after_loss ~f:(fun (_, hi) ->
+      List.find evs ~f:(fun e -> e.cycle > hi + resync_in_flight)
+      |> Option.map ~f:(fun e -> e.loss_mark))
   in
   { edges = List.length edges
   ; timed = !timed
@@ -388,9 +382,9 @@ let check
   ; no_estimate = !no_estimate
   ; pending = !pending
   ; latencies = !latencies
-  ; resyncs = List.length episodes
-  ; resync_next_marked = List.count after_resync ~f:fst
-  ; resync_rebaselined = List.count after_resync ~f:snd
+  ; resyncs = List.length after_loss
+  ; resync_marked = List.count marks ~f:Fn.id
+  ; resync_unmarked = List.count marks ~f:not
   ; matches = List.rev !matches
   ; errors = List.rev !errors
   }

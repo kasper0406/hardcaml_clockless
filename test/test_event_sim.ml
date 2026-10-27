@@ -1619,3 +1619,44 @@ library (rr) {
      (kind (Recovery_removal (edge_time 5000000) (window (-10000 10000)))))
     |}]
 ;;
+
+(* --- Pre-layout preset, registers resolving X ------------------------------ *)
+
+let%expect_test "pre_layout preset; a register that loads X resolves only with reg_resolves_x" =
+  (* the fields that differ from [default] *)
+  let fields c =
+    match Sim.Config.sexp_of_t c with
+    | Sexp.List xs -> List.map xs ~f:Sexp.to_string
+    | Atom _ -> []
+  in
+  List.iter2_exn (fields Sim.Config.default) (fields Sim.Config.pre_layout) ~f:(fun a b ->
+    if not (String.equal a b) then print_endline b);
+  (* A register clocked once, loading a flop's Q that is still X (never
+     clocked). *)
+  let lib = (force tlib).library in
+  let clock = Signal.input "clock" 1 in
+  let q =
+    Cell.Flop.instantiate lib
+      { cell = "sg13cmos5l_dfrbpq_1"; clk = "CLK"; d = "D"; reset_n = "RESET_B"; q = "Q" }
+      ~instance:"ff" ~clk:Signal.gnd ~reset_n:Signal.vdd Signal.vdd
+  in
+  let circuit =
+    Circuit.create_exn ~name:"x" [ Signal.output "r" (Signal.reg (Signal.Reg_spec.create ~clock ()) q) ]
+  in
+  List.iter [ false; true ] ~f:(fun reg_resolves_x ->
+    let sim = Sim.create ~config:{ Sim.Config.default with reg_resolves_x } (force tlib) circuit in
+    Sim.set_input sim "clock" V0 ~at:0;
+    Sim.set_input sim "clock" V1 ~at:(Sim.of_ns 10.);
+    Sim.run_until sim (Sim.of_ns 20.);
+    printf "reg_resolves_x %b: r = %s, resolved %d\n" reg_resolves_x
+      (Sexp.to_string (Sim.Value.sexp_of_t (Sim.value sim "r")))
+      (Sim.reg_x_resolutions sim));
+  [%expect {|
+    (wire_load Liberty_default)
+    (reg_resolves_x true)
+    (pulse_width_check Log)
+    (recovery_removal_check Log)
+    reg_resolves_x false: r = X, resolved 0
+    reg_resolves_x true: r = V1, resolved 1
+    |}]
+;;

@@ -12,13 +12,14 @@
             +--> edge counter: toggle on rise, toggle on fall (2-bit Gray), clocked by the pin
      ring nodes, counters A/B --> buf --> slot D muxes
 
-     bank: Johnson write pointer + [slots] records {nodes, count_a, count_b, pins},
-           each bit a flop whose D is mux(selected, new, Q): the clock is never gated.
+     bank: Johnson write pointer + [slots] records {nodes, count_a, count_b, pins, delayed, tag},
+           each bit a flop whose D is mux(selected, new, Q): the clock is never gated;
+           the tag (the write pointer) is selected through a longer buffer chain.
 
      drain (clk): 2-flop syncs of pointers, edge counters, levels, merged level
            -> read the next bank in turn (rising and falling toggles alternate)
            -> attribution = snapshot xor previous snapshot
-           -> ring decode (Ring.decode) -> checks -> event
+           -> tag check, ring decode (Ring.decode) -> checks -> plausibility -> event
     v}
 
     {2 Front}
@@ -85,23 +86,61 @@
       more than alternation allows, sets the sticky [capture_fault], counts,
       marks events in the pipeline, and resynchronises: the drain discards
       what is unread, waits until pointers and levels are stable for two
-      cycles, and restarts from there (the next bank from the merged level).
-      A pointer that stays invalid is reset ([ptr_reset_n], auto-reset).
-    - {b Overflow.} A bank with more than [slots] unread records, or a write
-      pointer that has passed the slot of an event that was being read
-      (checked when the event leaves the pipeline), sets [overflow], marks
-      the events in the pipeline and resynchronises. The pointer range is
-      [2 * ptr_bits], so more than that many writes to one bank between two
-      clock samples cannot be seen by the pointers; the edge counters then
-      report the loss (unless a pin lost a multiple of 4 edges).
-      The contract (owner decision D-13): everything unread is discarded, no
-      exact count of lost captures is claimed (the status counter counts
-      overflow marks), the next usable event is marked as following a loss,
-      and the levels are re-established by an untimed report. Not yet
-      implemented: the marks go to the events in flight when the overflow
-      is detected (read before the gap), not to the first event after the
-      resync, and at the end of the resync the drain takes the synchronised
-      levels silently (test/capture_oracle.ml counts both).
+      cycles (and any pointer reset is over), and restarts from there (the
+      next bank from the merged level). A pointer that stays invalid is
+      reset ([ptr_reset_n], auto-reset).
+    - {b Torn records.} A slot's data muxes turn to the fresh values only
+      after the previous write to its bank has moved the pointer and the
+      select (clock-to-Q, the select XORs, buffers, mux: ~1.1 ns typ, ~1.9
+      ns slow). Two writes to one bank closer than that (three merged
+      toggles: two pulse widths) load a record whose bits are partly the
+      slot's old record, partly fresh, some metastable: a {e torn} record.
+      Its pins may be right and its time wrong by anything (the gate found
+      a stale Gray bit, 1.9 us off, at slow). It cannot be prevented (pulses
+      can be shorter than any select path), so it is detected: each record
+      holds a {e tag}, the bank's write pointer at the write, loaded through
+      the slot's select delayed by [tag_lag_buffers] more buffers. A tag D
+      turns fresh after, and stale after, every other D of its slot, by
+      more than the flop's setup plus hold (measured with clock skew at
+      three corners, test/test_pin_capture_timing.ml). So if a tag bit that
+      changes took its new value, every other bit was settled before the
+      clock; a read whose tag is not its index's code is torn: a capture
+      fault (event [fault], [capture_fault], counted also as [Torn]), with a
+      resync. A tag of a later write to the slot is an overwrite instead
+      ([overflow]). The check is conservative: a write within the tag's
+      longer deselect also flags the record before it (clean), so bursts
+      with two writes to one bank within ~2.7 ns (slow) lose a few events.
+      A torn write leaves a mixture of old and new tag bits in its slot,
+      which a second torn write to the slot could leave in place and match;
+      so a torn record (or an implausible time, below) also resets the
+      pointers and tags (tags reset to an invalid pointer code), as the
+      pointer auto-reset does. Not covered: chains of torn writes to one
+      slot inside a single resync, and same-bank clocks closer than the
+      pointer's clock-to-Q.
+    - {b Plausibility.} [I.ring_time] is the same ring's clk sampler time.
+      An event's time must lie at least one clock cycle and at most
+      [plausible_cycles] before it (in ring stages, scaled by
+      [ring_time]'s per-cycle step); otherwise the event is [implausible],
+      counted, the events in flight are marked [fault], and the drain
+      resynchronises and resets the pointers and tags. A backstop for wrong
+      times the tag check misses: it catches errors outside a window of
+      [plausible_cycles] clock cycles out of the ring's range (2^count_width
+      periods), so it is weakest at fast corners.
+    - {b Overflow.} A bank with more than [slots] unread records, an
+      overwritten tag, or a write pointer that has passed the slot of an
+      event that was being read (checked when the event leaves the
+      pipeline; that event and those read after it are marked) sets
+      [overflow] and resynchronises. The pointer range is [2 * ptr_bits], so
+      more than that many writes to one bank between two clock samples
+      cannot be seen by the pointers; the edge counters then report the loss
+      (unless a pin lost a multiple of 4 edges).
+    - {b Resync and loss (owner decision D-13).} A capture fault, torn
+      record, overflow or implausible time discards everything unread. The
+      first event delivered after the resync carries [lost] (edges before
+      it may be missing). The levels are re-established silently from the
+      synchronised levels, as bitbanger's model does (D58): there is no
+      untimed re-baseline event. No exact count of lost captures is claimed
+      (the status counter counts detections, not captures).
     - {b Stale attributions.} Each record also holds every pin delayed by
       a chain of delay cells ([delay], longer than the pin -> capture clock
       delay). A pin attributed to an event must differ from its delayed copy
@@ -330,6 +369,18 @@ module Make (C : Config) (R : Ring.S) = struct
   let slot_width = Int.max 1 (num_bits_to_represent (slots - 1))
   let capture_count_width = num_bits_to_represent model_captures
 
+  (* Buffers between a slot's select net and its tag muxes (Front_cells). *)
+  let tag_lag_buffers = 3
+
+  (* Record tags are stored XOR-ed with this, so that the pointer reset,
+     which clears them, leaves an invalid pointer code (no record tag
+     matches it). *)
+  let tag_reset = 0b010
+
+  (** Most clock cycles of ring time from a capture to the clk sampler's
+      time when its event leaves (the plausibility check). *)
+  let plausible_cycles = (2 * slots) + 8
+
   (** One capture: the ring state and the pin levels. *)
   module Record = struct
     type 'a t =
@@ -338,6 +389,9 @@ module Make (C : Config) (R : Ring.S) = struct
       ; count_b : 'a [@bits R.counter_width]
       ; pins : 'a [@bits pins]
       ; delayed : 'a [@bits pins] (** pins through the recent-edge delay *)
+      ; tag : 'a [@bits ptr_bits]
+      (** the bank's write pointer at the write, loaded through a select
+          that lags every other bit's (see {e Torn records}) *)
       }
     [@@deriving hardcaml]
   end
@@ -456,12 +510,14 @@ module Make (C : Config) (R : Ring.S) = struct
                (List.init pins ~f:(fun i ->
                   let line = Delay_line.create lib ~name:(n "dly%d" i) ~cell ~length:count (pin i) in
                   buf (n "ddly%d" i) line.taps.(count - 1))))
+        ; tag = zero ptr_bits (* per bank, below *)
         }
       in
-      let field_names = Record.(to_list (map port_names ~f:Fn.id)) in
+      (* Every field but the tag, which each bank loads from its own pointer. *)
+      let field_names = Record.(to_list (map port_names ~f:Fn.id)) |> List.drop_last_exn in
       let fresh_bits =
         List.concat
-          (List.map2_exn field_names (Record.to_list fresh) ~f:(fun f s ->
+          (List.map2_exn field_names (Record.to_list fresh |> List.drop_last_exn) ~f:(fun f s ->
              List.mapi (bits_lsb s) ~f:(fun i b -> Printf.sprintf "%s%d" f i, b)))
       in
       let flops_per_bank = (slots * record_width) + ptr_bits in
@@ -512,9 +568,30 @@ module Make (C : Config) (R : Ring.S) = struct
             in
             bufs, high)
         in
+        (* The tag's select: a data select buffer of the slot (the first,
+           which carries the most loads) through [tag_lag_buffers] more
+           buffers, so that a tag bit's D turns fresh after every other
+           bit's of the slot. *)
+        let tag_selects =
+          let cache = Hashtbl.create (module Int) in
+          List.mapi sel_buffers ~f:(fun k (bufs, _) ->
+            let key = if slots = 2 then 0 else k in
+            Hashtbl.find_or_add cache key ~default:(fun () ->
+              List.fold (List.init tag_lag_buffers ~f:Fn.id) ~init:bufs.(0) ~f:(fun x m ->
+                buf (n "%s_tagsel%d_buf%d" tag key m) x)))
+        in
         let slot_records =
           List.mapi sel_buffers ~f:(fun slot (bufs, high) ->
             let count = ref 0 in
+            let bit ?(reset_n = vdd) ~sel ~bit_name fresh_bit =
+              let qw = wire 1 in
+              let inst = n "%s_s%d_%s" tag slot bit_name in
+              let a0, a1 = if high then qw, fresh_bit else fresh_bit, qw in
+              let dm = mux (inst ^ "_mux") ~s:sel ~a0 ~a1 in
+              let qf = flop inst ~clk:(next_leaf ()) ~reset_n dm in
+              Signal.assign qw qf;
+              qf
+            in
             let bits =
               List.map fresh_bits ~f:(fun (bit_name, fresh_bit) ->
                 (* Spread the loads over the buffers; with 2 slots both
@@ -522,15 +599,19 @@ module Make (C : Config) (R : Ring.S) = struct
                 let k = if slots = 2 then (slot * record_width) + !count else !count in
                 let sel = bufs.(k % Array.length bufs) in
                 Int.incr count;
-                let qw = wire 1 in
-                let inst = n "%s_s%d_%s" tag slot bit_name in
-                let a0, a1 = if high then qw, fresh_bit else fresh_bit, qw in
-                let dm = mux (inst ^ "_mux") ~s:sel ~a0 ~a1 in
-                let qf = flop inst ~clk:(next_leaf ()) ~reset_n:vdd dm in
-                Signal.assign qw qf;
-                qf)
+                bit ~sel ~bit_name fresh_bit)
             in
-            Record.Of_signal.unpack (concat_lsb bits))
+            let tag_bits =
+              List.init ptr_bits ~f:(fun i ->
+                (* stored as [tag xor tag_reset]: reset with the pointers to an
+                   invalid code *)
+                let fresh =
+                  if (tag_reset lsr i) land 1 = 1 then inv (n "%s_s%d_tag%d_inv" tag slot i) q.:(i) else q.:(i)
+                in
+                bit ~reset_n:ptr_reset_n ~sel:(List.nth_exn tag_selects slot)
+                  ~bit_name:(Printf.sprintf "tag%d" i) fresh)
+            in
+            Record.Of_signal.unpack (concat_lsb (bits @ tag_bits)))
         in
         q, slot_records
       in
@@ -569,7 +650,10 @@ module Make (C : Config) (R : Ring.S) = struct
       let ptr_f = wire ptr_bits in
       let slots_r = List.init slots ~f:(fun _ -> Record.Of_signal.wires ()) in
       let slots_f = List.init slots ~f:(fun _ -> Record.Of_signal.wires ()) in
-      let write ptr records cap en =
+      let write ptr records (cap : Signal.t Record.t) en =
+        (* The tag is the pointer at the write; the stimulus's tag is XOR-ed
+           in (fault injection: a torn record). *)
+        let cap = { cap with tag = ptr ^: cap.tag ^: of_int_trunc ~width:ptr_bits tag_reset } in
         let slot = Pointer.slot_of_index ~slots (Pointer.to_index ~slots ptr) in
         let records =
           List.mapi records ~f:(fun k r -> Record.Of_signal.mux2 (en &: (slot ==:. k)) cap r)
@@ -591,8 +675,12 @@ module Make (C : Config) (R : Ring.S) = struct
       in
       ptr_reg ptr_r pr s.corrupt_r "model_ptr_r";
       ptr_reg ptr_f pf s.corrupt_f "model_ptr_f";
-      List.iter2_exn slots_r sr ~f:(fun w x -> Record.Of_signal.assign w (Record.Of_signal.reg spec x));
-      List.iter2_exn slots_f sf ~f:(fun w x -> Record.Of_signal.assign w (Record.Of_signal.reg spec x));
+      (* tags reset with the pointers, as the cells' *)
+      let slot_reg (x : Signal.t Record.t) =
+        Record.Of_signal.reg spec { x with tag = mux2 ptr_reset (zero ptr_bits) x.tag }
+      in
+      List.iter2_exn slots_r sr ~f:(fun w x -> Record.Of_signal.assign w (slot_reg x));
+      List.iter2_exn slots_f sf ~f:(fun w x -> Record.Of_signal.assign w (slot_reg x));
       { Front.ptr_r; ptr_f; slots_r; slots_f; edges = s.edges; levels = s.levels; merged = m }
     ;;
   end
@@ -614,10 +702,14 @@ module Make (C : Config) (R : Ring.S) = struct
       ; mutable edge_flops : int (** as the cells: bit 2i toggles on a rise of pin i, 2i+1 on a fall *)
       ; mutable corrupt_r : int
       ; mutable corrupt_f : int
+      ; mutable tag_xor : int
+      ; mutable count_offset : int
+      ; n : int
       }
 
     let create ~n ~stages_per_cycle ~initial ~edges ~captures =
       { ring = Ring.Ideal.create ~n ~stages:R.max_length
+      ; n
       ; stages_per_cycle
       ; edges = Reference.sort_edges edges
       ; captures =
@@ -628,6 +720,8 @@ module Make (C : Config) (R : Ring.S) = struct
       ; edge_flops = 0
       ; corrupt_r = 0
       ; corrupt_f = 0
+      ; tag_xor = 0
+      ; count_offset = 0
       }
     ;;
 
@@ -637,7 +731,23 @@ module Make (C : Config) (R : Ring.S) = struct
       t.corrupt_f <- f
     ;;
 
+    (** Fault injection into the next capture: XOR [tag] into its tag (a
+        torn record) and add [periods] to both its counters (a wrong time
+        with a valid tag). *)
+    let corrupt_next_capture ?(tag = 0) ?(periods = 0) t =
+      t.tag_xor <- tag;
+      t.count_offset <- periods
+    ;;
+
     let now t = t.cycle * t.stages_per_cycle
+
+    (** [I.ring_time] for the next edge (call before {!cycle}): the clk sampler's output, which
+        shows the ring as sampled two edges earlier (two synchroniser
+        stages and the decode register). *)
+    let ring_time t =
+      let modulus = (1 lsl R.count_width) * 2 * t.n in
+      Int.max 0 ((t.cycle - 1) * t.stages_per_cycle + t.n - 1) % modulus
+    ;;
 
     let cycle t (s : Bits.t ref Model_stimulus.t) =
       let t1 = (t.cycle + 1) * t.stages_per_cycle in
@@ -656,8 +766,22 @@ module Make (C : Config) (R : Ring.S) = struct
           let nodes =
             Array.foldi t.ring.nodes ~init:0 ~f:(fun i acc v -> if v then acc lor (1 lsl i) else acc)
           in
-          let enc c = Ring.Counter.encode_int ~johnson_bits:R.johnson_bits ~gray_width:R.gray_width c in
-          { Record.nodes; count_a = enc a; count_b = enc b; pins = c.snapshot; delayed = c.delayed })
+          let enc c =
+            Ring.Counter.encode_int ~johnson_bits:R.johnson_bits ~gray_width:R.gray_width
+              (c + t.count_offset)
+          in
+          let r =
+            { Record.nodes
+            ; count_a = enc a
+            ; count_b = enc b
+            ; pins = c.snapshot
+            ; delayed = c.delayed
+            ; tag = t.tag_xor
+            }
+          in
+          t.tag_xor <- 0;
+          t.count_offset <- 0;
+          r)
       in
       while t.ring.time < t1 - 1 do
         Ring.Ideal.step t.ring
@@ -671,7 +795,7 @@ module Make (C : Config) (R : Ring.S) = struct
       let set r w v = r := Bits.of_int_trunc ~width:w v in
       set s.captures capture_count_width (List.length records);
       List.iteri s.capture ~f:(fun k (cap : Bits.t ref Record.t) ->
-        let rc = List.nth records k |> Option.value ~default:{ Record.nodes = 0; count_a = 0; count_b = 0; pins = 0; delayed = 0 } in
+        let rc = List.nth records k |> Option.value ~default:{ Record.nodes = 0; count_a = 0; count_b = 0; pins = 0; delayed = 0; tag = 0 } in
         Record.iter2 cap (Record.map2 rc Record.port_widths ~f:(fun v w -> v, w)) ~f:(fun r (v, w) -> set r w v));
       set s.edges (2 * pins) t.edge_flops;
       set s.levels pins t.levels;
@@ -699,8 +823,15 @@ module Make (C : Config) (R : Ring.S) = struct
       ; periods : 'a [@bits R.count_width]
       ; pattern_error : 'a
       ; order_error : 'a
-      ; overflow : 'a (** possibly overwritten, or read just before an overflow *)
-      ; fault : 'a (** read just before a capture fault *)
+      ; overflow : 'a (** possibly overwritten (its slot was reused before it left) *)
+      ; fault : 'a (** a torn record, or read just before a capture fault *)
+      ; implausible : 'a
+      (** its time is not within the capture latency before the read
+          (checked against [I.ring_time]) *)
+      ; lost : 'a
+      (** the first event after a resync that discarded unread captures
+          (fault, torn record, overflow or implausible time): edges before
+          it may be missing *)
       }
     [@@deriving hardcaml]
   end
@@ -717,6 +848,8 @@ module Make (C : Config) (R : Ring.S) = struct
       | Empty
       | Stale
       | Runt
+      | Torn
+      | Implausible
     [@@deriving sexp_of, compare, equal, enumerate]
 
     let code t = List.find_mapi_exn all ~f:(fun i x -> Option.some_if (equal x t) i)
@@ -726,14 +859,17 @@ module Make (C : Config) (R : Ring.S) = struct
   module Status = struct
     type 'a t =
       { resyncing : 'a
-      ; capture_fault : 'a (** sticky *)
+      ; capture_fault : 'a (** sticky: invalid pointer, bank imbalance or torn record *)
       ; overflow : 'a (** sticky *)
+      ; implausible : 'a (** sticky *)
       ; lost_edge : 'a [@bits pins] (** sticky, per pin *)
       ; level_mismatch : 'a [@bits pins] (** sticky, per pin *)
       ; merge_error : 'a [@bits pins]
       (** sticky, per pin: attributions not matched by captures (edges that
           cancelled in the XOR were attributed to a later capture) *)
-      ; fault_now : 'a
+      ; fault_now : 'a (** a capture fault (torn records included) *)
+      ; torn_now : 'a (** a record's tag did not match its read: torn or overwritten *)
+      ; implausible_now : 'a
       ; runt_now : 'a
       (** a bank missed a toggle the other saw (read order re-aligned) *)
       ; empty_now : 'a (** an empty capture was dropped *)
@@ -761,6 +897,10 @@ module Make (C : Config) (R : Ring.S) = struct
       ; length_sel : 'a [@bits R.select_width]
       ; count_select : 'a [@bits Count_source.width] (** a {!Count_source.code} *)
       ; ring : 'a R.State.t [@rtlmangle "_"] (** unused in [Model] mode *)
+      ; ring_time : 'a [@bits R.time_width]
+      (** the same ring's {!Ring.S.Clk_sampler} [time] (same [length_sel]),
+          for the plausibility check *)
+      ; ring_time_valid : 'a (** its [valid] and not [pattern_error] *)
       }
     [@@deriving hardcaml]
   end
@@ -796,12 +936,13 @@ module Make (C : Config) (R : Ring.S) = struct
         ; stale : 'a [@bits pins]
         ; overflow : 'a
         ; fault : 'a
+        ; lost : 'a (** entered the pipeline first after a resync's start *)
         }
       [@@deriving hardcaml]
     end
 
     let create ?first_stage ~name scope ~clock ~clear ~clear_status ~pin_enable ~length_sel
-      ~count_select (front : Signal.t Front.t)
+      ~count_select ~ring_time ~ring_time_valid (front : Signal.t Front.t)
       =
       let ( -- ) = Scope.naming scope in
       let spec = Reg_spec.create ~clock () in
@@ -900,6 +1041,25 @@ module Make (C : Config) (R : Ring.S) = struct
       let record =
         Record.Of_signal.unpack (mux2 next_f (pick front.slots_f) (pick front.slots_r))
       in
+      (* Torn records (see the module doc): the tag must be the read index's
+         code. *)
+      let tag_of ~ahead =
+        mux rd
+          (List.init ptr_range ~f:(fun m ->
+             of_int_trunc ~width:ptr_bits (Pointer.code_of_index ~slots (m + ahead) lxor tag_reset)))
+      in
+      (* The tag of a later write to the slot: overwritten before the read
+         (the pointers show it up to two cycles late). With 3 or 4 slots
+         that is also the tag the slot held before, so a torn write that
+         left the whole tag old counts as an overwrite (both resynchronise
+         and re-arm the tags). *)
+      let ovf_tag =
+        do_read
+        &: (List.init ((ptr_range / slots) - 1) ~f:(fun j -> record.tag ==: tag_of ~ahead:((j + 1) * slots))
+            |> List.reduce_exn ~f:( |: ))
+        |> fun x -> x -- "ovf_tag"
+      in
+      let torn = do_read &: ~:ovf_tag &: (record.tag <>: tag_of ~ahead:0) |> fun x -> x -- "torn" in
       let diff = record.pins ^: prev_snap -- "diff" in
       let stale = diff &: en &: ~:guard &: ~:(record.pins ^: record.delayed) in
       let changed = diff &: en &: ~:guard &: ~:stale in
@@ -964,9 +1124,20 @@ module Make (C : Config) (R : Ring.S) = struct
       let stable_all =
         wr ==: wr_p &: (wf ==: wf_p) &: (mg ==: mg_p) &: (lv ==: lv_p) &: valid_r &: valid_f
       in
-      let resync_done = resync &: stable_all in
+      (* a new start (an event in flight found overwritten or implausible)
+         wins over completion *)
       let late_ovf_w = wire 1 in
-      let start_resync = fault_now |: ovf_now |: late_ovf_w in
+      let implausible_w = wire 1 in
+      let resync_done =
+        resync &: stable_all &: (ar_cnt ==:. 0) &: ~:late_ovf_w &: ~:implausible_w
+      in
+      let start_resync = fault_now |: torn |: ovf_now |: ovf_tag |: late_ovf_w |: implausible_w in
+      (* D-13: the first event delivered after a resync that discarded
+         captures is marked [lost]. The first event to enter the pipeline
+         after the start takes the mark (a start wins over an event entering
+         in the same cycle, which was read before the gap); if it is dropped
+         as empty, the next delivered event takes it. *)
+      let lost_pending = wire 1 in
       (* --- Pipeline stage A (registered at the read) --- *)
       let stage_a =
         { Stage.valid = do_read |: untimed
@@ -977,10 +1148,13 @@ module Make (C : Config) (R : Ring.S) = struct
         ; changed = mux2 do_read changed level_bad
         ; reconfig = mux2 do_read reconfig (zero pins)
         ; stale = mux2 do_read stale (zero pins)
-        ; overflow = gnd
-        ; fault = gnd
+        ; overflow = ovf_tag
+        ; fault = torn
+        ; lost = lost_pending
         }
       in
+      let stage_a = { stage_a with lost = stage_a.lost &: stage_a.valid } in
+      Signal.assign lost_pending (rc (start_resync |: (lost_pending &: ~:(stage_a.valid))));
       (* The ring part of the record is decoded in the read cycle; only the
          phase, period count and pattern error go on (the time is formed at
          the output). *)
@@ -992,12 +1166,18 @@ module Make (C : Config) (R : Ring.S) = struct
       in
       let slim (d : Signal.t R.Decoded.t) = concat_lsb [ d.phase; d.periods; d.pattern_error ] in
       let dec_a = r (slim dec_now) in
-      (* Marks from overflow/fault detection reach every event in flight. *)
+      (* A torn or overwritten record is marked as it is read. Marks reach
+         every event in flight from a capture fault found by the pointers,
+         and from an implausible time or an overwrite found as an event
+         leaves (the events read after it were attributed against its pins).
+         An overflow found by the pointers marks nothing: the events in
+         flight were read before the gap, and each is checked for an
+         overwrite as it leaves. *)
+      let mark_fault = fault_now |: implausible_w in
       let mark_ovf = wire 1 in
-      let mark_fault = wire 1 in
       let stage_reg (s : Signal.t Stage.t) = Stage.Of_signal.reg specc s in
       let marked (s : Signal.t Stage.t) =
-        { s with overflow = s.overflow |: mark_ovf; fault = s.fault |: mark_fault }
+        { s with fault = s.fault |: mark_fault; overflow = s.overflow |: mark_ovf }
       in
       let sa = stage_reg (marked stage_a) in
       let sb = stage_reg (marked sa) in
@@ -1029,10 +1209,10 @@ module Make (C : Config) (R : Ring.S) = struct
       let late_ovf =
         sc.valid &: ~:(sc.untimed) &: (Pointer.sub_mod ~slots w_idx sc.index >:. slots)
       in
-      let sd = marked { sc with overflow = sc.overflow |: late_ovf } in
+      let sd = { sc with overflow = sc.overflow |: late_ovf; fault = sc.fault |: fault_now } in
       Signal.assign late_ovf_w late_ovf;
-      Signal.assign mark_ovf (ovf_now |: late_ovf);
-      Signal.assign mark_fault fault_now;
+      Signal.assign mark_ovf late_ovf;
+      let ovf_found = ovf_now |: ovf_tag |: late_ovf in
       (* Order check. *)
       let tw = R.time_width in
       let modulus =
@@ -1053,6 +1233,34 @@ module Make (C : Config) (R : Ring.S) = struct
       let backward = sll d ~by:1 >: modulus in
       let back_by = modulus -: d in
       let timed = sd.valid &: ~:(sd.untimed) in
+      let nonempty = sd.changed |: sd.reconfig |: sd.stale <>:. 0 in
+      (* Plausibility: [ring_time], registered here, shows the ring as
+         sampled three edges ago (two in the clk sampler), and the record
+         was written before the pointer synchroniser's first stage saw it,
+         four edges ago or earlier. So the ring time from the capture to
+         [ring_time] is at least about one clock cycle and at most
+         [plausible_cycles] (a backlog of [2 * slots] records, runt
+         re-alignment, synchronisers and pipeline). Clock cycles are
+         measured in ring stages by [ring_time]'s own per-cycle step. *)
+      let ring_time = r ring_time
+      and ring_time_valid = r ring_time_valid in
+      let mod_sub a b =
+        let a = uresize a ~width:(tw + 1)
+        and b = uresize b ~width:(tw + 1) in
+        mux2 (a <: b) (a -: b +: modulus) (a -: b)
+      in
+      let rt_valid = ring_time_valid &: r ring_time_valid in
+      let step = r (mod_sub ring_time (r ring_time)) -- "plaus_step" in
+      let step_valid = r rt_valid &: rt_valid in
+      let age = mod_sub ring_time dec_d.time -- "plaus_age" in
+      let pw = num_bits_to_represent plausible_cycles in
+      let max_age = step *: of_int_trunc ~width:pw plausible_cycles in
+      let implausible =
+        timed &: nonempty &: step_valid
+        &: (age <: step |: (uresize age ~width:(tw + 1 + pw) >: max_age))
+        |> fun x -> x -- "implausible"
+      in
+      Signal.assign implausible_w implausible;
       (* Only events read within 4 cycles of each other are compared: their
          captures are then well within half the ring time range, which must
          exceed ~8 clock cycles. *)
@@ -1063,11 +1271,15 @@ module Make (C : Config) (R : Ring.S) = struct
       Signal.assign
         since_last
         (rc (mux2 timed (zero 3) (mux2 (since_last ==:. 7) since_last (since_last +:. 1))));
-      let nonempty = sd.changed |: sd.reconfig |: sd.stale <>:. 0 in
       let out_valid = sd.valid &: (sd.untimed |: nonempty) in
       let empty_event = timed &: ~:nonempty in
-      Signal.assign have_last (rc (mux2 timed vdd (have_last &: ~:resync_done)));
-      Signal.assign last_time (rc (mux2 timed dec_d.time last_time));
+      let lost_carry = wire 1 in
+      let lost_out = out_valid &: (sd.lost |: lost_carry) in
+      Signal.assign lost_carry (rc (~:out_valid &: (lost_carry |: (sd.valid &: sd.lost))));
+      (* An implausible time is not a reference for the next order check. *)
+      let timed_ok = timed &: ~:implausible in
+      Signal.assign have_last (rc (mux2 timed_ok vdd (have_last &: ~:resync_done)));
+      Signal.assign last_time (rc (mux2 timed_ok dec_d.time last_time));
       (* --- State updates --- *)
       Signal.assign resync (rc ~clear_to:vdd (mux2 resync (~:resync_done) start_resync));
       let rd_next which idx_now rd_cur =
@@ -1117,12 +1329,19 @@ module Make (C : Config) (R : Ring.S) = struct
         alt_wait
         (rc (mux2 (normal &: alt_transient &: ~:runt) (alt_wait +:. 1) (zero 2)));
       (* Auto-reset of a pointer that stays invalid while resynchronising. *)
+      (* Also after a tag mismatch or an implausible time: the reset re-arms
+         the tags (a torn write leaves a mixture of old and new tag bits in
+         its slot, which a later torn write to the slot could leave in place
+         and pass for fresh). *)
       let bad_streak = r (resync &: pointer_bad) in
       Signal.assign
         ar_cnt
         (rc
            (mux2 (ar_cnt <>:. 0) (ar_cnt -:. 1)
-              (mux2 (resync &: pointer_bad &: bad_streak) (of_int_trunc ~width:3 7) ar_cnt)));
+              (mux2
+                 (resync &: pointer_bad &: bad_streak |: torn |: implausible_w
+                  |: if slots > 2 then ovf_tag else gnd)
+                 (of_int_trunc ~width:3 7) ar_cnt)));
       let ptr_reset = r (clear |: (ar_cnt >:. 4)) -- "ptr_reset" in
       let edge_reset = r clear in
       (* --- Status --- *)
@@ -1132,14 +1351,16 @@ module Make (C : Config) (R : Ring.S) = struct
         let cw = num_bits_to_represent pins in
         let n x = uresize x ~width:cw in
         let source : Count_source.t -> Signal.t = function
-          | Fault -> n fault_now
-          | Overflow -> n mark_ovf
+          | Fault -> n (fault_now |: torn)
+          | Overflow -> n ovf_found
           | Lost_edge -> popcount count_bad |> n
           | Level_mismatch -> popcount level_bad |> n
           | Merge_error -> n merge_bad
           | Empty -> n empty_event
           | Stale -> mux2 timed (popcount sd.stale |> n) (zero cw)
           | Runt -> n runt
+          | Torn -> n torn
+          | Implausible -> n implausible
         in
         let x = r (mux (r count_select) (List.map Count_source.all ~f:source)) in
         reg_fb specc ~width:status_width ~f:(fun c ->
@@ -1149,15 +1370,18 @@ module Make (C : Config) (R : Ring.S) = struct
       in
       let status =
         { Status.resyncing = resync
-        ; capture_fault = sticky fault_now
-        ; overflow = sticky mark_ovf
+        ; capture_fault = sticky (fault_now |: torn)
+        ; overflow = sticky ovf_found
+        ; implausible = sticky implausible
         ; lost_edge = sticky count_bad
         ; level_mismatch = sticky level_bad
         ; merge_error = sticky merge_error
-        ; fault_now = r fault_now
+        ; fault_now = r (fault_now |: torn)
+        ; torn_now = r torn
+        ; implausible_now = r implausible
         ; runt_now = r runt
         ; empty_now = r empty_event
-        ; overflow_now = r mark_ovf
+        ; overflow_now = r ovf_found
         ; lost_edge_now = r count_bad
         ; level_mismatch_now = r level_bad
         ; merge_error_now = r merge_error
@@ -1182,6 +1406,8 @@ module Make (C : Config) (R : Ring.S) = struct
         ; order_error
         ; overflow = sd.overflow
         ; fault = sd.fault
+        ; implausible
+        ; lost = lost_out
         }
       in
       ( { O.event; status }
@@ -1216,6 +1442,8 @@ module Make (C : Config) (R : Ring.S) = struct
         ~pin_enable:i.pin_enable
         ~length_sel:i.length_sel
         ~count_select:i.count_select
+        ~ring_time:i.ring_time
+        ~ring_time_valid:i.ring_time_valid
         front
     in
     Signal.assign enable ctl.enable;

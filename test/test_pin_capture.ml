@@ -62,8 +62,9 @@ type result =
   ; flags : Capture_oracle.flags
   ; status : Bits.t Cap.Status.t
   ; counts : int array
-  (** counted from the [_now] pulses: fault overflow lost_edge level_mismatch
-      merge_error empty stale runt *)
+  (** counted from the [_now] pulses, in [Count_source] order: fault
+      overflow lost_edge level_mismatch merge_error empty stale runt torn
+      implausible *)
   ; ptr_resets : int
   ; cycles : int
   }
@@ -78,6 +79,7 @@ let run
   ?(enable = fun _ -> all)
   ?(trace = false)
   ?(corrupt = fun _ ~ptr_r:_ ~ptr_f:_ -> None)
+  ?(corrupt_capture = fun (_ : int) -> None)
   ?(initial = 0)
   ?(count_select = Cap.Count_source.Fault)
   ?(captures : Ref.capture list option)
@@ -105,7 +107,7 @@ let run
   let resync = ref [] in
   let runts = ref [] in
   let ptr_resets = ref 0 in
-  let counts = Array.create ~len:8 0 in
+  let counts = Array.create ~len:(List.length Cap.Count_source.all) 0 in
   let model_ptr nm () =
     Cyclesim.lookup_reg_by_name sim nm |> Option.value_exn |> Cyclesim.Reg.to_bits |> Bits.to_int_trunc
   in
@@ -118,6 +120,12 @@ let run
     (match corrupt c ~ptr_r:(model_ptr "model_ptr_r") ~ptr_f:(model_ptr "model_ptr_f") with
      | Some (r, f) -> Cap.Model_driver.corrupt driver ~r ~f
      | None -> ());
+    (match corrupt_capture c with
+     | Some (tag, periods) -> Cap.Model_driver.corrupt_next_capture driver ~tag ~periods
+     | None -> ());
+    (* the clk sampler's time, valid once the ring has been sampled *)
+    i.cap.ring_time := Bits.of_int_trunc ~width:R.time_width (Cap.Model_driver.ring_time driver);
+    i.cap.ring_time_valid := Bits.of_bool (k >= 3);
     Cap.Model_driver.cycle driver i.stim;
     Cyclesim.cycle sim;
     let ev = Cap.Event.map o.event ~f:( ! ) in
@@ -127,7 +135,8 @@ let run
     if pf <> 0 then pin_flags := (c, pf) :: !pin_flags;
     if k >= 2
     then (
-      if Bits.(to_bool (st.fault_now |: st.overflow_now)) then faults := c :: !faults;
+      if Bits.(to_bool (st.fault_now |: st.overflow_now |: st.implausible_now))
+      then faults := c :: !faults;
       if Bits.to_bool st.resyncing then resync := c :: !resync;
       if Bits.to_bool st.runt_now then runts := c :: !runts);
     if Bits.to_bool st.ptr_reset then Int.incr ptr_resets;
@@ -140,7 +149,9 @@ let run
     add 4 (if b st.merge_error_now <> 0 then 1 else 0);
     add 5 (b st.empty_now);
     if Bits.to_bool ev.valid && not (Bits.to_bool ev.untimed) then add 6 (pc ev.stale);
-    add 7 (b st.runt_now)
+    add 7 (b st.runt_now);
+    add 8 (b st.torn_now);
+    add 9 (b st.implausible_now)
   done;
   { outs = List.rev !outs
   ; flags =
@@ -156,7 +167,9 @@ let run
   }
 ;;
 
-let flagged (ev : Bits.t Cap.Event.t) = Bits.(to_bool (ev.fault |: ev.overflow |: ev.order_error |: ev.pattern_error))
+let flagged (ev : Bits.t Cap.Event.t) =
+  Bits.(to_bool (ev.fault |: ev.overflow |: ev.order_error |: ev.pattern_error |: ev.implausible))
+;;
 
 (* Toggles to edges with levels. *)
 let with_levels ~initial (edges : Ref.edge list) =
@@ -201,7 +214,7 @@ let oracle ?(initial = 0) ~edges (r : result) =
          ; reconfig = b ev.reconfig
          ; stale = b ev.stale
          ; flagged = flagged ev
-         ; loss_mark = Bits.(to_bool (ev.fault |: ev.overflow))
+         ; loss_mark = Bits.to_bool ev.lost
          ; est = (if Bits.to_bool ev.untimed then None else Some (est_of_time ev ~cycle))
          }))
     ~flags:r.flags
@@ -234,7 +247,9 @@ let print_events (r : result) =
       (if Bits.to_bool ev.untimed then 0 else b ev.time)
       (if Bits.to_bool ev.overflow then " OVERFLOW" else "")
       (if Bits.to_bool ev.fault then " FAULT" else "")
-      (if Bits.to_bool ev.order_error then " ORDER" else ""))
+      ((if Bits.to_bool ev.order_error then " ORDER" else "")
+       ^ (if Bits.to_bool ev.implausible then " IMPLAUSIBLE" else "")
+       ^ if Bits.to_bool ev.lost then " LOST" else ""))
 ;;
 
 (* Random edges on [pins] pins from [start], gaps drawn from [gap]; at most
@@ -362,9 +377,9 @@ let%expect_test "bursts overflow the banks: flagged, resynchronised, nothing unf
   print_endline (Capture_oracle.pp_resyncs s);
   List.iter (List.take s.errors 10) ~f:print_endline;
   [%expect {|
-    status: fault 0 (0) overflow 1 (3385) lost_edge f (72) level_mismatch f (106) merge_error d (2) empty 392 stale 1906 resyncing 0
-    edges 19682: timed 3145, untimed 153, lost+flagged 16384, bad+flagged 5236 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
-    resyncs 1393: first event after it loss-marked 0, levels re-baselined by an untimed event 3
+    status: fault 0 (0) overflow 1 (2918) lost_edge f (69) level_mismatch f (103) merge_error d (2) empty 301 stale 1333 resyncing 0
+    edges 19682: timed 3163, untimed 153, lost+flagged 16366, bad+flagged 3489 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    resyncs after a loss 1305: first event after it marked lost 1305, NOT MARKED 0 (D-13)
     |}]
 ;;
 
@@ -399,13 +414,15 @@ let%expect_test "shared status counter: each source counts what its pulses repor
   [%expect {|
     bursts:
       Fault           pulses    0 counter   0
-      Overflow        pulses  503 counter 255
+      Overflow        pulses  431 counter 255
       Lost_edge       pulses    9 counter   9
       Level_mismatch  pulses   21 counter  21
       Merge_error     pulses    1 counter   1
-      Empty           pulses   54 counter  54
-      Stale           pulses  242 counter 242
+      Empty           pulses   48 counter  48
+      Stale           pulses  170 counter 170
       Runt            pulses    0 counter   0
+      Torn            pulses    0 counter   0
+      Implausible     pulses    0 counter   0
     gentle, pointer corrupted at cycle 300:
       Fault           pulses    1 counter   1
       Overflow        pulses    0 counter   0
@@ -415,6 +432,8 @@ let%expect_test "shared status counter: each source counts what its pulses repor
       Empty           pulses    0 counter   0
       Stale           pulses    0 counter   0
       Runt            pulses    0 counter   0
+      Torn            pulses    0 counter   0
+      Implausible     pulses    0 counter   0
     |}]
 ;;
 
@@ -463,11 +482,165 @@ let%expect_test "corrupted pointer: capture_fault, auto-reset, resync, then corr
        ~f:(fun (o, (e : Ref.event)) ->
          b o.ev.changed <> e.changed || b o.ev.time <> (e.time + n - 1) % modulus || flagged o.ev));
   [%expect {|
-    status: fault 1 (1) overflow 0 (0) lost_edge 9 (2) level_mismatch 9 (2) merge_error 0 (0) empty 0 stale 2 resyncing 0
-    pointer reset asserted for 9 cycles
-    edges 600: timed 594, untimed 1, lost+flagged 5, bad+flagged 5 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
-    resyncs 2: first event after it loss-marked 0, levels re-baselined by an untimed event 0
+    status: fault 1 (1) overflow 1 (1) lost_edge 0 (0) level_mismatch 0 (0) merge_error 0 (0) empty 0 stale 0 resyncing 0
+    pointer reset asserted for 12 cycles
+    edges 600: timed 589, untimed 0, lost+flagged 11, bad+flagged 2 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    resyncs after a loss 2: first event after it marked lost 2, NOT MARKED 0 (D-13)
     after recovery: 344 events, 344 expected, mismatches 0
+    |}]
+;;
+
+(* --- 4b. Torn records and implausible times ------------------------------- *)
+
+(* One capture of isolated edges (one per 5-15 cycles) is corrupted as the
+   gate's slow-corner error was (the Event_sim reproduction is in
+   test/test_pin_capture_timing.ml): its period count 56 periods ahead (a
+   stale Gray bit), so its time is wrong but its pin, level and every count
+   are right, and the order check sees a forward step. With its tag also
+   wrong (a torn record) the tag check flags it; with a right tag (a wrong
+   time from elsewhere) the plausibility check does. Either way the drain
+   resynchronises and marks the next event [lost]. Without the checks the
+   oracle reports the event as an unflagged phantom and its edge as lost. *)
+let%expect_test "a wrong time from a torn record: tag check, else plausibility check" =
+  let gap rng = (5 * spc) + Random.State.int rng (10 * spc) in
+  let edges = random_edges ~seed:5 ~count:60 ~start:(30 * spc) ~gap in
+  let cycles = cycle_of_time (List.last_exn edges).time + 100 in
+  let at = 200 in
+  List.iter [ "torn (tag and count)", 0b001; "count only (tag right)", 0 ] ~f:(fun (label, tag) ->
+    let corrupt_capture c = if c = at then Some (tag, 56) else None in
+    let r = run ~corrupt_capture ~edges ~cycles () in
+    printf "%s:\n" label;
+    print_events { r with outs = List.filter r.outs ~f:(fun o -> o.cycle > at && o.cycle < at + 40) };
+    print_status r.status r.counts;
+    printf "torn %d implausible %d\n" r.counts.(8) r.counts.(9);
+    let s = oracle ~edges r in
+    print_endline (Capture_oracle.pp s);
+    print_endline (Capture_oracle.pp_resyncs s);
+    List.iter s.errors ~f:print_endline);
+  [%expect {|
+    torn (tag and count):
+    cycle 202: timed   pins 1 changed 2 reconfig 0 stale 0 time  1642
+    cycle 209: timed   pins 3 changed 2 reconfig 0 stale 0 time  7455 FAULT IMPLAUSIBLE
+    cycle 226: timed   pins 0 changed 2 reconfig 0 stale 0 time 14934 LOST
+    cycle 238: timed   pins 4 changed 4 reconfig 0 stale 0 time  3853
+    status: fault 1 (1) overflow 0 (0) lost_edge 0 (0) level_mismatch 0 (0) merge_error 0 (0) empty 0 stale 0 resyncing 0
+    torn 1 implausible 1
+    edges 60: timed 58, untimed 0, lost+flagged 2, bad+flagged 1 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    resyncs after a loss 1: first event after it marked lost 1, NOT MARKED 0 (D-13)
+    count only (tag right):
+    cycle 202: timed   pins 1 changed 2 reconfig 0 stale 0 time  1642
+    cycle 209: timed   pins 3 changed 2 reconfig 0 stale 0 time  7455 IMPLAUSIBLE
+    cycle 226: timed   pins 0 changed 2 reconfig 0 stale 0 time 14934 LOST
+    cycle 238: timed   pins 4 changed 4 reconfig 0 stale 0 time  3853
+    status: fault 0 (0) overflow 0 (0) lost_edge 0 (0) level_mismatch 0 (0) merge_error 0 (0) empty 0 stale 0 resyncing 0
+    torn 0 implausible 1
+    edges 60: timed 58, untimed 0, lost+flagged 2, bad+flagged 1 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    resyncs after a loss 1: first event after it marked lost 1, NOT MARKED 0 (D-13)
+    |}]
+;;
+
+(* With 3 or 4 slots a slot's consecutive writes alternate between two
+   pointer codes, so a torn write that left the slot's whole old tag shows
+   the code of a later write: it is read as an overwrite. It must still
+   resynchronise and re-arm the tags (pointer reset), or a second torn
+   write to that slot could keep the old tag and pass. Two such captures,
+   4 slots. *)
+module Cfg4 = struct
+  include Cfg
+
+  let slots = 4
+end
+
+module Cap4 = Pin_capture.Make (Cfg4) (R)
+
+module Top4 = struct
+  module I = struct
+    type 'a t =
+      { cap : 'a Cap4.I.t [@rtlmangle "_"]
+      ; stim : 'a Cap4.Model_stimulus.t [@rtlmangle "_"]
+      }
+    [@@deriving hardcaml]
+  end
+
+  let create scope (i : _ I.t) = Cap4.create (Model i.stim) scope i.cap
+end
+
+module Sim4 = Cyclesim.With_interface (Top4.I) (Cap4.O)
+
+let%expect_test "4 slots: a torn write that left its slot's old tag reads as an overwrite, re-arms the tags" =
+  let gap rng = (5 * spc) + Random.State.int rng (10 * spc) in
+  let edges = random_edges ~seed:5 ~count:80 ~start:(30 * spc) ~gap in
+  let cycles = cycle_of_time (List.last_exn edges).time + 100 in
+  let captures = fst (Ref.captures ~initial:0 ~enabled:all ~merge_window ~swallow edges) in
+  let scope = Scope.create ~flatten_design:true () in
+  let sim = Sim4.create (Top4.create scope) in
+  let i = Cyclesim.inputs sim and o = Cyclesim.outputs sim in
+  let driver = Cap4.Model_driver.create ~n ~stages_per_cycle:spc ~initial:0 ~edges ~captures in
+  let events = ref [] and faults = ref [] and resync = ref [] and resets = ref 0 in
+  for k = 0 to cycles - 1 do
+    let c = k + 1 in
+    i.cap.clear := Bits.of_bool (k < 2);
+    i.cap.pin_enable := Bits.of_int_trunc ~width:Cfg.pins all;
+    (* the whole tag inverted: code(k) -> code(k + 4), the slot's old tag *)
+    if c = 200 || c = 400 then Cap4.Model_driver.corrupt_next_capture driver ~tag:0b1111;
+    i.cap.ring_time := Bits.of_int_trunc ~width:R.time_width (Cap4.Model_driver.ring_time driver);
+    i.cap.ring_time_valid := Bits.of_bool (k >= 3);
+    Cap4.Model_driver.cycle driver i.stim;
+    Cyclesim.cycle sim;
+    let ev = Cap4.Event.map o.event ~f:(fun x -> !x) in
+    let st = Cap4.Status.map o.status ~f:(fun x -> !x) in
+    let f x = Bits.to_bool x in
+    if f ev.valid
+    then (
+      events := (c, ev) :: !events;
+      if (c > 200 && c < 230) || (c > 400 && c < 430)
+      then
+        printf "cycle %d: changed %x%s%s%s\n" c (b ev.changed)
+          (if f ev.overflow then " OVERFLOW" else "")
+          (if f ev.fault then " FAULT" else "")
+          (if f ev.lost then " LOST" else ""));
+    if k >= 2 && Bits.(to_bool (st.fault_now |: st.overflow_now |: st.implausible_now))
+    then faults := c :: !faults;
+    if k >= 2 && f st.resyncing then resync := c :: !resync;
+    if f st.ptr_reset then Int.incr resets
+  done;
+  let s =
+    Capture_oracle.check ~pins:Cfg.pins ~edges:(with_levels ~initial:0 edges)
+      ~events:
+        (List.rev_map !events ~f:(fun (cycle, ev) ->
+           { Capture_oracle.cycle
+           ; untimed = Bits.to_bool ev.untimed
+           ; pins = b ev.pins
+           ; changed = b ev.changed
+           ; reconfig = b ev.reconfig
+           ; stale = b ev.stale
+           ; flagged =
+               Bits.(to_bool (ev.fault |: ev.overflow |: ev.order_error |: ev.pattern_error |: ev.implausible))
+           ; loss_mark = Bits.to_bool ev.lost
+           ; est =
+               (if Bits.to_bool ev.untimed
+                then None
+                else (
+                  let t_out = cycle_time cycle in
+                  Some (t_out - ((t_out - (b ev.time - (n - 1))) % modulus))))
+           }))
+      ~flags:{ pin = []; faults = List.rev !faults; resync = List.rev !resync; runts = [] }
+      ~cycle_of_time ~cycle_time ~match_tol:merge_window
+      ~windows:
+        { Capture_oracle.in_flight = 4; back = 4; before = (2 * 4) + 4; after = 5; event_age = (2 * 4) + 8 }
+      ~deadline:(fun _ -> cycles) ~end_cycle:cycles
+  in
+  printf "pointer reset asserted for %d cycles\n%s\n%s\n" !resets (Capture_oracle.pp s)
+    (Capture_oracle.pp_resyncs s);
+  [%expect {|
+    cycle 202: changed 2
+    cycle 209: changed 2 OVERFLOW
+    cycle 226: changed 2 LOST
+    cycle 405: changed 4 OVERFLOW
+    cycle 424: changed 8 LOST
+    pointer reset asserted for 12 cycles
+    edges 80: timed 76, untimed 0, lost+flagged 4, bad+flagged 2 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0
+    resyncs after a loss 2: first event after it marked lost 2, NOT MARKED 0 (D-13)
     |}]
 ;;
 
@@ -588,11 +761,11 @@ let%expect_test "cells mode: module protoemu_pin_capture, stable dont_touch inst
    | exception e -> print_s [%sexp (e : exn)]);
   [%expect {|
     module protoemu_pin_capture present: true
-      78 sg13cmos5l_buf_1
-     213 sg13cmos5l_dfrbpq_1
+      86 sg13cmos5l_buf_1
+     225 sg13cmos5l_dfrbpq_1
        8 sg13cmos5l_dlygate4sd3_1
-      15 sg13cmos5l_inv_1
-     180 sg13cmos5l_mux2_1
+      19 sg13cmos5l_inv_1
+     192 sg13cmos5l_mux2_1
        4 sg13cmos5l_nand2_1
        7 sg13cmos5l_xor2_1
     cap_gate0: true
