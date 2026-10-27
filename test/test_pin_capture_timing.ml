@@ -15,29 +15,39 @@
      are safe in phases [9, 2n + 4) after their edge: L = 9, E = 4, which
      leaves >= 6.2 stages on both sides (>= 5.0 with flat wires). At a
      write, the slot selects change >= 476 ps after the hold time;
+   - torn records: a slot's data muxes turn to the fresh values ~1.1 ns
+     (typ) / ~1.9 ns (slow) after the previous write to its bank (pointer
+     clock-to-Q, two select XORs, buffer, mux). A second write to the bank
+     sooner (three merged toggles within that time) clocks the slot while
+     its D pins are changing: bits metastable, some keeping the slot's old
+     record. That was the gate's unflagged error before the record tags
+     (slow, four edges within 2.7 ns: Gray bit 2 of counter B kept its value
+     from the slot's record 1.9 us earlier, period count 376 for 320, right
+     pin and level, a forward step the order check accepts), and the flat
+     wire one at typ (same-bank writes 1.10 ns apart). The tags catch it:
+     their D changes after every other D of the slot by more than setup +
+     hold, at every select change, on and off (below). The sweep below
+     flags every same-bank pair up to ~2.7 ns at slow (the tag's longer
+     deselect also flags the clean record before the second write);
    - accounting against Capture_oracle's contract (per-pin flags by the end
      of the next 10-cycle quiet stretch; fault, overflow and runt windows;
-     flagged events cover only their pins): in the gate (105k edges, a
-     400 ns quiet stretch every 50 edges) one unflagged error, at slow: in a
-     burst of four edges on four pins within 2.7 ns, pin 1's edge came out
-     with the right pin and level but a time 1.9 us off (a capture record
-     with a wrong period count; no flag on the event, the level and count
-     checks pass, and the order check only catches backward steps). The old
-     400-cycle flag slack had hidden it behind a later, unrelated flag. With
-     flat wires the gate finds one more of the same kind (typ), and at fast
-     a single-pin event one ring period off (1.04 ns): the 2 ns attribution
-     tolerance exceeds the ring period there, so the timing report counts
-     errors beyond half a ring period separately;
-   - timing, separately: 89-91% of edges validated against their true time
+     flagged events cover only their pins; every resync after a loss must
+     mark the next event [lost]): in the gate (105k edges, a 400 ns quiet
+     stretch every 50 edges) no unflagged error at any corner, with 1k or
+     flat wires; every resync's next event marked; torn flags ~1 per
+     270-1500 edges (slow-fast), nearly all on records that decoded right
+     (conservative); the plausibility check fired only on events also
+     marked overwritten (0 false flags); unflagged events' ages 1.0-6.1
+     cycles against its 1-12 window;
+   - timing, separately: 87-89% of edges validated against their true time
      within 2 ns; single-pin events, calibration fitted to a separate run
-     and frozen: 0.6 bin rms (30/47/74 ps fast/typ/slow; bins 50/77/123 ps
-     mean), p99 72/116/188 ps, rare multi-pin-burst outliers beyond 3 bins
-     (gate: 0/2/2 in ~30k, worst 0.84 ns at slow); events merging several
-     pins: 168-408 ps rms, worst 1.1 ns (one time for edges up to a merge
-     window apart);
-   - per-pin flags come <= 8 cycles after the error (gate); overflow and
-     fault resyncs (D-13): no event after a resync carries a loss mark and
-     levels are re-established silently, not by an untimed event;
+     and frozen: 0.6 bin rms (30/47/73 ps fast/typ/slow; bins 50/77/123 ps
+     mean), p99 72/117/183 ps, rare outliers beyond 3 bins (gate: 1 in
+     ~90k, 0.43 ns at slow); events merging several pins: 169-421 ps rms,
+     worst 0.9 ns (one time for edges up to a merge window apart);
+   - per-pin flags come <= 8 cycles after the error (gate); resyncs (D-13)
+     mark the next event [lost], levels are re-established silently (no
+     untimed re-baseline event);
    - edge-to-event latency (gate, 105k edges): the event is on the outputs
      after the 5th rising clock edge at or after the pin edge (median, every
      corner); 5-6 for an edge with no other edge within 100 ns, except when

@@ -6,8 +6,11 @@
    first and then frozen. Reports per corner: oracle accounting (unflagged
    errors, late flags), timing (edges validated against their true time and
    the error distribution of those), per-pin flag latency, snapshot race
-   margin, status counts. Exits 1 on any unflagged error, unjudged edge or
-   unknown (X) flag.
+   margin, the D-13 loss marks after resyncs, the torn-record and
+   plausibility flags against the true edges (conservative and false flags),
+   the plausibility ages of unflagged events, status counts. Exits 1 on any
+   unflagged error, unjudged edge, resync without a [lost] mark on the
+   event after it, or unknown (X) flag.
 
    Usage: capture_gate.exe [EDGES_PER_CORNER [SEED [NEAR [MIN_SAME_PIN_NS [SLOTS [WIRES]]]]]]
    SLOTS is the slots per bank (2..4, default 2); WIRES is [1k] (the
