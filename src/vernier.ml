@@ -585,9 +585,14 @@ module Make (Config : Config) : S = struct
       let range_event = reg spec (s0_edge &: m.range_fault) -- nm "range_event" in
       let overrun = sticky "overrun" overrun_event in
       let range_fault = sticky "range_fault" range_event in
-      (* A fault drops the pin to bypass at once, until the flags are cleared:
-         the pin shows the requested level at cycle resolution. *)
-      let fallback = overrun |: range_fault in
+      (* A fault drops the pin to bypass at once: the pin shows the requested
+         level at cycle resolution. It returns once the flags are cleared and
+         both lines are quiet, so the switch back moves no edge in flight. *)
+      let fallback =
+        reg_fb spec ~width:1 ~f:(fun q ->
+          overrun_event |: range_event |: (q &: ~:(mode_ok &: ~:overrun &: ~:range_fault)))
+        -- nm "fallback"
+      in
       { rise
       ; fall
       ; level = level_d

@@ -113,7 +113,8 @@
       than a cycle). The tap is clamped and the pin drops to bypass.
     Both are sticky per pin ([overrun], [range_fault]; one-cycle
     [overrun_event]/[range_event] pulses for counters), and the pin stays in
-    bypass ([fallback]) until the host clears them with [clear_flags].
+    bypass ([fallback]) until the host clears them with [clear_flags] and
+    both lines are quiet.
 
     A host change of [mode] applies at the first edge where both lines of the
     pin are quiet and no request is being mapped (in the chip, mode changes
