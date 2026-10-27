@@ -450,8 +450,8 @@ struct
       t.worst_class_ps (t.worst_class_ps /. bin) t.outliers
   ;;
 
-  (* Edge-to-event latency of the timed single-pin attributions, in clock
-     edges: the first rising clock edge at or after the pin edge is 1, and
+  (* Edge-to-event latency of the matched, unflagged, timed single-pin
+     attributions (not untimed, merged or flagged events), in clock edges: the first rising clock edge at or after the pin edge is 1, and
      the event is on the outputs (valid) after that many edges. All events,
      and those whose edge had no other edge on any pin within [quiet_ns]
      (no backlog in the FIFO, no burst). *)
@@ -459,13 +459,16 @@ struct
     let times = List.map edges ~f:fst |> List.sort ~compare:Int.compare |> Array.of_list in
     let quiet = Event_sim.of_ns quiet_ns in
     let isolated time =
-      (match Array.binary_search times ~compare:Int.compare `Last_strictly_less_than time with
-       | Some k -> time - times.(k) > quiet
-       | None -> true)
-      &&
-      match Array.binary_search times ~compare:Int.compare `First_strictly_greater_than time with
-      | Some k -> times.(k) - time > quiet
-      | None -> true
+      (* the edge itself is the only one within [quiet] *)
+      let near =
+        match
+          ( Array.binary_search times ~compare:Int.compare `First_greater_than_or_equal_to (time - quiet)
+          , Array.binary_search times ~compare:Int.compare `Last_less_than_or_equal_to (time + quiet) )
+        with
+        | Some lo, Some hi -> hi - lo + 1
+        | _ -> 0
+      in
+      near = 1
     in
     let all =
       List.filter_map t.summary.matches ~f:(fun (ev, (edge : Capture_oracle.edge), k) ->

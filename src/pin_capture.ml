@@ -60,9 +60,10 @@
     - The ring time is decoded from the record ({!Ring.S.decode}).
     - Events leave the third pipeline stage combinationally, 2 cycles after
       the read, so the overwrite check below can be applied to the event
-      itself. An edge with the FIFO empty is an event after the 5th or 6th
-      rising clock edge at or after it (Event_sim, three corners); a backlog
-      or a re-aligned runt adds cycles (test/test_pin_capture_timing.ml).
+      itself. An edge with the FIFO empty, the bank order aligned and the
+      drain not resynchronising is an event after the 5th or 6th rising
+      clock edge at or after it (Event_sim, three corners); a backlog or a
+      runt re-alignment adds cycles (test/test_pin_capture_timing.ml).
 
     {2 Integrity checks (everything is flagged, nothing silently wrong)}
 

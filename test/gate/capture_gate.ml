@@ -79,7 +79,7 @@ let () =
     printf
       "     single-edge error (per-class offsets): %d events, rms %.1f ps (%.2f bins), worst %.1f ps (%.2f bins), >3 bins %d; race margin min %.0f ps\n"
       !n_acc rms (rms /. !bin) !worst (!worst /. !bin) !outliers !race_min;
-    printf "     edge -> event latency, clock edges (first after the edge = 1): all %s\n"
+    printf "     edge -> event latency, clock edges (first at or after the edge = 1): all %s\n"
       (T.pp_latencies !lat_all);
     printf "       no other edge within 100 ns: %s\n" (T.pp_latencies !lat_iso);
     printf "     counts: %s\n"
