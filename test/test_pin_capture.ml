@@ -59,9 +59,14 @@ type result =
   ; pin_flags : (int * int) list
   ; global_flags : int list
   ; status : Bits.t Cap.Status.t
+  ; counts : int array
+  (** counted from the [_now] pulses: fault overflow lost_edge level_mismatch
+      merge_error empty stale runt *)
   ; ptr_resets : int
   ; cycles : int
   }
+
+let b x = Bits.to_int_trunc x
 
 (* Output cycle c is clock edge c, at stage time c * spc. *)
 let cycle_time c = c * spc
@@ -72,6 +77,7 @@ let run
   ?(trace = false)
   ?(corrupt = fun _ ~ptr_r:_ ~ptr_f:_ -> None)
   ?(initial = 0)
+  ?(count_select = Cap.Count_source.Fault)
   ?(captures : Ref.capture list option)
   ~(edges : Ref.edge list)
   ~cycles
@@ -95,6 +101,7 @@ let run
   let pin_flags = ref [] in
   let global_flags = ref [] in
   let ptr_resets = ref 0 in
+  let counts = Array.create ~len:8 0 in
   let model_ptr nm () =
     Cyclesim.lookup_reg_by_name sim nm |> Option.value_exn |> Cyclesim.Reg.to_bits |> Bits.to_int_trunc
   in
@@ -102,6 +109,8 @@ let run
     let c = k + 1 in
     i.cap.clear := Bits.of_bool (k < 2);
     i.cap.pin_enable := Bits.of_int_trunc ~width:Cfg.pins (enable c);
+    i.cap.count_select
+    := Bits.of_int_trunc ~width:Cap.Count_source.width (Cap.Count_source.code count_select);
     (match corrupt c ~ptr_r:(model_ptr "model_ptr_r") ~ptr_f:(model_ptr "model_ptr_f") with
      | Some (r, f) -> Cap.Model_driver.corrupt driver ~r ~f
      | None -> ());
@@ -114,18 +123,28 @@ let run
     if pf <> 0 then pin_flags := (c, pf) :: !pin_flags;
     if Bits.(to_bool (st.fault_now |: st.runt_now |: st.overflow_now |: st.resyncing)) && k >= 2
     then global_flags := c :: !global_flags;
-    if Bits.to_bool st.ptr_reset then Int.incr ptr_resets
+    if Bits.to_bool st.ptr_reset then Int.incr ptr_resets;
+    let add k x = counts.(k) <- counts.(k) + x in
+    let pc x = Bits.(to_int_trunc (popcount x)) in
+    add 0 (b st.fault_now);
+    add 1 (b st.overflow_now);
+    add 2 (pc st.lost_edge_now);
+    add 3 (pc st.level_mismatch_now);
+    add 4 (if b st.merge_error_now <> 0 then 1 else 0);
+    add 5 (b st.empty_now);
+    if Bits.to_bool ev.valid && not (Bits.to_bool ev.untimed) then add 6 (pc ev.stale);
+    add 7 (b st.runt_now)
   done;
   { outs = List.rev !outs
   ; pin_flags = List.rev !pin_flags
   ; global_flags = List.rev !global_flags
   ; status = Cap.Status.map o.status ~f:( ! )
+  ; counts
   ; ptr_resets = !ptr_resets
   ; cycles
   }
 ;;
 
-let b x = Bits.to_int_trunc x
 let flagged (ev : Bits.t Cap.Event.t) = Bits.(to_bool (ev.fault |: ev.overflow |: ev.order_error |: ev.pattern_error))
 
 (* Toggles to edges with levels. *)
@@ -171,12 +190,12 @@ let oracle ?(initial = 0) ~edges (r : result) =
     ~end_cycle:r.cycles
 ;;
 
-let print_status (s : Bits.t Cap.Status.t) =
+let print_status (s : Bits.t Cap.Status.t) (c : int array) =
   printf
     "status: fault %d (%d) overflow %d (%d) lost_edge %x (%d) level_mismatch %x (%d) merge_error %x (%d) empty %d stale %d resyncing %d\n"
-    (b s.capture_fault) (b s.fault_count) (b s.overflow) (b s.overflow_count) (b s.lost_edge)
-    (b s.lost_edge_count) (b s.level_mismatch) (b s.level_mismatch_count) (b s.merge_error)
-    (b s.merge_error_count) (b s.empty_count) (b s.stale_count)
+    (b s.capture_fault) c.(0) (b s.overflow) c.(1) (b s.lost_edge)
+    c.(2) (b s.level_mismatch) c.(3) (b s.merge_error)
+    c.(4) c.(5) c.(6)
     (b s.resyncing)
 ;;
 
@@ -256,7 +275,7 @@ let%expect_test "random edges: events equal the Reference's, times exact, zero u
       ~f:(fun ((a : Ref.edge), (b : Ref.edge)) -> a.pin = b.pin && b.time - a.time <= merge_window)
   in
   printf "same-pin pulses within the merge window (both captures empty, lost_edge): %d\n" narrow;
-  print_status r.status;
+  print_status r.status r.counts;
   print_endline (Capture_oracle.pp (oracle ~edges r));
   [%expect {|
     edges 4000, captures 4000, cancelled toggles 0, reference events 3911 (49 multi-pin), timed events 3911, mismatches 0
@@ -286,8 +305,8 @@ let%expect_test "two pins delta apart: cancelled, merged into one event, or sepa
       "delta %2d: %2d timed events (%d attributed to both pins), %d untimed, empty %d, level_mismatch %d, merge_error %d | %s\n"
       delta (List.length timed)
       (List.count timed ~f:(fun o -> b o.ev.changed = 3))
-      (List.length untimed) (b r.status.empty_count) (b r.status.level_mismatch_count)
-      (b r.status.merge_error_count) (Capture_oracle.pp s));
+      (List.length untimed) r.counts.(5) r.counts.(3)
+      r.counts.(4) (Capture_oracle.pp s));
   [%expect {|
     swallow 2, merge window 5 stages
     delta  0:  0 timed events (0 attributed to both pins), 8 untimed, empty 0, level_mismatch 16, merge_error 0 | edges 16: timed 0, untimed 16, lost+flagged 0, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 | pending 0
@@ -312,13 +331,63 @@ let%expect_test "bursts overflow the banks: flagged, resynchronised, nothing unf
   let edges = random_edges ~seed:7 ~count:20000 ~start:(30 * spc) ~gap in
   let cycles = cycle_of_time (List.last_exn edges).time + 400 in
   let r = run ~edges ~cycles () in
-  print_status r.status;
+  print_status r.status r.counts;
   let s = oracle ~edges r in
   print_endline (Capture_oracle.pp s);
   List.iter (List.take s.errors 10) ~f:print_endline;
   [%expect {|
-    status: fault 0 (0) overflow 1 (57) lost_edge f (72) level_mismatch f (106) merge_error d (2) empty 136 stale 114 resyncing 0
+    status: fault 0 (0) overflow 1 (3385) lost_edge f (72) level_mismatch f (106) merge_error d (2) empty 392 stale 1906 resyncing 0
     edges 19682: timed 3145, untimed 153, lost+flagged 16384, bad+flagged 5236 | UNFLAGGED: lost 0, phantom 0 | pending 0
+    |}]
+;;
+
+let%expect_test "shared status counter: each source counts what its pulses report, saturating" =
+  (* Two scenarios: bursts (overflow, stale, empty, lost edges), and gentle
+     traffic with a corrupted pointer (fault). The counter is 8 bits wide
+     here, so large counts saturate. Runts need the real cells (Event_sim);
+     the Model front never produces them. *)
+  let scenario ~seed ~count ~gap ~corrupt_at =
+    let edges = random_edges ~seed ~count ~start:(30 * spc) ~gap in
+    let cycles = cycle_of_time (List.last_exn edges).time + 400 in
+    let corrupt c ~ptr_r ~ptr_f:_ =
+      if c = corrupt_at then Some (ptr_r () lxor 0b010, 0) else None
+    in
+    List.iter Cap.Count_source.all ~f:(fun source ->
+      let r = run ~trace:true ~corrupt ~count_select:source ~edges ~cycles () in
+      let pulses = r.counts.(Cap.Count_source.code source) in
+      let expect = Int.min pulses ((1 lsl Cfg.status_width) - 1) in
+      let got = b r.status.count in
+      printf "  %-15s pulses %4d counter %3d%s\n"
+        (Sexp.to_string (Cap.Count_source.sexp_of_t source)) pulses got
+        (if got = expect then "" else " MISMATCH"))
+  in
+  print_endline "bursts:";
+  scenario ~seed:7 ~count:3000 ~corrupt_at:(-1) ~gap:(fun rng ->
+    match Random.State.int rng 10 with
+    | 0 -> 1 + Random.State.int rng 4
+    | 1 | 2 | 3 -> Random.State.int rng (spc / 2)
+    | _ -> Random.State.int rng (3 * spc));
+  print_endline "gentle, pointer corrupted at cycle 300:";
+  scenario ~seed:3 ~count:600 ~corrupt_at:300 ~gap:(fun rng -> spc + Random.State.int rng (4 * spc));
+  [%expect {|
+    bursts:
+      Fault           pulses    0 counter   0
+      Overflow        pulses  503 counter 255
+      Lost_edge       pulses    9 counter   9
+      Level_mismatch  pulses   21 counter  21
+      Merge_error     pulses    1 counter   1
+      Empty           pulses   54 counter  54
+      Stale           pulses  242 counter 242
+      Runt            pulses    0 counter   0
+    gentle, pointer corrupted at cycle 300:
+      Fault           pulses    1 counter   1
+      Overflow        pulses    0 counter   0
+      Lost_edge       pulses    0 counter   0
+      Level_mismatch  pulses    0 counter   0
+      Merge_error     pulses    0 counter   0
+      Empty           pulses    0 counter   0
+      Stale           pulses    0 counter   0
+      Runt            pulses    0 counter   0
     |}]
 ;;
 
@@ -342,7 +411,7 @@ let%expect_test "corrupted pointer: capture_fault, auto-reset, resync, then corr
     else None
   in
   let r = run ~trace:true ~corrupt ~edges ~cycles () in
-  print_status r.status;
+  print_status r.status r.counts;
   printf "pointer reset asserted for %d cycles\n" r.ptr_resets;
   let s = oracle ~edges r in
   print_endline (Capture_oracle.pp s);
@@ -385,7 +454,7 @@ let%expect_test "a pulse narrower than the XOR: lost_edge on its pin, no event" 
   in
   let r = run ~edges ~cycles:500 () in
   print_events r;
-  print_status r.status;
+  print_status r.status r.counts;
   print_endline (Capture_oracle.pp (oracle ~edges r));
   [%expect {|
     cycle  66: timed   pins 2 changed 2 reconfig 0 stale 0 time 15078
@@ -423,7 +492,7 @@ let%expect_test "enabling and disabling a high pin creates no phantom edge" =
   in
   let r = run ~enable ~captures ~edges ~cycles:220 () in
   print_events r;
-  print_status r.status;
+  print_status r.status r.counts;
   [%expect {|
     cycle  56: timed   pins 9 changed 1 reconfig 0 stale 0 time  9663
     cycle  86: timed   pins 1 changed 8 reconfig 0 stale 0 time  8485
@@ -523,7 +592,7 @@ let%expect_test "pins high at reset: edges counted forward, no false lost_edge" 
   let edges = List.init 12 ~f:(fun k -> { Ref.time = ((40 + (10 * k)) * spc) + 7; pin = k % 4 }) in
   let r = run ~initial ~edges ~cycles:200 () in
   print_events r;
-  print_status r.status;
+  print_status r.status r.counts;
   print_endline (Capture_oracle.pp (oracle ~initial ~edges r));
   [%expect {|
     cycle  46: timed   pins 4 changed 1 reconfig 0 stale 0 time  4255
@@ -556,7 +625,7 @@ let%expect_test "capture balance far below 0 between checks: merge_error, not wr
       List.map [ 0, 0; 1, 1; 3, 2; 4, 3; 7, 0 ] ~f:(fun (dt, pin) -> { Ref.time = t + dt; pin }))
   in
   let r = run ~edges ~cycles:500 () in
-  print_status r.status;
+  print_status r.status r.counts;
   print_endline (Capture_oracle.pp (oracle ~edges r));
   [%expect {|
     status: fault 0 (0) overflow 0 (0) lost_edge 1 (1) level_mismatch 0 (0) merge_error e (1) empty 0 stale 0 resyncing 0
