@@ -126,7 +126,7 @@ let%expect_test "an edge flagged at the end of the run is not pending" =
   [%expect {| edges 1: timed 0, untimed 0, lost+flagged 1, bad+flagged 0 | UNFLAGGED: lost 0, phantom 0 (late flag 0) | pending 0 |}]
 ;;
 
-let%expect_test "resync conformance (D-13): a loss mark and a right untimed re-baseline" =
+let%expect_test "resync conformance (D-13): the first event after a resync carries [lost]" =
   let flags = { no_flags with faults = [ 12 ]; resync = List.range 13 21 } in
   let report events =
     let edges = [ { O.time = cycle_time 10 - 500; pin = 0; level = true } ] in
@@ -134,14 +134,30 @@ let%expect_test "resync conformance (D-13): a loss mark and a right untimed re-b
       O.check ~pins:2 ~edges ~events ~flags ~cycle_of_time ~cycle_time ~match_tol:300 ~windows
         ~deadline:(fun _ -> 100) ~end_cycle:200
     in
-    print_endline (O.pp_resyncs s)
+    printf "%s, ok %b\n" (O.pp_resyncs s) (O.ok s)
   in
-  (* the first event after the resync: untimed with pin 0 high, marked *)
-  report [ event ~untimed:true ~loss_mark:true ~flagged:true ~cycle:25 ~pins:0b01 ~changed:0 () ];
-  (* an empty flagged untimed event with wrong levels is neither *)
-  report [ event ~untimed:true ~flagged:true ~cycle:25 ~pins:0b00 ~changed:0 () ];
+  (* the first event after the resync (and after the events in flight) *)
+  report [ event ~loss_mark:true ~est:(cycle_time 24) ~cycle:25 ~pins:0b01 ~changed:0 () ];
+  report [ event ~est:(cycle_time 24) ~cycle:25 ~pins:0b01 ~changed:0 () ];
+  (* an unmarked event still in flight, then a marked one *)
+  report
+    [ event ~cycle:21 ~pins:0b01 ~changed:0 ()
+    ; event ~loss_mark:true ~cycle:25 ~pins:0b01 ~changed:0 ()
+    ];
+  (* no event after it: pending, not an error; a resync without a pulse
+     (start-up) is not counted *)
+  report [];
+  let flags = { no_flags with resync = List.range 13 21 } in
+  let s =
+    O.check ~pins:2 ~edges:[] ~events:[ event ~cycle:25 ~pins:0 ~changed:0 () ] ~flags ~cycle_of_time
+      ~cycle_time ~match_tol:300 ~windows ~deadline:(fun _ -> 100) ~end_cycle:200
+  in
+  print_endline (O.pp_resyncs s);
   [%expect {|
-    resyncs 1: first event after it loss-marked 1, levels re-baselined by an untimed event 1
-    resyncs 1: first event after it loss-marked 0, levels re-baselined by an untimed event 0
+    resyncs after a loss 1: first event after it marked lost 1, NOT MARKED 0 (D-13), ok true
+    resyncs after a loss 1: first event after it marked lost 0, NOT MARKED 1 (D-13), ok false
+    resyncs after a loss 1: first event after it marked lost 1, NOT MARKED 0 (D-13), ok true
+    resyncs after a loss 1: first event after it marked lost 0, NOT MARKED 0 (D-13), ok true
+    resyncs after a loss 0: first event after it marked lost 0, NOT MARKED 0 (D-13)
     |}]
 ;;

@@ -97,6 +97,8 @@ let island lib =
       ; count_select = zero Cap.I.port_widths.count_select
       ; pins
       ; ring = state
+      ; ring_time = sampled.time
+      ; ring_time_valid = sampled.valid &: ~:(sampled.pattern_error)
       }
   in
   let tdc =

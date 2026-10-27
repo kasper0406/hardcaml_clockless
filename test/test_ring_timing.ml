@@ -112,7 +112,7 @@ module Measure (Config : Ring.Timed_config) = struct
 
   let create_sim ~wire_load ~path ~n ~clock_period =
     let tl = Timing_library.load path in
-    let sim = Event_sim.create ~config:{ Event_sim.Config.default with wire_load } tl (circuit tl.library) in
+    let sim = Event_sim.create ~config:{ Event_sim.Config.pre_layout with wire_load } tl (circuit tl.library) in
     let sel = List.findi_exn Config.lengths ~f:(fun _ m -> m = n) |> fst in
     Event_sim.set_input_int sim "length_sel" sel ~at:0;
     Event_sim.set_input_int sim "enable" 0 ~at:0;
@@ -323,7 +323,7 @@ let check worst =
 (* The baseline for reported numbers: the library's default wire load
    ("1k"), pre-layout. [Flat] (1 fF per net, Event_sim's default) is kept as
    a regression. *)
-let wire_load : Event_sim.Config.wire_load = Liberty_default
+let wire_load = Event_sim.Config.pre_layout.wire_load
 
 let%expect_test "counter selection margins with Liberty delays at three corners (Liberty 1k wire load)" =
   print_endline "selectable length (mux in the loop):";

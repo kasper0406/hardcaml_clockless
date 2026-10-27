@@ -104,6 +104,7 @@ module Config = struct
     ; input_slew : float
     ; prim_delay : int
     ; reg_clock_to_q : int
+    ; reg_resolves_x : bool
     ; untimed_logic : untimed_logic
     ; metastability : bool
     ; tau : float
@@ -133,6 +134,7 @@ module Config = struct
     ; input_slew = 0.05
     ; prim_delay = 0
     ; reg_clock_to_q = 0
+    ; reg_resolves_x = false
     ; untimed_logic = Allow
     ; metastability = true
     ; tau = 0.030
@@ -146,6 +148,15 @@ module Config = struct
     ; clock_delay_overrides = []
     ; flop_init = Init_x
     ; reg_init = Init_zero
+    }
+  ;;
+
+  let pre_layout =
+    { default with
+      wire_load = Liberty_default
+    ; pulse_width_check = Log
+    ; recovery_removal_check = Log
+    ; reg_resolves_x = true
     }
   ;;
 end
@@ -326,6 +337,8 @@ type t =
   ; primary_inputs : (int, unit) Hashtbl.t
   ; watchers : (int -> int -> unit) list array
   ; meta_rng : Random.State.t
+  ; reg_x_rng : Random.State.t
+  ; mutable reg_x_resolutions : int
   ; mutable now : int
   ; mutable next_seq : int
   ; mutable heap : event array
@@ -835,7 +848,16 @@ and eval_reg t r =
     if c_old = active_old && c = active_new
     then (
       let f = next () in
-      set_bits f)
+      if t.config.reg_resolves_x
+      then
+        set_bits (fun i q ->
+          let nv = f i q in
+          if nv = vx
+          then (
+            t.reg_x_resolutions <- t.reg_x_resolutions + 1;
+            Random.State.int t.reg_x_rng 2)
+          else nv)
+      else set_bits f)
     else if c = vx && c_old = active_old
     then (
       let f = next () in
@@ -1731,6 +1753,8 @@ let create ?(config = Config.default) (lib : Timing_library.t) (circuit : Circui
     ; primary_inputs
     ; watchers = Array.create ~len:num_nets []
     ; meta_rng = Random.State.make [| config.seed; 2 |]
+    ; reg_x_rng = Random.State.make [| config.seed; 4 |]
+    ; reg_x_resolutions = 0
     ; now = 0
     ; next_seq = 0
     ; heap = Array.create ~len:1024 dummy_event
@@ -1841,6 +1865,7 @@ let on_change t name f =
 ;;
 
 let metastable_events t = List.rev t.metastable
+let reg_x_resolutions t = t.reg_x_resolutions
 let timing_violations t = List.rev t.violations
 let untimed_logic t = t.untimed
 let clock_delays t = t.clock_delays

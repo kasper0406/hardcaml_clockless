@@ -224,6 +224,14 @@ module Config : sig
     ; input_slew : float (** ns, for primary inputs *)
     ; prim_delay : int (** fs, Hardcaml combinational primitives *)
     ; reg_clock_to_q : int (** fs, Hardcaml registers *)
+    ; reg_resolves_x : bool
+    (** a Hardcaml register that loads X on a clean clock edge loads a
+        seeded random 0 or 1 instead (counted, {!reg_x_resolutions}): a
+        real flop resolves. For registers that may sample a cell output
+        while it is metastable or changing (e.g. a read racing an
+        asynchronous write), so that the X does not stand for a value
+        forever. Off by default: it also hides X from missing
+        initialisation. *)
     ; untimed_logic : untimed_logic (** Liberty mode only *)
     ; metastability : bool (** off: liberty flops sample ideally at the edge *)
     ; tau : float (** ns, mean metastability resolution time *)
@@ -246,10 +254,19 @@ module Config : sig
 
   (** Liberty delays, inertial, corner 1, no variation, seed 0, [Flat] 1 fF
       wire, Hardcaml inputs free, 50 ps input slew, zero-delay primitives and
-      registers allowed, metastability on with tau = 30 ps (not scaled),
+      registers allowed (not resolving X), metastability on with tau = 30 ps (not scaled),
       pulse width and recovery/removal checks off, ideal clocks, flops start
       X, registers start 0. *)
   val default : t
+
+  (** The pre-layout baseline for the reported ring and Pin_capture numbers
+      (owner decision D-9): [default] with the library's default wire load
+      ([Liberty_default], "1k" in sg13cmos5l), the minimum pulse width and
+      recovery/removal checks set to [Log] (they only record:
+      {!timing_violations}), and Hardcaml registers resolving X
+      ([reg_resolves_x]). Override [wire_load = Flat] for the flat-wire
+      regressions. *)
+  val pre_layout : t
 end
 
 module Metastable_event : sig
@@ -350,6 +367,10 @@ val on_change : t -> string -> (time:int -> Value.t -> unit) -> unit
 
 (** Oldest first. *)
 val metastable_events : t -> Metastable_event.t list
+
+(** Hardcaml register bits that loaded X and were resolved
+    ([Config.reg_resolves_x]). *)
+val reg_x_resolutions : t -> int
 
 (** Oldest first (by detection). *)
 val timing_violations : t -> Timing_violation.t list
