@@ -263,8 +263,9 @@ module type S = sig
     [@@deriving hardcaml]
   end
 
-  (** A flip-flop cell with an active-low asynchronous reset. *)
-  type flop =
+  (** A flip-flop cell with an active-low asynchronous reset (an alias of
+      {!Cell.Flop.t}). *)
+  type flop = Cell.Flop.t =
     { cell : string
     ; clk : string
     ; d : string
@@ -410,7 +411,7 @@ module Make_timed (C : Timed_config) : S = struct
     [@@deriving hardcaml]
   end
 
-  type flop =
+  type flop = Cell.Flop.t =
     { cell : string
     ; clk : string
     ; d : string
@@ -430,82 +431,11 @@ module Make_timed (C : Timed_config) : S = struct
     | Cells of cells
     | Model of Signal.t Model_stimulus.t
 
-  let flop_cell library (f : flop) ~instance ~clk ~reset_n d =
-    Cell.instantiate library ~cell:f.cell ~instance [ f.clk, clk; f.d, d; f.reset_n, reset_n ] f.q
-  ;;
-
   type loop_break =
     { instance : string
     ; pin : string
     }
   [@@deriving sexp_of]
-
-  (* Identify cell pins from their functions, so any library works. *)
-  module Pins = struct
-    let inputs lib cell =
-      List.map (Cell_library.Cell.inputs (Cell_library.find_exn lib cell)) ~f:(fun p -> p.name)
-    ;;
-
-    let output_and_function lib cell =
-      match Cell_library.Cell.outputs (Cell_library.find_exn lib cell) with
-      | [ { name; function_ = Some f; _ } ] -> name, f
-      | _ -> raise_s [%message "Ring: expected one output with a function" (cell : string)]
-    ;;
-
-    let check lib cell ~arity ~f:reference ~what =
-      let ins = inputs lib cell in
-      let out, fn = output_and_function lib cell in
-      if List.length ins <> arity then raise_s [%message "Ring: wrong pin count" (cell : string) what];
-      List.iter (List.init (1 lsl arity) ~f:Fn.id) ~f:(fun bits ->
-        let env p =
-          let i, _ = List.findi_exn ins ~f:(fun _ q -> String.equal p q) in
-          (bits lsr i) land 1 = 1
-        in
-        if Bool.( <> ) (Bool_expr.eval fn ~env) (reference (List.map ins ~f:env))
-        then raise_s [%message "Ring: cell does not implement" (cell : string) what]);
-      ins, out
-    ;;
-
-    let inverter lib cell =
-      match check lib cell ~arity:1 ~what:"an inverter" ~f:(function [ a ] -> not a | _ -> false) with
-      | [ a ], y -> a, y
-      | _ -> assert false
-    ;;
-
-    let nand2 lib cell =
-      match
-        check lib cell ~arity:2 ~what:"a nand2" ~f:(function [ a; b ] -> not (a && b) | _ -> false)
-      with
-      | [ a; b ], y -> a, b, y
-      | _ -> assert false
-    ;;
-
-    (* Returns (select, input when select=0, input when select=1, output). *)
-    let mux2 lib cell =
-      let ins = inputs lib cell in
-      let out, fn = output_and_function lib cell in
-      let eval assign = Bool_expr.eval fn ~env:(fun p -> List.Assoc.find_exn assign p ~equal:String.equal) in
-      let candidates =
-        List.filter_map ins ~f:(fun s ->
-          match List.filter ins ~f:(Fn.non (String.equal s)) with
-          | [ x; y ] ->
-            let all = List.init 8 ~f:Fn.id in
-            let ok d0 d1 =
-              List.for_all all ~f:(fun b ->
-                let vs = (b land 1 = 1), (b land 2 = 2), (b land 4 = 4) in
-                let sv, xv, yv = vs in
-                let assign = [ s, sv; x, xv; y, yv ] in
-                Bool.equal (eval assign) (if sv then List.Assoc.find_exn assign d1 ~equal:String.equal
-                                          else List.Assoc.find_exn assign d0 ~equal:String.equal))
-            in
-            if ok x y then Some (s, x, y) else if ok y x then Some (s, y, x) else None
-          | _ -> None)
-      in
-      match candidates with
-      | [ (s, d0, d1) ] -> s, d0, d1, out
-      | _ -> raise_s [%message "Ring: cell is not a 2:1 mux" (cell : string)]
-    ;;
-  end
 
   module Analog = struct
     let create ~name implementation ~enable ~length_sel =
@@ -533,9 +463,9 @@ module Make_timed (C : Timed_config) : S = struct
           }
         , [] )
       | Cells { library; nand2; inverter; mux2; flop } ->
-        let nand_a, nand_b, nand_y = Pins.nand2 library nand2 in
-        let inv_a, inv_y = Pins.inverter library inverter in
-        let mux_s, mux_d0, mux_d1, mux_x = Pins.mux2 library mux2 in
+        let nand_a, nand_b, nand_y = Cell_pins.nand2 library nand2 in
+        let inv_a, inv_y = Cell_pins.inverter library inverter in
+        let mux_s, mux_d0, mux_d1, mux_x = Cell_pins.mux2 library mux2 in
         let fb = wire 1 in
         let nand_instance = name ^ "_nand" in
         let node0 =
@@ -587,8 +517,8 @@ module Make_timed (C : Timed_config) : S = struct
             let node0_buf = inv (name ^ "_clkinv_a1") node0 |> inv (name ^ "_clkinv_a2") in
             let counter tag clk =
               Counter.create_with ~johnson_bits ~gray_width ~flop:(fun bit d ->
-                flop_cell library f ~instance:(Printf.sprintf "%s_cnt_%s_%s" name tag bit) ~clk
-                  ~reset_n:enable d)
+                Cell.Flop.instantiate library f ~instance:(Printf.sprintf "%s_cnt_%s_%s" name tag bit)
+                  ~clk ~reset_n:enable d)
             in
             counter "a" node0_buf, counter "b" node0_n
         in
@@ -709,7 +639,7 @@ module Make_timed (C : Timed_config) : S = struct
           r -- nm
         | Some (library, f) ->
           (* the instance keeps [nm]; a wire of the same name would rename it *)
-          flop_cell library f ~instance:nm ~clk:i.clock ~reset_n:vdd b -- (nm ^ "_q")
+          Cell.Flop.instantiate library f ~instance:nm ~clk:i.clock ~reset_n:vdd b -- (nm ^ "_q")
       in
       let first x nm =
         let nm = Printf.sprintf "%s_sample_%s" name nm in

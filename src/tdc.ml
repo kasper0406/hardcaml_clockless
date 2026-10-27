@@ -13,7 +13,11 @@
     v}
 
     The first sample stage is a bank of plain registers named
-    [<name>_sample<i>] with [dont_touch]/[keep]; the delay cells are
+    [<name>_sample<i>] with [dont_touch]/[keep], or, with [first_stage], of
+    flip-flop cells: instances [<name>_sample<i>], outputs
+    [<name>_sample<i>_q]. Synthesis gives a kept register a generated
+    instance name (only its output net keeps the name), so prefer cells
+    where constraints must find the flops. The delay cells are
     [<name>_stage<i>] (see {!Delay_line}).
 
     {2 Positions}
@@ -162,11 +166,20 @@ module type S = sig
 
   (** The analog part: delay line plus the first sample stage. *)
   module Analog : sig
-    (** [create ~name implementation ~clock ~hit] returns the [positions]-bit
-        sampled vector, bit [i] = position [i], registered on [clock]. The
-        sampling registers are named [<name>_sample<i>] and carry
-        [dont_touch]/[keep]; delay cells are [<name>_stage<i>]. *)
-    val create : name:string -> implementation -> clock:Signal.t -> hit:Signal.t -> Signal.t
+    (** [create ?first_stage ~name implementation ~clock ~hit] returns the
+        [positions]-bit sampled vector, bit [i] = position [i], registered on
+        [clock]. The sampling registers are named [<name>_sample<i>] and
+        carry [dont_touch]/[keep]; with [first_stage] they are flip-flop
+        cells instead (instances [<name>_sample<i>], outputs
+        [<name>_sample<i>_q], reset tied inactive). Delay cells are
+        [<name>_stage<i>]. *)
+    val create
+      :  ?first_stage:Cell_library.t * Cell.Flop.t
+      -> name:string
+      -> implementation
+      -> clock:Signal.t
+      -> hit:Signal.t
+      -> Signal.t
   end
 
   (** The synchronous decoder. Ordinary Hardcaml: it simulates in Cyclesim
@@ -184,16 +197,25 @@ module type S = sig
     val create : Scope.t -> Signal.t I.t -> Signal.t O.t
   end
 
-  (** [create ?name implementation scope i]. [name] (default ["tdc"]) prefixes
-      cell instance and sampling register names. *)
-  val create : ?name:string -> implementation -> Scope.t -> Signal.t I.t -> Signal.t O.t
+  (** [create ?first_stage ?name implementation scope i]. [name] (default
+      ["tdc"]) prefixes cell instance and sampling register names.
+      [first_stage]: build the first sample stage from flip-flop cells (see
+      {!Analog.create}). *)
+  val create
+    :  ?first_stage:Cell_library.t * Cell.Flop.t
+    -> ?name:string
+    -> implementation
+    -> Scope.t
+    -> Signal.t I.t
+    -> Signal.t O.t
 
   (** As [create], as a separate module called [module_name] (the caller's
       prefix included, e.g. ["protoemu_tdc"]) unless the scope flattens the
       design. [Model] is only allowed in a flattened scope, since its stimulus
       comes from outside the module. *)
   val hierarchical
-    :  ?name:string
+    :  ?first_stage:Cell_library.t * Cell.Flop.t
+    -> ?name:string
     -> module_name:string
     -> implementation
     -> Scope.t
@@ -298,7 +320,7 @@ module Make (Config : Config) : S = struct
   module Analog = struct
     let sample_attributes = Cell.attributes
 
-    let create ~name implementation ~clock ~hit =
+    let create ?first_stage ~name implementation ~clock ~hit =
       if Signal.width hit <> 1 then raise_config "hit must be 1 bit";
       (* What each position shows at the clock edge. *)
       let at_edge =
@@ -324,9 +346,15 @@ module Make (Config : Config) : S = struct
       in
       let spec = Reg_spec.create ~clock () in
       List.mapi at_edge ~f:(fun i x ->
-        let r = reg spec x in
-        List.iter sample_attributes ~f:(fun a -> ignore (add_attribute r a : Signal.t));
-        r -- Printf.sprintf "%s_sample%d" name i)
+        let nm = Printf.sprintf "%s_sample%d" name i in
+        match first_stage with
+        | None ->
+          let r = reg spec x in
+          List.iter sample_attributes ~f:(fun a -> ignore (add_attribute r a : Signal.t));
+          r -- nm
+        | Some (library, f) ->
+          (* the instance keeps [nm]; a wire of the same name would rename it *)
+          Cell.Flop.instantiate library f ~instance:nm ~clk:clock ~reset_n:vdd x -- (nm ^ "_q"))
       |> concat_lsb
     ;;
   end
@@ -394,12 +422,12 @@ module Make (Config : Config) : S = struct
     ;;
   end
 
-  let create ?(name = "tdc") implementation scope (i : Signal.t I.t) =
-    let sampled = Analog.create ~name implementation ~clock:i.clock ~hit:i.hit in
+  let create ?first_stage ?(name = "tdc") implementation scope (i : Signal.t I.t) =
+    let sampled = Analog.create ?first_stage ~name implementation ~clock:i.clock ~hit:i.hit in
     Decoder.create scope { Decoder.I.clock = i.clock; clear = i.clear; sampled }
   ;;
 
-  let hierarchical ?name ~module_name implementation scope =
+  let hierarchical ?first_stage ?name ~module_name implementation scope =
     (match implementation with
      | Model _ when not (Scope.flatten_design scope) ->
        raise_s
@@ -408,6 +436,6 @@ module Make (Config : Config) : S = struct
              (module_name : string)]
      | Model _ | Cells _ -> ());
     let module H = Hierarchy.In_scope (I) (O) in
-    H.hierarchical ~scope ~name:module_name (create ?name implementation)
+    H.hierarchical ~scope ~name:module_name (create ?first_stage ?name implementation)
   ;;
 end

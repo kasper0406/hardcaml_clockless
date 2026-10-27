@@ -11,7 +11,7 @@
 
     [create] reads a flattened Hardcaml circuit. Every instance carrying
     {!Cell.attributes}' [dont_touch] is protected, and so is every register
-    carrying it (the first sampling stage of {!Tdc}, or of {!Ring.S.Clk_sampler}
+    carrying it (the first sampling stage of {!Tdc}, {!Ring.S.Clk_sampler}
     and [Pin_capture] without [first_stage] cells). Protected nets are those
     driven by a protected instance or register, plus registered {e fork}
     nets: inputs whose branches race each other, e.g. a captured pin that
