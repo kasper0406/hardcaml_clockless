@@ -1,0 +1,8 @@
+; The stub island for the physical-flow gate (README "Physical flow",
+; janestreet-bitbanger flow/). Not run by `dune runtest`: it needs the
+; LibreLane flow.
+(executable
+ (name gen_stub)
+ (libraries hardcaml_clockless hardcaml stdio)
+ (preprocess
+  (pps ppx_jane)))
