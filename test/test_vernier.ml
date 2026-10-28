@@ -561,7 +561,7 @@ let%expect_test "Sdc.vernier: lines cut from registers and ports, select and dra
     set_max_delay 20.0000 -to [get_pins ... (58 S pins, first vernier_p1_r_cm1_0/S)
     set_max_delay 20.0000 -to [get_pins ... (58 S pins, first vernier_p1_f_cm1_0/S)
     set_max_delay 80.0000 -from [get_cells {vernier_p1_r_launch vernier_p1_f_launch}] -to [get_pins {vernier_p1_out/A0}]
-    protected nets: 942, e.g. vernier_p0_r_cm6_0__X
+    protected nets: 982, e.g. vernier_p0_r_cm6_0__X
     drain: from vernier_p0_r_launch vernier_p0_f_launch to vernier_p0_out/A0 (driven by the XOR)
     drain: from vernier_p1_r_launch vernier_p1_f_launch to vernier_p1_out/A0 (driven by the XOR)
     select bound covers exactly the S pin of every mux but the output muxes (232): true

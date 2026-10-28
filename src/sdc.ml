@@ -13,20 +13,32 @@
     {!Cell.attributes}' [dont_touch] is protected, and so is every register
     carrying it (the first sampling stage of {!Tdc}, {!Ring.S.Clk_sampler}
     and [Pin_capture] without [first_stage] cells). Protected nets are those
-    driven by a protected instance or register, plus registered {e fork}
-    nets: inputs whose branches race each other, e.g. a captured pin that
-    feeds both the merge NAND and its snapshot buffer. Net names are the
-    circuit's ({!Cell} names every output [<instance>__<pin>]).
+    driven by a protected instance or register (but not outputs of
+    protected instances that feed only synthesised logic, e.g. a first
+    sampling stage: hold repair must be able to buffer them, and a
+    protected net is never repaired), registered {e fork} nets
+    (inputs whose branches race each other, e.g. a captured pin that feeds
+    both the merge NAND and its snapshot buffer) and {e boundary} nets:
+    nets from synthesised logic into a protected instance (a mux select, a
+    flop reset). OpenROAD cannot buffer a net with a dont-touch load (the
+    load pin cannot move to the new net: [repair_design] stops with
+    RSZ-3006), so those nets must not be repaired at all; keep their fanout
+    small (the PDK's max fanout) or build their fanout from cells. Inputs
+    of the circuit are left alone: the clock is the parent's and CTS builds
+    its tree. Net names are the circuit's ({!Cell} names every output
+    [<instance>__<pin>]); synthesis may rename boundary nets, which
+    {!dont_touch_list} resolves.
 
     A kept register becomes a flop with a generated instance name in
     synthesis; only its output net is named. {!dont_touch_list} resolves those
-    instances (and unnamed fork nets) from a synthesised netlist; prefer cell
+    instances (and renamed nets) from a synthesised netlist; prefer cell
     first stages where a structure offers them.
 
     {2 LibreLane}
 
     LibreLane applies [RSZ_DONT_TOUCH_RX] (a Tcl regexp matched against every
-    net and instance name) and [RSZ_DONT_TOUCH_LIST] only around its resizer
+    net and instance name; {!rsz_dont_touch_rx} before synthesis,
+    {!dont_touch_rx} of {!dont_touch_list} after) only around its resizer
     steps (design repair after global placement and routing, timing repair
     after CTS and routing, and global placement); clock tree synthesis and
     antenna repair do not see them. Hence island clocks are only in the
@@ -63,7 +75,8 @@ module Driver = struct
     | Cell of Endpoint.t (** a protected instance's output *)
     | Register of string (** a kept register, by name *)
     | Constant of bool
-    | Other (** synthesised logic or an input port *)
+    | Input (** an input port of the circuit *)
+    | Other (** synthesised logic *)
   [@@deriving sexp_of]
 end
 
@@ -75,15 +88,22 @@ module Net = struct
     ; logic_sinks : bool (** also feeds logic outside the island *)
     ; ports : string list (** circuit outputs on it *)
     ; fork : bool
+    ; boundary : bool (** from synthesised logic into a protected instance *)
+    ; kept_sink : bool (** feeds a kept register (D, clock or reset) *)
     }
   [@@deriving sexp_of]
 
   let is_protected t =
     t.fork
+    || t.boundary
     ||
     match t.driver with
-    | Cell _ | Register _ -> true
-    | Constant _ | Other -> false
+    | Register _ -> true
+    | Cell _ ->
+      (* not an exit into synthesised logic alone (a first sampling stage's
+         output): the resizer must be free to fix hold there *)
+      not (List.is_empty t.sinks && List.is_empty t.ports && not t.kept_sink)
+    | Constant _ | Input | Other -> false
   ;;
 end
 
@@ -231,6 +251,7 @@ let create ?(prefix = "") (circuit : Circuit.t) =
   let sinks = Array.create ~len:!count [] in
   let logic = Array.create ~len:!count false in
   let ports = Array.create ~len:!count [] in
+  let kept_sink = Array.create ~len:!count false in
   List.iter signals ~f:(fun s ->
     let w = Signal.width s in
     List.iter (Signal.names s) ~f:(fun nm ->
@@ -251,6 +272,13 @@ let create ?(prefix = "") (circuit : Circuit.t) =
         let n = net o i in
         ports.(n) <- (if w = 1 then nm else Printf.sprintf "%s[%d]" nm i) :: ports.(n)
       done));
+  (* An island inside a hierarchy (a prefix) shares its inputs with the
+     parent, whose loads on them are its business, like those on outputs. *)
+  List.iter (Circuit.inputs circuit) ~f:(fun i ->
+    for b = 0 to Signal.width i - 1 do
+      driver.(net i b) <- Input;
+      if not (String.is_empty prefix) then logic.(net i b) <- true
+    done);
   let instances = Queue.create () in
   let registers = Queue.create () in
   List.iter signals ~f:(fun s ->
@@ -286,6 +314,9 @@ let create ?(prefix = "") (circuit : Circuit.t) =
       if Option.is_some r.enable || Option.is_some r.clear
       then raise_s [%message "Sdc: kept registers must be plain flops (no enable or clear)" name];
       driver.(net s 0) <- Register name;
+      kept_sink.(net d 0) <- true;
+      kept_sink.(net r.clock.clock 0) <- true;
+      Option.iter r.reset ~f:(fun x -> kept_sink.(net x.reset 0) <- true);
       Queue.enqueue
         registers
         { Register.name
@@ -310,6 +341,11 @@ let create ?(prefix = "") (circuit : Circuit.t) =
       ; logic_sinks = logic.(n)
       ; ports = List.sort ports.(n) ~compare:String.compare
       ; fork = false
+      ; kept_sink = kept_sink.(n)
+      ; boundary =
+          (match driver.(n) with
+           | Other -> not (List.is_empty sinks.(n))
+           | Cell _ | Register _ | Constant _ | Input -> false)
       })
   in
   { prefix
@@ -478,9 +514,10 @@ let pin_capture t ~name ~pins ~min_edge_spacing_ns =
     bypass path (level flop -> output mux -> pin) stays timed. Select paths
     past the select pins are cut only by the break at those pins.
 
-    The constraints appear in both stages: at PnR the resizer can repair the
-    select fan-out (synthesised logic); the drain paths are all
-    [dont_touch], so there it is a check. OpenSTA warns (1551) that each
+    The constraints appear in both stages. The select nets into the muxes
+    are boundary nets, protected and never repaired: their fanout is what
+    synthesis left ({!boundary_fanouts}); the drain paths are all
+    [dont_touch]. At PnR both are checks. OpenSTA warns (1551) that each
     internal pin "is not a valid endpoint" and honours it. The cells are
     protected like every [dont_touch] instance. *)
 let vernier t ~name ~pins ~period_ns ~settle_cycles =
@@ -491,7 +528,7 @@ let vernier t ~name ~pins ~period_ns ~settle_cycles =
   let driven_by (e : Endpoint.t) =
     match t.nets.(pin_net t e).driver with
     | Cell d -> Some d.instance
-    | Register _ | Constant _ | Other -> None
+    | Register _ | Constant _ | Input | Other -> None
   in
   (* a mux's select: its one input not driven by another cell of the line *)
   let select instance =
@@ -557,17 +594,32 @@ let rx_of_name nm =
     | c -> "\\" ^ String.of_char c)
 ;;
 
-let rsz_dont_touch_rx t =
-  let names =
-    List.map t.instances ~f:(fun i -> i.name)
-    @ List.concat_map (protected_nets t) ~f:(fun n -> n.names)
-    |> List.dedup_and_sort ~compare:String.compare
+(* An anchored Tcl ARE matching exactly [names], factored into a character
+   trie with non-capturing groups: islands have thousands of structured
+   names (ring_inv12, vernier_p0_r_cm1_7, ...), and LibreLane passes the
+   regex to OpenROAD in an environment variable (Linux: at most 128 KiB). *)
+let dont_touch_rx names =
+  let rec trie names =
+    let ends = List.exists names ~f:String.is_empty in
+    let branches =
+      List.filter names ~f:(fun s -> not (String.is_empty s))
+      |> List.group ~break:(fun a b -> not (Char.equal a.[0] b.[0]))
+      |> List.map ~f:(fun g ->
+        rx_of_name (String.prefix (List.hd_exn g) 1)
+        ^ trie (List.map g ~f:(fun s -> String.drop_prefix s 1)))
+    in
+    match branches, ends with
+    | [], _ -> ""
+    | [ b ], false -> b
+    | bs, false -> "(?:" ^ String.concat ~sep:"|" bs ^ ")"
+    | bs, true -> "(?:" ^ String.concat ~sep:"|" bs ^ ")?"
   in
-  Printf.sprintf
-    "^%s(%s)$"
-    (rx_of_name t.prefix)
-    (String.concat ~sep:"|" (List.map names ~f:rx_of_name))
+  match List.dedup_and_sort names ~compare:String.compare with
+  | [] -> "$^"
+  | names -> "^" ^ trie names ^ "$"
 ;;
+
+let rsz_dont_touch_rx t = dont_touch_rx (instance_names t @ net_names t)
 
 (* Names go into SDC braced (a list of them, space separated); refuse what
    would break the braces. *)
@@ -627,6 +679,11 @@ let sdc t ~(stage : Stage.t) ~system_clock =
        List.fold t.clocks ~init:[] ~f:(fun acc c ->
          if List.mem acc c.group ~equal:String.equal then acc else acc @ [ c.group ])
      in
+     if not (List.is_empty t.clocks)
+     then
+       line
+         "set_propagated_clock [get_clocks {%s}]"
+         (String.concat ~sep:" " (List.map t.clocks ~f:(fun c -> c.name)));
      if not (List.is_empty groups)
      then
        line
@@ -698,21 +755,27 @@ let single_var : Bool_expr.t -> (string * bool) option = function
     output) departs from the islands; [[]] if they survived:
     - every protected instance exists with the same cell type;
     - every protected net is a single netlist net with one driver, carries one
-      of its circuit names (so the dont-touch regex matched it), still drives
-      its circuit outputs, and, unless it also feeds synthesised logic, has no
-      loads but its island sinks and [passive] cells (default: Liberty cells
-      with only inputs, e.g. antenna diodes). Loads from synthesised logic are
-      not checked one by one;
+      of its circuit names (so the dont-touch regex matched it) or a name in
+      [dont_touch] (the resolved names), and, if renamed, one it had in
+      [reference] (the synthesised netlist the names were resolved from:
+      which net it is, beyond being protected), still drives its circuit
+      outputs, and, unless it also feeds synthesised logic, has no loads but
+      its island sinks and [passive] cells (default: Liberty cells with only
+      inputs, e.g. antenna diodes). Loads from synthesised logic are not
+      checked one by one, nor loads on boundary nets (synthesis may share
+      them), nor, with a [prefix], loads on the island's inputs and outputs
+      (the parent's logic);
     - every kept register is a plain D flop with the right clock edge, its D on
       the expected net, its clock from the circuit's clock and, if the
       register had no reset, its clear/preset tied inactive;
     - inputs entering the island may be rebuffered but must come from the net
       that still carries their circuit name ([boundary] maps circuit names to
-      netlist names, e.g. after flattening). Named inputs whose names are all
-      gone are reported as unverifiable; unnamed ones only need a common
-      source. Constants may be literals or tie cells of the right value. *)
-let check ?passive ?(boundary = []) t ~(library : Timing_library.t) (nl : Netlist.t) =
+      netlist names, e.g. after flattening). Circuit inputs whose names are
+      all gone are reported as unverifiable. Constants may be literals or tie
+      cells of the right value. *)
+let check ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(library : Timing_library.t) (nl : Netlist.t) =
   let errors = Queue.create () in
+  let dont_touch = Set.of_list (module String) dont_touch in
   let err fmt = Printf.ksprintf (Queue.enqueue errors) fmt in
   let p nm = t.prefix ^ nm in
   let passive =
@@ -812,6 +875,17 @@ let check ?passive ?(boundary = []) t ~(library : Timing_library.t) (nl : Netlis
        | Register r -> Netlist.find_net nl (p r)
        | _ -> by_name net)
   in
+  let reference_names (net : Net.t) =
+    Option.bind reference ~f:(fun r ->
+      List.find_map
+        ((match net.driver with
+          | Cell e -> [ e ]
+          | _ -> [])
+         @ net.sinks)
+        ~f:(fun (e : Endpoint.t) ->
+          Option.bind (Netlist.find_instance r (p e.instance)) ~f:(fun i -> pin_conn i e.pin))
+      |> Option.map ~f:(Netlist.net_names r))
+  in
   let label (net : Net.t) =
     match net.names with
     | nm :: _ -> p nm
@@ -825,17 +899,20 @@ let check ?passive ?(boundary = []) t ~(library : Timing_library.t) (nl : Netlis
        | Some v when Bool.equal v b -> ()
        | _ -> err "%s should be constant %d, is on %s" what (Bool.to_int b) (net_str (root n 0)))
     | _ ->
-      (match by_name net with
-       | Some m ->
+      (match by_name net, net.driver with
+       | Some m, _ ->
          if root m 0 <> root n 0
          then err "%s is driven from %s, not from %s" what (net_str (root n 0)) (net_str m)
-       | None ->
-         if not (List.is_empty net.names)
-         then
-           err
-             "%s: cannot verify its source, none of %s survives (pass ~boundary)"
-             what
-             (String.concat ~sep:"," (List.map net.names ~f:p)))
+       | None, Input when not (List.is_empty net.names) ->
+         err
+           "%s: cannot verify its source, none of %s survives (pass ~boundary)"
+           what
+           (String.concat ~sep:"," (List.map net.names ~f:p))
+       | None, _ ->
+         (* a boundary net: synthesis may rename it (yosys prefers generated
+            whole-wire names to bits of a named bus); it is checked as one
+            protected net *)
+         ())
   in
   (* flops synthesised from kept registers, by their D net *)
   let reg_flops = Hashtbl.create (module Int) in
@@ -907,8 +984,23 @@ let check ?passive ?(boundary = []) t ~(library : Timing_library.t) (nl : Netlis
         in
         Option.iter n ~f:(fun n ->
           let have = Netlist.net_names nl n in
+          let by_circuit_name =
+            List.exists net.names ~f:(fun nm -> List.mem have (p nm) ~equal:String.equal)
+          in
+          (* renamed: it must be the net it was in the reference *)
+          (match reference_names net with
+           | Some names
+             when (not by_circuit_name)
+                  && not (List.exists have ~f:(List.mem names ~equal:String.equal)) ->
+             err
+               "net %s is %s in the netlist, %s in the reference"
+               (label net)
+               (net_str n)
+               (String.concat ~sep:"," names)
+           | _ -> ());
           if (not (List.is_empty net.names))
-             && not (List.exists net.names ~f:(fun nm -> List.mem have (p nm) ~equal:String.equal))
+             && (not by_circuit_name)
+             && not (List.exists have ~f:(Set.mem dont_touch))
           then
             err
               "net %s is named %s in the netlist: the dont-touch names do not match it"
@@ -916,7 +1008,7 @@ let check ?passive ?(boundary = []) t ~(library : Timing_library.t) (nl : Netlis
               (net_str n);
           (match drivers.(n), net.driver with
            | [ _ ], _ -> ()
-           | [], (Constant _ | Other) -> () (* an input port *)
+           | [], (Constant _ | Input) -> () (* an input port *)
            | ds, _ ->
              err
                "net %s has %d drivers: %s"
@@ -925,7 +1017,7 @@ let check ?passive ?(boundary = []) t ~(library : Timing_library.t) (nl : Netlis
                (String.concat ~sep:", " (List.map ds ~f:(fun (i, pin) -> i.name ^ "/" ^ pin))));
           (* a fork fed from outside keeps its source *)
           (match net.driver with
-           | Other | Constant _ -> check_source net ("net " ^ label net) n
+           | Input | Other | Constant _ -> check_source net ("net " ^ label net) n
            | Cell _ | Register _ -> ());
           (* circuit outputs (top level only: in a flattened hierarchy they are
              the parent's logic) *)
@@ -936,7 +1028,9 @@ let check ?passive ?(boundary = []) t ~(library : Timing_library.t) (nl : Netlis
               match Netlist.find_net nl port with
               | Some m when root m 0 = n -> ()
               | _ -> err "net %s no longer drives output %s" (label net) port);
-          if not (net.logic_sinks || port_sinks)
+          (* boundary nets are synthesised logic, which synthesis may share
+             with other logic *)
+          if not (net.logic_sinks || port_sinks || net.boundary)
           then (
             let expected =
               List.filter_map net.sinks ~f:(fun e ->
@@ -967,9 +1061,14 @@ let check ?passive ?(boundary = []) t ~(library : Timing_library.t) (nl : Netlis
   Queue.to_list errors
 ;;
 
-(** Exact names for LibreLane's [RSZ_DONT_TOUCH_LIST], from a synthesised
-    netlist: protected instances, the netlist names of protected nets, and the
-    flops synthesised from kept registers. An error if any is missing. *)
+(** Exact names to protect, from a synthesised netlist: protected
+    instances, the netlist names of protected nets, and the flops
+    synthesised from kept registers. An error if any is missing.
+
+    Give them to LibreLane as [RSZ_DONT_TOUCH_RX] ({!dont_touch_rx}), not as
+    [RSZ_DONT_TOUCH_LIST]: LibreLane 3.1 passes list elements Tcl-escaped
+    ([uio_in\[2]]), and OpenROAD's [set_dont_touch] then does not find
+    bus-bit names (STA-0101) and leaves them unprotected. *)
 let dont_touch_list t ~(library : Timing_library.t) (nl : Netlist.t) =
   let p nm = t.prefix ^ nm in
   let drivers, _ = drivers_and_loads t library nl in
@@ -1016,4 +1115,29 @@ let dont_touch_list t ~(library : Timing_library.t) (nl : Netlist.t) =
   else
     Or_error.error_s
       [%message "Sdc.dont_touch_list: not in the netlist" ~_:(Queue.to_list missing : string list)]
+;;
+
+(** Boundary nets of a synthesised netlist with more than [max_fanout] loads,
+    with their load counts, worst first. OpenROAD repairs neither these nets
+    (they are protected) nor could it buffer them if they were not (a
+    dont-touch load: RSZ-3006), so their slew, capacitance and fanout stay
+    as synthesis left them; e.g. a reset that synthesis shares between
+    protected cells and synthesised logic. Pass the PDK's
+    MAX_FANOUT_CONSTRAINT. *)
+let boundary_fanouts t ~(library : Timing_library.t) ~max_fanout (nl : Netlist.t) =
+  let _, loads = drivers_and_loads t library nl in
+  List.filter_map (Array.to_list t.nets) ~f:(fun (net : Net.t) ->
+    if not net.boundary
+    then None
+    else
+      Option.bind
+        (List.find_map net.sinks ~f:(fun e ->
+           Option.bind (Netlist.find_instance nl (t.prefix ^ e.instance)) ~f:(fun i -> pin_conn i e.pin)))
+        ~f:(fun n ->
+          let fanout = List.length loads.(n) in
+          Option.some_if
+            (fanout > max_fanout)
+            (String.concat ~sep:"," (Netlist.net_names nl n), fanout)))
+  |> List.dedup_and_sort ~compare:[%compare: string * int]
+  |> List.sort ~compare:(fun (_, a) (_, b) -> Int.compare b a)
 ;;

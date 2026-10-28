@@ -88,23 +88,52 @@ flat wires kept as regressions. For less optimistic numbers also set `prim_input
 
 ```ocaml
 let sdc =
-  Sdc.create circuit (* flattened; ~prefix:"u_island." if yosys flattens it *)
-  |> Sdc.ring ~name:"ring" ~loop_breaks ~period_ns:1.0 (* fastest corner *)
+  Sdc.create circuit (* flattened; ~prefix:"island." if yosys flattens it *)
+  |> Sdc.ring ~name:"ring" ~loop_breaks ~period_ns:2.4 (* see below *)
   |> Sdc.pin_capture ~name:"pin_capture" ~pins:4 ~min_edge_spacing_ns:2.0
   |> Sdc.tdc ~name:"tdc"
   |> Sdc.vernier ~name:"vernier" ~pins:2 ~period_ns:20.0 ~settle_cycles:3 (* smallest the host loads *)
 in
-Sdc.rsz_dont_touch_rx sdc (* LibreLane RSZ_DONT_TOUCH_RX *)
 Sdc.sdc sdc ~stage:Pnr ~system_clock:"clk" (* append to PNR_SDC_FILE *)
 Sdc.sdc sdc ~stage:Signoff ~system_clock:"clk" (* append to SIGNOFF_SDC_FILE *)
-(* library: a Timing_library.t *)
-Sdc.dont_touch_list sdc ~library (Netlist.load "synthesised.v") (* RSZ_DONT_TOUCH_LIST *)
-Sdc.check sdc ~library (Netlist.load "routed.nl.v") (* [] if the islands survived *)
+(* library: a Timing_library.t; synthesised: LibreLane's Yosys.Synthesis netlist *)
+let names = Or_error.ok_exn (Sdc.dont_touch_list sdc ~library synthesised) in
+Sdc.dont_touch_rx names (* RSZ_DONT_TOUCH_RX (not RSZ_DONT_TOUCH_LIST) *)
+Sdc.boundary_fanouts sdc ~library ~max_fanout:10 synthesised (* nets OpenROAD will not repair *)
+Sdc.check sdc ~library ~dont_touch:names ~reference:synthesised routed (* [] if the islands survived *)
 ```
 
 LibreLane applies the dont-touch settings only in its resizer steps, so
 island clocks are left out of the PnR SDC (clock tree synthesis would buffer
-them) and only appear at signoff. See `src/sdc.ml`.
+them) and only appear at signoff. Protected are the island's cells and its
+nets, including *boundary* nets from synthesised logic into a cell (OpenROAD
+stops with RSZ-3006 when it tries to buffer a net with a dont-touch load), but
+not cell outputs that only feed synthesised logic (hold repair must reach
+them). The names are resolved from the synthesised netlist and given to
+LibreLane as one exact-match regex: its list variable loses bus bits. One
+signoff SDC serves all corners, and the ring's counters are timed against
+its `period_ns`: give the typical corner's period (LibreLane checks
+violations there) and redo each corner with its own (below). See
+`src/sdc.ml`.
+
+The physical-flow gate (issue #7) runs a stub island, `test/flow/gen_stub.ml`
+(the 17-stage ring with its sampler, a 4-pin Pin_capture and the chip's
+2-pin Vernier, with serial configuration and readout), next to
+janestreet-bitbanger's chip through the Tiny Tapeout IHP flow pinned to the
+GDS action (LibreLane 3.1.0.dev3, locally in Docker: that repository's
+`flow/`). `test/flow/sta_island.tcl` and `test/flow/island_timing.py` give
+the three-corner signoff of the routed island and an SDF-based comparison of
+its ring, capture races and vernier lines before and after layout.
+Result (2026-10-28): every protected cell and net survived every OpenROAD
+step unchanged (28 antenna diodes on one captured pin aside); the routed
+island meets its timing checks (island clocks, vernier bounds, bypass) at
+all three corners, but 12 boundary nets exceed the max fanout and the
+island's clear (47 loads) the max capacitance, unrepairable; layout costs:
+the unplaced ring's nodes carry 3.7 times the "1k" wire capacitance and its
+period doubles (stage intervals 57-378 ps typical); Pin_capture's recent-edge delay
+needs four dlygate4sd3 (two lose to the routed bank clocks by up to 0.55
+ns); the vernier lines get 3-4% faster. Details in janestreet-bitbanger's
+`flow/README.md`.
 
 ## Testing
 
