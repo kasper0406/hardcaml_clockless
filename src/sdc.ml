@@ -89,7 +89,7 @@ module Net = struct
     ; ports : string list (** circuit outputs on it *)
     ; fork : bool
     ; boundary : bool (** from synthesised logic into a protected instance *)
-    ; kept_sink : bool (** feeds a kept register's D *)
+    ; kept_sink : bool (** feeds a kept register (D, clock or reset) *)
     }
   [@@deriving sexp_of]
 
@@ -315,6 +315,8 @@ let create ?(prefix = "") (circuit : Circuit.t) =
       then raise_s [%message "Sdc: kept registers must be plain flops (no enable or clear)" name];
       driver.(net s 0) <- Register name;
       kept_sink.(net d 0) <- true;
+      kept_sink.(net r.clock.clock 0) <- true;
+      Option.iter r.reset ~f:(fun x -> kept_sink.(net x.reset 0) <- true);
       Queue.enqueue
         registers
         { Register.name
@@ -512,9 +514,10 @@ let pin_capture t ~name ~pins ~min_edge_spacing_ns =
     bypass path (level flop -> output mux -> pin) stays timed. Select paths
     past the select pins are cut only by the break at those pins.
 
-    The constraints appear in both stages: at PnR the resizer can repair the
-    select fan-out (synthesised logic); the drain paths are all
-    [dont_touch], so there it is a check. OpenSTA warns (1551) that each
+    The constraints appear in both stages. The select nets into the muxes
+    are boundary nets, protected and never repaired: their fanout is what
+    synthesis left ({!boundary_fanouts}); the drain paths are all
+    [dont_touch]. At PnR both are checks. OpenSTA warns (1551) that each
     internal pin "is not a valid endpoint" and honours it. The cells are
     protected like every [dont_touch] instance. *)
 let vernier t ~name ~pins ~period_ns ~settle_cycles =

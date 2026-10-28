@@ -643,3 +643,18 @@ endmodule
     net sel_b is signal_reg_1 in the netlist, signal_reg_2 in the reference
     |}]
 ;;
+
+let%expect_test "a protected cell clocking only a kept register keeps its net protected" =
+  let library = force lib in
+  let open Signal in
+  let clk = input "clk" 1 in
+  let ck = Cell.instantiate library ~cell:"sg13cmos5l_inv_1" ~instance:"ckinv" [ "A", clk ] "Y" in
+  let q = reg (Reg_spec.create ~clock:ck ()) (input "d" 1) -- "kept" in
+  List.iter Cell.attributes ~f:(fun a -> ignore (add_attribute q a : Signal.t));
+  let t = Sdc.create (Circuit.create_exn ~name:"top" [ output "q" q ]) in
+  List.iter (Sdc.protected_nets t) ~f:(fun n -> print_s [%message (n.names : string list)]);
+  [%expect {|
+    (n.names (kept q))
+    (n.names (ckinv__Y))
+    |}]
+;;

@@ -14,8 +14,9 @@ A small path calculator over the SDF's interconnect and cell arcs, with
 unateness by cell type: earliest arrivals over the SDF's early (min)
 delays, latest over its late (max) delays; nominal figures (period, steps,
 spans) use the latest. It reports
-  - ring: the period (both traversals of the loop), per-stage delays (the
-    sampler's bins) per edge;
+  - ring: the period (both traversals of the loop; early and late), the
+    stage intervals at the ring cells' outputs (the sampler's bins add
+    the routing to its flops, their skew and apertures);
   - capture: for every captured pin and bank, the snapshot race margin
     (earliest bank-clock arrival at the slot flops minus the latest arrival
     of the pin's snapshot at their D, minus setup) and the delayed-snapshot
@@ -169,7 +170,7 @@ def ring(sdf, loop):
     by = loop.arcs[p + "nand"][("B", "Y")]
     stop = lambda pin: pin == p + "nand/B"
     res = {}
-    period = 0.0
+    period = [0.0, 0.0]  # over early, late delays
     stages = []
     for e in "rf":
         arr = sdf.propagate(nand_y, e, stop=stop)
@@ -181,16 +182,21 @@ def ring(sdf, loop):
             t = arr[(p + f"inv{k}/Y", ek)][1]
             stages.append(t - t_prev)
             t_prev = t
-        tb = arr[(p + "nand/B", ek)][1]
-        back = late(by[0] if ek == "f" else by[1])  # B falls -> Y rises
-        if back <= 0:
+        tb = arr[(p + "nand/B", ek)]
+        back = by[0] if ek == "f" else by[1]  # B falls -> Y rises
+        if back is None or back[1] <= 0:
             raise SystemExit("ring: no NAND feedback delay in LOOP_SDF (pass the SDF with the ring broken elsewhere)")
-        stages.append(tb - t_prev + back)
-        period += tb + back
-    res["period_ns"] = period
+        stages.append(tb[1] - t_prev + back[1])
+        period[0] += tb[0] + back[0]
+        period[1] += tb[1] + back[1]
+    # the early period is the one to time the ring-clocked counters against
+    res["period_ns"] = period[1]
+    res["period_early_ns"] = period[0]
     res["stage_ps"] = [round(1000 * s, 1) for s in stages]
-    res["bin_min_ps"] = round(1000 * min(stages), 1)
-    res["bin_max_ps"] = round(1000 * max(stages), 1)
+    # stage intervals at the ring cells' outputs (the sampler's bins also
+    # depend on the routing to its flops, their clock skew and apertures)
+    res["stage_min_ps"] = round(1000 * min(stages), 1)
+    res["stage_max_ps"] = round(1000 * max(stages), 1)
     return res
 
 
@@ -216,13 +222,15 @@ def capture(sdf):
                     clk = arr.get((f + "/CLK", "r"))
                     d = [arr[(f + "/D", x)] for x in "rf" if (f + "/D", x) in arr]
                     if clk is None or not d:
-                        continue
+                        raise SystemExit(f"capture: no path from pin {i} ({e}) to {f} (bank {bank})")
                     if f in slots:
                         setup = max(v for (k, _, pin), v in sdf.checks[f].items() if k == "SETUP")
                         race.append(clk[0] - max(x[1] for x in d) - setup)
                     else:
                         hold = max(v for (k, _, pin), v in sdf.checks[f].items() if k == "HOLD")
                         delayed.append(min(x[0] for x in d) - clk[1] - hold)
+                if not race or (dlys and not delayed):
+                    raise SystemExit(f"capture: pin {i} ({e}), bank {bank}: no slot flops found")
                 if race:
                     out[f"pin_{e}_bank_{bank}"] = {
                         "snapshot_margin_ps": round(1000 * min(race), 1),
@@ -356,8 +364,8 @@ def wire_caps(sdf, spef):
 def summary(d):
     """A pre- against post-layout table of the JSON results in [d]."""
     rows = [
-        ("ring period (ns)", lambda r: f"{r['ring']['period_ns']:.3f}"),
-        ("ring stage / bin (ps)", lambda r: f"{r['ring']['bin_min_ps']:.0f}-{r['ring']['bin_max_ps']:.0f}"),
+        ("ring period, early-late (ns)", lambda r: f"{r['ring']['period_early_ns']:.2f}-{r['ring']['period_ns']:.2f}"),
+        ("ring stage interval (ps)", lambda r: f"{r['ring']['stage_min_ps']:.0f}-{r['ring']['stage_max_ps']:.0f}"),
         ("snapshot race margin (ps)", lambda r: f"{r['capture']['snapshot_margin_min_ps']:.0f}"),
         ("recent-edge delay margin (ps)", lambda r: f"{r['capture']['delayed_margin_min_ps']:.0f}"),
         ("vernier coarse step (ps)", lambda r: "{:.0f}-{:.0f}".format(
@@ -419,7 +427,7 @@ def main():
     if out:
         json.dump(res, open(out, "w"), indent=1)
     r = res["ring"]
-    print(f"ring: period {r['period_ns']:.3f} ns, stage (bin) {r['bin_min_ps']}-{r['bin_max_ps']} ps")
+    print(f"ring: period {r['period_early_ns']:.3f}-{r['period_ns']:.3f} ns, stage interval {r['stage_min_ps']}-{r['stage_max_ps']} ps")
     c = res["capture"]
     print(f"capture: snapshot race margin >= {c['snapshot_margin_min_ps']} ps, delayed-snapshot margin >= {c['delayed_margin_min_ps']} ps")
     for i in range(4):

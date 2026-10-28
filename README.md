@@ -125,10 +125,12 @@ GDS action (LibreLane 3.1.0.dev3, locally in Docker: that repository's
 the three-corner signoff of the routed island and an SDF-based comparison of
 its ring, capture races and vernier lines before and after layout.
 Result (2026-10-28): every protected cell and net survived every OpenROAD
-step unchanged (28 antenna diodes on one captured pin aside), the routed
-island meets its signoff checks at all three corners, and layout costs: the
-unplaced ring's nodes carry 3.7 times the "1k" wire capacitance and its
-period doubles (bins 57-378 ps typical); Pin_capture's recent-edge delay
+step unchanged (28 antenna diodes on one captured pin aside); the routed
+island meets its timing checks (island clocks, vernier bounds, bypass) at
+all three corners, but 12 boundary nets exceed the max fanout and the
+island's clear (47 loads) the max capacitance, unrepairable; layout costs:
+the unplaced ring's nodes carry 3.7 times the "1k" wire capacitance and its
+period doubles (stage intervals 57-378 ps typical); Pin_capture's recent-edge delay
 needs four dlygate4sd3 (two lose to the routed bank clocks by up to 0.55
 ns); the vernier lines get 3-4% faster. Details in janestreet-bitbanger's
 `flow/README.md`.
