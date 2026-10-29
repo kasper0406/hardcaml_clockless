@@ -369,8 +369,10 @@ def counter_margins(sdf, loop, flops, frame, n=17, settle=9, earliest=4, periods
                 before = min(before, r_lo(q) - hi)
                 after = min(after, lo_next - r_hi(q))
         res[tag] = {"safe_from": max(unsafe) + 1 if unsafe else None,
-                    "before_stages": round(before / stage, 1), "after_stages": round(after / stage, 1)}
+                    "before_stages": round(before / stage, 1), "after_stages": round(after / stage, 1),
+                    "worst_exact": min(before, after) / stage}
     res["worst_stages"] = min(min(v["before_stages"], v["after_stages"]) for k, v in res.items() if k in "ab")
+    res["worst_exact"] = min(v["worst_exact"] for k, v in res.items() if k in "ab")
     if not all(math.isfinite(v["before_stages"]) and math.isfinite(v["after_stages"]) for k, v in res.items() if k in "ab"):
         raise SystemExit("margins: no complete period (missing counter paths?)")
     res["stage_ps"] = round(1000 * stage, 1)
@@ -412,6 +414,7 @@ def ring_margins(sdf, loop):
                         flops[(tag, i)] = f
             res[f"capture_{bank}{slot}"] = counter_margins(sdf, loop, flops, lambda f, ck=ck: ck[f])
     res["worst_stages"] = min(v["worst_stages"] for v in res.values())
+    res["worst_exact"] = min(v["worst_exact"] for k, v in res.items() if isinstance(v, dict))
     return res
 
 
@@ -426,6 +429,7 @@ def tag_lag(sdf):
     pc = "island.pin_capture_"
     res = {}
     slot_rx = re.compile(r"_[rf]_s\d+_")
+    exact = []
     for bank, root in (("r", pc + "clkr/X"), ("f", pc + "clkf/Y")):
         arr = sdf.propagate(root, "r", selects=True,
                             stop=lambda pin: (pin.endswith("/S") or pin.endswith("/D")
@@ -462,9 +466,11 @@ def tag_lag(sdf):
                 - max(fresh(f, k) - at(f + "/CLK", k) + check(f, "SETUP") for f in data)
                 for k in (0, 1))
             res[f"{bank}{slot}"] = round(1000 * margin, 1)
+            exact.append(1000 * margin)
     if not res:
         raise SystemExit("tag lag: no capture slots")
     res["worst_ps"] = min(res.values())
+    res["worst_exact_ps"] = min(exact)  # unrounded, for thresholds
     return res
 
 
@@ -667,7 +673,7 @@ def main():
               f"launch->out {v.get('launch_to_out_ns')}")
     rm = res["ring_margins"]
     print(f"counter selection (L/E) margins: worst {rm['worst_stages']} stages; "
-          + ", ".join(f"{k} {v['worst_stages']}" for k, v in rm.items() if k != "worst_stages"))
+          + ", ".join(f"{k} {v['worst_stages']}" for k, v in rm.items() if isinstance(v, dict)))
     print(f"tag lag over setup + hold: worst {res['tag_lag']['worst_ps']} ps")
     for g, v in res.get("wire_caps", {}).items():
         print(f"wire cap, {g} ({v['nets']} nets): extracted {v['spef_ff_mean']} fF mean ({v['spef_ff_max']} max), "
