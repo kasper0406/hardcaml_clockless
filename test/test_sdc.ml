@@ -766,10 +766,19 @@ endmodule
   run ~reference (netlist "_r1_");
   run ~reference (netlist "o");
   run (netlist "o");
+  (* a buffer before the isolating buffer, in both: the same source *)
+  let buffered =
+    String.substr_replace_first
+      (netlist "_b_")
+      ~pattern:"  sg13cmos5l_buf_1 iso"
+      ~with_:"  sg13cmos5l_buf_1 _3_ (.A(_r1_), .X(_b_));\n  sg13cmos5l_buf_1 iso"
+  in
+  run ~reference:(Netlist.of_string buffered) buffered;
   [%expect {|
     isolating buffer ring_en_iso: input not connected
     ok
     isolating buffer iso is fed from o, from _r1_ in the reference
     isolating buffer iso: cannot verify its source (pass ~reference)
+    ok
     |}]
 ;;

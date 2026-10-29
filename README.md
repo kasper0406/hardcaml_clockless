@@ -101,7 +101,7 @@ let names = Or_error.ok_exn (Sdc.dont_touch_list sdc ~library synthesised) in
 Sdc.dont_touch_rx names (* RSZ_DONT_TOUCH_RX (not RSZ_DONT_TOUCH_LIST) *)
 Sdc.fanout_violations sdc ~library ~max_fanout:10 synthesised (* nets OpenROAD will not repair *)
 Sdc.check sdc ~library ~dont_touch:names ~reference:synthesised routed (* [] if the islands survived *)
-Sdc.ring_placement sdc ~name:"ring" ~library ~rows ~site ~row ~columns:2 ~row_pitch:11 ~column_gap:50
+Sdc.ring_placement sdc ~name:"ring" ~library:library.library ~rows ~site ~row ~columns:2 ~row_pitch:11 ~column_gap:50
 (* MACRO_PLACEMENT_CFG: the ring and its node loads, fixed before placement *)
 ```
 

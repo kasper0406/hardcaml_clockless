@@ -308,6 +308,7 @@ def counter_margins(sdf, loop, flops, frame, n=17, settle=9, earliest=4, periods
         src, e, t = times[first]
         clk_at = sdf.propagate(src, e, t0=t, stop=at_d, within=hand)
         once = []
+        hit = set()
         for cnt in [i for i in sdf.celltype if i.startswith(p + f"cnt_{tag}_")]:
             c = clk_at.get((cnt + "/CLK", "r"))
             if c is None:
@@ -322,8 +323,12 @@ def counter_margins(sdf, loop, flops, frame, n=17, settle=9, earliest=4, periods
                     for x in "rf":
                         if (f + "/D", x) in arr:
                             lo, hi = arr[(f + "/D", x)]
+                            hit.add(f)
                             once.append(dict(time=hi - frame(f), lo=lo - (c[1] + cq[1]) + arr_lo - frame(f),
                                              setup=check(f, "SETUP", x), hold=check(f, "HOLD", x)))
+        missing = [f for (role, _), f in flops.items() if role == tag and f not in hit]
+        if missing:
+            raise SystemExit(f"margins: no path from counter {tag} to {missing}")
         changes[tag] = [dict(c, time=c["time"] + j * period, lo=c["lo"] + j * period) for j in range(periods) for c in once]
     seen = [x["time"] + x["setup"] for x in tr]
     bins = [seen[q + 1] - seen[q] for q in range(2 * n * (periods - 1))]

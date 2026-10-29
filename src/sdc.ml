@@ -841,8 +841,9 @@ let check_structure ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(
     String.is_prefix i.name ~prefix:t.prefix
     && Hashtbl.mem found (String.drop_prefix i.name (String.length t.prefix))
   in
-  (* trace back through unprotected buffers *)
-  let rec root n depth =
+  (* trace back through unprotected buffers (of [nl], or with [drivers] of
+     another netlist) *)
+  let rec root_in drivers n depth =
     if depth > 64 || n = Netlist.const0 || n = Netlist.const1
     then n
     else (
@@ -852,11 +853,13 @@ let check_structure ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(
          | Some c when Cell_library.Cell.is_buffer c.logic ->
            let input = (List.hd_exn (Cell_library.Cell.inputs c.logic)).name in
            (match pin_conn i input with
-            | Some m -> root m (depth + 1)
+            | Some m -> root_in drivers m (depth + 1)
             | None -> n)
          | _ -> n)
       | _ -> n)
   in
+  let root n depth = root_in drivers n depth in
+  let reference_drivers = Option.map reference ~f:(fun r -> fst (drivers_and_loads t library r)) in
   let tie_value n =
     if n = Netlist.const0
     then Some false
@@ -970,7 +973,9 @@ let check_structure ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(
                  with
                  | None -> err "%s: not in the reference" what
                  | Some rn ->
-                   let want = Netlist.net_names r rn in
+                   let want =
+                     Netlist.net_names r (root_in (Option.value_exn reference_drivers) rn 0)
+                   in
                    if not
                         (List.exists (Netlist.net_names nl (root n 0)) ~f:(fun nm ->
                            List.mem want nm ~equal:String.equal))
@@ -1260,14 +1265,18 @@ type rows =
     the ring's period depends on its node loads, which an unconstrained
     placer spreads out (doubling the period in the gate). Stage [k] and the
     protected loads of its output form a group; groups snake down and up
-    [columns] columns so that consecutive stages, and the last and first,
-    are neighbours; the counters and the enable tree go in the rows below
+    [columns] columns (up the first, down the next...) so that consecutive
+    stages are neighbours, and with two columns the last and first too;
+    the counters and the enable tree go in the rows below
     them. The block's lower-left corner is site [site] of row [row]. Consecutive
     groups are [row_pitch] rows (default 1) and the columns [column_gap]
-    sites (default 0) apart: a compact block leaves the nodes far lighter
-    than the Liberty "1k" wire load the ring's timing (its counters' L and
-    E, the Gray counter's settling within a period) was characterised with,
-    and the spacing restores it, the same in every run. Returns
+    sites (default 0) apart. The coordinates are deterministic; the wire
+    load they give is a measured result for a geometry, not a guarantee: in
+    the gate (TT IHP sg13cmos5l, 2 columns) a compact block left the nodes
+    with a fifth of the Liberty "1k" wire load the ring's timing (its
+    counters' L and E, the Gray counter's settling within a period) was
+    characterised with, an 11-row pitch and 50-site gap with 0.93 of it.
+    Revalidate after changing the geometry. Returns
     [(instance, x, y, orientation)] for LibreLane's [MACRO_PLACEMENT_CFG]
     (fixed before global placement, which then pulls the connected logic
     towards the block). Cell widths are their Liberty area over the row
