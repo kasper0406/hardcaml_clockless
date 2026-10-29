@@ -438,7 +438,10 @@ module Make (C : Config) (R : Ring.S) = struct
     ; flop : Cell.Flop.t (** with active-low asynchronous reset *)
     ; delay : string * int
     (** buffer/delay cell and count for the recent-edge delay of each pin;
-        it must exceed the pin -> capture clock delay at every corner *)
+        it must exceed the pin -> capture clock delay at every corner after
+        layout, when routing has slowed the bank clocks (four dlygate4sd3
+        in the physical-flow gate: two lost by up to 0.55 ns; the bitbanger
+        chip's configuration) *)
     }
 
   type implementation =

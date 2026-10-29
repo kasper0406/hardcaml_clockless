@@ -87,7 +87,7 @@ let island lib =
          ; buffer = "sg13cmos5l_buf_1"
          ; mux2 = "sg13cmos5l_mux2_1"
          ; flop
-         ; delay = "sg13cmos5l_dlygate4sd3_1", 2
+         ; delay = "sg13cmos5l_dlygate4sd3_1", 4
          })
       scope
       { clock
