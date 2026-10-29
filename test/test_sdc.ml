@@ -320,8 +320,8 @@ let%expect_test "check: names, registers and constants" =
 
 let%expect_test "check: prefix" =
   let t = one_buffer ~prefix:"u_island." in
-  let run ?boundary text =
-    match Sdc.check t ?boundary ~library:(force tlib) (Netlist.of_string text) with
+  let run ?boundary ?reference text =
+    match Sdc.check t ?boundary ?reference ~library:(force tlib) (Netlist.of_string text) with
     | [] -> print_endline "ok"
     | errors -> List.iter errors ~f:print_endline
   in
@@ -340,11 +340,17 @@ let%expect_test "check: prefix" =
   in
   run moved;
   run ~boundary:[ "i", "i" ] moved;
+  (* ... or against the netlist the names were resolved from *)
+  let intact = String.substr_replace_first moved ~pattern:".A(x)" ~with_:".A(i)" in
+  run ~reference:(Netlist.of_string intact) intact;
+  run ~reference:(Netlist.of_string intact) moved;
   [%expect {|
     ok
     missing instance u_island.b (sg13cmos5l_buf_1)
-    u_island.b/A: cannot verify its source, none of u_island.i survives (pass ~boundary)
+    u_island.b/A: cannot verify its source, none of u_island.i survives (pass ~boundary or ~reference)
     u_island.b/A is driven from x, not from i
+    ok
+    u_island.b/A is fed from x, from i in the reference
     |}]
 ;;
 
@@ -651,7 +657,9 @@ endmodule
     ok
     ok
     net sel_a is signal_reg_2 in the netlist, signal_reg_1 in the reference
+    net sel_a is fed from signal_reg_2, from signal_reg_1 in the reference
     net sel_b is signal_reg_1 in the netlist, signal_reg_2 in the reference
+    net sel_b is fed from signal_reg_1, from signal_reg_2 in the reference
     |}]
 ;;
 
