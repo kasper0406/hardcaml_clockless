@@ -44,9 +44,15 @@ CAPTURE = "island.pin_capture_"
 VERNIER = "island.vernier_"
 
 
+def scope(prefix):
+    """The part of a prefix naming the island's hierarchy ("island." of
+    "island.ring_"), or the whole prefix if it has none."""
+    return prefix[: prefix.rfind(".") + 1] if "." in prefix else prefix
+
+
 def hand(inst):
     """A hand-placed island cell (not synthesised logic)."""
-    return any(inst.startswith(x.split(".")[0] + ".") for x in (RING, SAMPLER, CAPTURE, VERNIER))
+    return any(inst.startswith(scope(x)) for x in (RING, SAMPLER, CAPTURE, VERNIER))
 
 
 POS = "pos"
