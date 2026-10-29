@@ -270,9 +270,10 @@ let island lib =
    paths against the typical corner's period would be pessimistic, the fast
    corner's period against typical paths fail. LibreLane's signoff (one SDC,
    violations checked at the typical corner) gets the typical period below
-   (pre-layout 2.61 ns, Event_sim); flow/signoff.sh redoes each corner with
-   that corner's measured period. *)
-let ring_period_ns = ref 2.4
+   (2.42-2.71 ns over early delays after layout with the ring block at an
+   11-row pitch); flow/signoff.sh redoes each corner with that corner's
+   measured period. *)
+let ring_period_ns = ref 2.3
 
 let constraints lib =
   let circuit, loop_breaks = island lib in

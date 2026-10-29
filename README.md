@@ -89,7 +89,7 @@ flat wires kept as regressions. For less optimistic numbers also set `prim_input
 ```ocaml
 let sdc =
   Sdc.create circuit (* flattened; ~prefix:"island." if yosys flattens it *)
-  |> Sdc.ring ~name:"ring" ~loop_breaks ~period_ns:2.4 (* see below *)
+  |> Sdc.ring ~name:"ring" ~loop_breaks ~period_ns:2.3 (* see below *)
   |> Sdc.pin_capture ~name:"pin_capture" ~pins:4 ~min_edge_spacing_ns:2.0
   |> Sdc.tdc ~name:"tdc"
   |> Sdc.vernier ~name:"vernier" ~pins:2 ~period_ns:20.0 ~settle_cycles:3 (* smallest the host loads *)
@@ -99,8 +99,10 @@ Sdc.sdc sdc ~stage:Signoff ~system_clock:"clk" (* append to SIGNOFF_SDC_FILE *)
 (* library: a Timing_library.t; synthesised: LibreLane's Yosys.Synthesis netlist *)
 let names = Or_error.ok_exn (Sdc.dont_touch_list sdc ~library synthesised) in
 Sdc.dont_touch_rx names (* RSZ_DONT_TOUCH_RX (not RSZ_DONT_TOUCH_LIST) *)
-Sdc.boundary_fanouts sdc ~library ~max_fanout:10 synthesised (* nets OpenROAD will not repair *)
+Sdc.fanout_violations sdc ~library ~max_fanout:10 synthesised (* nets OpenROAD will not repair *)
 Sdc.check sdc ~library ~dont_touch:names ~reference:synthesised routed (* [] if the islands survived *)
+Sdc.ring_placement sdc ~name:"ring" ~library ~rows ~site ~row ~columns:2 ~row_pitch:11 ~column_gap:50
+(* MACRO_PLACEMENT_CFG: the ring and its node loads, fixed before placement *)
 ```
 
 LibreLane applies the dont-touch settings only in its resizer steps, so
@@ -109,7 +111,10 @@ them) and only appear at signoff. Protected are the island's cells and its
 nets, including *boundary* nets from synthesised logic into a cell (OpenROAD
 stops with RSZ-3006 when it tries to buffer a net with a dont-touch load), but
 not cell outputs that only feed synthesised logic (hold repair must reach
-them). The names are resolved from the synthesised netlist and given to
+them). Since OpenROAD repairs no protected net, Ring and Vernier take every
+control into their cells through an isolating buffer (`Cell.isolate`: kept by
+synthesis, repairable by OpenROAD) and a cell buffer tree within 8 loads
+(`Cell.fanout`). The names are resolved from the synthesised netlist and given to
 LibreLane as one exact-match regex: its list variable loses bus bits. One
 signoff SDC serves all corners, and the ring's counters are timed against
 its `period_ns`: give the typical corner's period (LibreLane checks
@@ -124,15 +129,20 @@ GDS action (LibreLane 3.1.0.dev3, locally in Docker: that repository's
 `flow/`). `test/flow/sta_island.tcl` and `test/flow/island_timing.py` give
 the three-corner signoff of the routed island and an SDF-based comparison of
 its ring, capture races and vernier lines before and after layout.
-Result (2026-10-28): every protected cell and net survived every OpenROAD
-step unchanged (28 antenna diodes on one captured pin aside); the routed
-island meets its timing checks (island clocks, vernier bounds, bypass) at
-all three corners, but 12 boundary nets exceed the max fanout and the
-island's clear (47 loads) the max capacitance, unrepairable; layout costs:
-the unplaced ring's nodes carry 3.7 times the "1k" wire capacitance and its
-period doubles (stage intervals 57-378 ps typical); Pin_capture's recent-edge delay
-needs four dlygate4sd3 (two lose to the routed bank clocks by up to 0.55
-ns); the vernier lines get 3-4% faster. Details in janestreet-bitbanger's
+Result (2026-10-29, after the follow-ups): every protected cell and net
+survives every OpenROAD step unchanged (antenna diodes on a captured pin
+aside); no max-capacitance violation (the Vernier clear behind its isolating
+buffer); Pin_capture's pointer reset (18 loads) and its select and clock
+leaf buffers (11-13) remain above the max fanout. Unplaced, the ring's nodes
+carried 2-3.7 times the "1k" wire capacitance and its period varied with the
+placer (typical 3.7-5.9 ns over four runs); as a compact block, a fifth of
+it, and a period 40% shorter than characterised, which broke the counter
+selection margins (0-1 stage) and the counters' one-period settling. At an
+11-row pitch the nodes carry 0.93 of "1k" and the period is 2.42-2.71 ns
+typical in both runs (2.53-2.79 before layout), with counter selection
+margins >= 4.2 stages, record tags lagging by >= 62 ps over setup and hold,
+and the recent-edge delay (four dlygate4sd3) and snapshot race margins at
+>= 351 and >= 260 ps at all three corners. Details in janestreet-bitbanger's
 `flow/README.md`.
 
 ## Testing
