@@ -176,6 +176,8 @@ type t =
   { prefix : string
   ; instances : Instance.t list
   ; registers : Register.t list
+  ; isolators : (string * int * int) list
+  (** {!Cell.isolate} buffers: instance, input net, output net *)
   ; nets : Net.t array
   ; loop_breaks : Endpoint.t list
   ; clocks : Clock.t list
@@ -184,10 +186,11 @@ type t =
   ; max_delays : Max_delay.t list
   }
 
-let is_dont_touch s =
-  List.exists (Signal.Type.get_attributes s) ~f:(fun a ->
-    String.equal (Rtl_attribute.name a) "dont_touch")
+let has_attribute s name =
+  List.exists (Signal.Type.get_attributes s) ~f:(fun a -> String.equal (Rtl_attribute.name a) name)
 ;;
+
+let is_dont_touch s = has_attribute s "dont_touch"
 
 let create ?(prefix = "") (circuit : Circuit.t) =
   let graph = Circuit.signal_graph circuit in
@@ -281,6 +284,7 @@ let create ?(prefix = "") (circuit : Circuit.t) =
     done);
   let instances = Queue.create () in
   let registers = Queue.create () in
+  let isolators = Queue.create () in
   List.iter signals ~f:(fun s ->
     match s with
     | Signal.Type.Wire _ | Select _ | Cat _ | Empty -> ()
@@ -303,6 +307,12 @@ let create ?(prefix = "") (circuit : Circuit.t) =
       Queue.enqueue
         instances
         { Instance.name = inst.instance_label; cell = inst.circuit_name; pins }
+    | Inst { instantiation = { inputs = [ i ]; outputs = [ o ]; instance_label; _ }; _ }
+      when has_attribute s "keep" ->
+      (* an isolating buffer (Cell.isolate): synthesised logic to the
+         resizer, but checked to sit between its two nets *)
+      Queue.enqueue isolators (instance_label, net i.input_signal 0, net s o.output_low_index);
+      mark_logic i.input_signal
     | Reg { d; register = r; _ } when is_dont_touch s ->
       let name =
         match Signal.names s with
@@ -351,6 +361,7 @@ let create ?(prefix = "") (circuit : Circuit.t) =
   { prefix
   ; instances = Queue.to_list instances |> List.sort ~compare:(fun a b -> String.compare a.name b.name)
   ; registers = Queue.to_list registers
+  ; isolators = Queue.to_list isolators
   ; nets
   ; loop_breaks = []
   ; clocks = []
@@ -530,9 +541,15 @@ let vernier t ~name ~pins ~period_ns ~settle_cycles =
     | Cell d -> Some d.instance
     | Register _ | Constant _ | Input | Other -> None
   in
-  (* a mux's select: its one input not driven by another cell of the line *)
-  let select instance =
-    match List.filter (input_pins t instance) ~f:(fun e -> Option.is_none (driven_by e)) with
+  (* a mux's select: its one input not driven by another cell of the line
+     (but from synthesised logic, or its select buffers [<line>_sel_...]) *)
+  let select ~line instance =
+    let from_line e =
+      match driven_by e with
+      | Some d -> not (String.is_prefix d ~prefix:(line ^ "_sel_"))
+      | None -> false
+    in
+    match List.filter (input_pins t instance) ~f:(fun e -> not (from_line e)) with
     | [ e ] -> e
     | l -> raise_s [%message "Sdc.vernier: expected one select input" (instance : string) (l : Endpoint.t list)]
   in
@@ -542,7 +559,8 @@ let vernier t ~name ~pins ~period_ns ~settle_cycles =
         List.exists [ "_cm"; "_fm" ] ~f:(fun s -> String.is_prefix i.name ~prefix:(prefix ^ s)))
     in
     if List.is_empty tree then raise_s [%message "Sdc.vernier: no tap muxes" (prefix : string)];
-    List.map tree ~f:(fun i -> select i.name) @ List.map [ prefix ^ "_cbyp"; prefix ^ "_fbyp" ] ~f:select
+    List.map tree ~f:(fun i -> select ~line:prefix i.name)
+    @ List.map [ prefix ^ "_cbyp"; prefix ^ "_fbyp" ] ~f:(select ~line:prefix)
   in
   List.fold (List.init pins ~f:Fn.id) ~init:t ~f:(fun t i ->
     let p = Printf.sprintf "%s_p%d" name i in
@@ -751,7 +769,22 @@ let single_var : Bool_expr.t -> (string * bool) option = function
   | _ -> None
 ;;
 
-(** [check t ~library netlist] lists every way [netlist] (yosys or OpenROAD
+(* Cells that only load a net (antenna diodes): Liberty cells with only inputs. *)
+let passive_of ?passive (library : Timing_library.t) =
+  match passive with
+  | Some f -> f
+  | None ->
+    fun cell ->
+      (match Timing_library.find library cell with
+       | Some c ->
+         List.for_all c.logic.pins ~f:(fun pin ->
+           match pin.direction with
+           | Output | Inout -> false
+           | Input | Internal -> true)
+       | None -> false)
+;;
+
+(** [check_structure t ~library netlist] lists every way [netlist] (yosys or OpenROAD
     output) departs from the islands; [[]] if they survived:
     - every protected instance exists with the same cell type;
     - every protected net is a single netlist net with one driver, carries one
@@ -773,24 +806,12 @@ let single_var : Bool_expr.t -> (string * bool) option = function
       netlist names, e.g. after flattening). Circuit inputs whose names are
       all gone are reported as unverifiable. Constants may be literals or tie
       cells of the right value. *)
-let check ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(library : Timing_library.t) (nl : Netlist.t) =
+let check_structure ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(library : Timing_library.t) (nl : Netlist.t) =
   let errors = Queue.create () in
   let dont_touch = Set.of_list (module String) dont_touch in
   let err fmt = Printf.ksprintf (Queue.enqueue errors) fmt in
   let p nm = t.prefix ^ nm in
-  let passive =
-    match passive with
-    | Some f -> f
-    | None ->
-      fun cell ->
-        (match Timing_library.find library cell with
-         | Some c ->
-           List.for_all c.logic.pins ~f:(fun pin ->
-             match pin.direction with
-             | Output | Inout -> false
-             | Input | Internal -> true)
-         | None -> false)
-  in
+  let passive = passive_of ?passive library in
   let drivers, loads = drivers_and_loads t library nl in
   let net_str n =
     match Netlist.net_names nl n with
@@ -820,8 +841,9 @@ let check ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(library : 
     String.is_prefix i.name ~prefix:t.prefix
     && Hashtbl.mem found (String.drop_prefix i.name (String.length t.prefix))
   in
-  (* trace back through unprotected buffers *)
-  let rec root n depth =
+  (* trace back through unprotected buffers (of [nl], or with [drivers] of
+     another netlist) *)
+  let rec root_in drivers n depth =
     if depth > 64 || n = Netlist.const0 || n = Netlist.const1
     then n
     else (
@@ -831,11 +853,13 @@ let check ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(library : 
          | Some c when Cell_library.Cell.is_buffer c.logic ->
            let input = (List.hd_exn (Cell_library.Cell.inputs c.logic)).name in
            (match pin_conn i input with
-            | Some m -> root m (depth + 1)
+            | Some m -> root_in drivers m (depth + 1)
             | None -> n)
          | _ -> n)
       | _ -> n)
   in
+  let root n depth = root_in drivers n depth in
+  let reference_drivers = Option.map reference ~f:(fun r -> fst (drivers_and_loads t library r)) in
   let tie_value n =
     if n = Netlist.const0
     then Some false
@@ -914,6 +938,54 @@ let check ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(library : 
             protected net *)
          ())
   in
+  (* isolating buffers: present, between their two nets (the input may be
+     rebuffered and the buffer resized: it is the resizer's) *)
+  List.iter t.isolators ~f:(fun (name, input, output) ->
+    match Netlist.find_instance nl (p name) with
+    | None -> err "missing isolating buffer %s" (p name)
+    | Some i ->
+      (match Timing_library.find library i.cell with
+       | Some c when Cell_library.Cell.is_buffer c.logic ->
+         let pin f = pin_conn i (List.hd_exn (f c.logic) : Cell_library.Pin.t).name in
+         (match pin Cell_library.Cell.outputs, resolve t.nets.(output) with
+          | Some o, Some expected when o <> expected ->
+            err "isolating buffer %s drives %s, not %s" (p name) (net_str o) (net_str expected)
+          | None, _ -> err "isolating buffer %s: output not connected" (p name)
+          | _ -> ());
+         let what = "isolating buffer " ^ p name in
+         (match pin Cell_library.Cell.inputs with
+          | None -> err "%s: input not connected" what
+          | Some n ->
+            check_source t.nets.(input) what n;
+            (* a source whose circuit names did not survive synthesis:
+               against the reference *)
+            if Option.is_none (by_name t.nets.(input))
+            then (
+              match reference with
+              | None ->
+                (match t.nets.(input).driver with
+                 | Other -> err "%s: cannot verify its source (pass ~reference)" what
+                 | _ -> ())
+              | Some r ->
+                (match
+                   Option.bind (Netlist.find_instance r (p name)) ~f:(fun ri ->
+                     pin_conn ri (List.hd_exn (Cell_library.Cell.inputs c.logic) : Cell_library.Pin.t).name)
+                 with
+                 | None -> err "%s: not in the reference" what
+                 | Some rn ->
+                   let want =
+                     Netlist.net_names r (root_in (Option.value_exn reference_drivers) rn 0)
+                   in
+                   if not
+                        (List.exists (Netlist.net_names nl (root n 0)) ~f:(fun nm ->
+                           List.mem want nm ~equal:String.equal))
+                   then
+                     err
+                       "%s is fed from %s, from %s in the reference"
+                       what
+                       (net_str (root n 0))
+                       (String.concat ~sep:"," want))))
+       | _ -> err "isolating buffer %s is %s, not a buffer" (p name) i.cell));
   (* flops synthesised from kept registers, by their D net *)
   let reg_flops = Hashtbl.create (module Int) in
   List.iter t.registers ~f:(fun r ->
@@ -1117,27 +1189,180 @@ let dont_touch_list t ~(library : Timing_library.t) (nl : Netlist.t) =
       [%message "Sdc.dont_touch_list: not in the netlist" ~_:(Queue.to_list missing : string list)]
 ;;
 
-(** Boundary nets of a synthesised netlist with more than [max_fanout] loads,
-    with their load counts, worst first. OpenROAD repairs neither these nets
-    (they are protected) nor could it buffer them if they were not (a
-    dont-touch load: RSZ-3006), so their slew, capacitance and fanout stay
-    as synthesis left them; e.g. a reset that synthesis shares between
-    protected cells and synthesised logic. Pass the PDK's
-    MAX_FANOUT_CONSTRAINT. *)
-let boundary_fanouts t ~(library : Timing_library.t) ~max_fanout (nl : Netlist.t) =
+(** Protected nets of [netlist] with more than [max_fanout] loads (passive
+    cells, e.g. antenna diodes, not counted), with their load counts, worst
+    first. OpenROAD repairs no protected net (and could not buffer a net
+    with a dont-touch load: RSZ-3006), so their fanout, slew and capacitance
+    stay as the island and synthesis left them: build fanout from cells
+    ({!Cell.fanout}) and isolate shared controls ({!Cell.isolate}). Pass the
+    smaller of the PDK's MAX_FANOUT_CONSTRAINT and the Liberty
+    [default_max_fanout] ({!Cell.max_fanout}). *)
+let fanout_violations ?passive t ~(library : Timing_library.t) ~max_fanout (nl : Netlist.t) =
+  let passive = passive_of ?passive library in
   let _, loads = drivers_and_loads t library nl in
   List.filter_map (Array.to_list t.nets) ~f:(fun (net : Net.t) ->
-    if not net.boundary
+    if not (Net.is_protected net)
     then None
     else
       Option.bind
-        (List.find_map net.sinks ~f:(fun e ->
-           Option.bind (Netlist.find_instance nl (t.prefix ^ e.instance)) ~f:(fun i -> pin_conn i e.pin)))
+        (match
+           List.find_map
+             ((match net.driver with
+               | Cell e -> [ e ]
+               | _ -> [])
+              @ net.sinks)
+             ~f:(fun e ->
+               Option.bind (Netlist.find_instance nl (t.prefix ^ e.instance)) ~f:(fun i ->
+                 pin_conn i e.pin))
+         with
+         | Some n -> Some n
+         | None ->
+           (match net.driver with
+            | Register r -> Netlist.find_net nl (t.prefix ^ r)
+            | _ -> None))
         ~f:(fun n ->
-          let fanout = List.length loads.(n) in
+          let fanout =
+            List.count loads.(n) ~f:(fun ((i : Netlist.Instance.t), _) -> not (passive i.cell))
+          in
           Option.some_if
             (fanout > max_fanout)
             (String.concat ~sep:"," (Netlist.net_names nl n), fanout)))
   |> List.dedup_and_sort ~compare:[%compare: string * int]
   |> List.sort ~compare:(fun (_, a) (_, b) -> Int.compare b a)
+;;
+
+(** {!check_structure}, and with [max_fanout] also every protected net above
+    it ({!fanout_violations}). *)
+let check ?passive ?boundary ?dont_touch ?reference ?max_fanout t ~library nl =
+  check_structure ?passive ?boundary ?dont_touch ?reference t ~library nl
+  @ (match max_fanout with
+     | None -> []
+     | Some max_fanout ->
+       List.map (fanout_violations ?passive t ~library ~max_fanout nl) ~f:(fun (n, f) ->
+         Printf.sprintf
+           "net %s has %d loads (max %d): OpenROAD repairs no protected net"
+           n
+           f
+           max_fanout))
+;;
+
+(* --- Placement --- *)
+
+(** Standard-cell rows: the origin of row 0, the row height and the site
+    width (µm), and whether row 0 is flipped (FS); rows alternate. *)
+type rows =
+  { x0 : float
+  ; y0 : float
+  ; row_height : float
+  ; site_width : float
+  ; first_flipped : bool
+  }
+
+(** [ring_placement t ~name ~library ~rows ~site ~row ~columns] places ring
+    [name] and the protected cells its nodes drive (sampler first stages,
+    capture data buffers, counter clock inverters) as a compact, legal
+    block of standard cells, for a placement that is the same in every run:
+    the ring's period depends on its node loads, which an unconstrained
+    placer spreads out (doubling the period in the gate). Stage [k] and the
+    protected loads of its output form a group; groups snake down and up
+    [columns] columns (up the first, down the next...) so that consecutive
+    stages are neighbours, and with two columns the last and first too;
+    the counters and the enable tree go in the rows below
+    them. The block's lower-left corner is site [site] of row [row]. Consecutive
+    groups are [row_pitch] rows (default 1) and the columns [column_gap]
+    sites (default 0) apart. The coordinates are deterministic; the wire
+    load they give is a measured result for a geometry, not a guarantee: in
+    the gate (TT IHP sg13cmos5l, 2 columns) a compact block left the nodes
+    with a fifth of the Liberty "1k" wire load the ring's timing (its
+    counters' L and E, the Gray counter's settling within a period) was
+    characterised with, an 11-row pitch and 50-site gap with 0.93 of it.
+    Revalidate after changing the geometry. Returns
+    [(instance, x, y, orientation)] for LibreLane's [MACRO_PLACEMENT_CFG]
+    (fixed before global placement, which then pulls the connected logic
+    towards the block). Cell widths are their Liberty area over the row
+    height. *)
+let ring_placement ?(row_pitch = 1) ?(column_gap = 0) t ~name ~(library : Cell_library.t) ~rows ~site ~row ~columns =
+  if columns < 1 || row_pitch < 1 || column_gap < 0 || site < 0 || row < 0
+  then
+    raise_s
+      [%message "Sdc.ring_placement: bad geometry" (columns : int) (row_pitch : int) (column_gap : int) (site : int) (row : int)];
+  let width i =
+    let c = Cell_library.find_exn library i.Instance.cell in
+    Float.to_int (Float.round_up (c.area /. rows.row_height /. rows.site_width -. 1e-6))
+  in
+  let inst nm =
+    match find_instance t nm with
+    | Some i -> i
+    | None -> raise_s [%message "Sdc.ring_placement: no instance" nm]
+  in
+  let is_stage nm =
+    String.equal nm (name ^ "_nand")
+    || List.exists [ "_inv"; "_mux" ] ~f:(fun s -> String.is_prefix nm ~prefix:(name ^ s))
+  in
+  let taken = Hash_set.create (module String) in
+  (* walk the loop from the NAND *)
+  let rec walk acc (i : Instance.t) =
+    Hash_set.add taken i.name;
+    let out = output_pin t i.name in
+    let n = pin_net t out in
+    let next = List.find t.nets.(n).sinks ~f:(fun e -> is_stage e.instance && not (Hash_set.mem taken e.instance)) in
+    let acc = (i, n) :: acc in
+    match next with
+    | Some e -> walk acc (inst e.instance)
+    | None -> List.rev acc
+  in
+  let stages = walk [] (inst (name ^ "_nand")) in
+  let groups =
+    List.map stages ~f:(fun (i, n) ->
+      let loads =
+        List.filter_map t.nets.(n).sinks ~f:(fun e ->
+          if is_stage e.instance || Hash_set.mem taken e.instance
+          then None
+          else (
+            Hash_set.add taken e.instance;
+            Some (inst e.instance)))
+        |> List.dedup_and_sort ~compare:(fun (a : Instance.t) b -> String.compare a.name b.name)
+      in
+      i :: loads)
+  in
+  let extras =
+    List.filter t.instances ~f:(fun i ->
+      String.is_prefix i.name ~prefix:(name ^ "_") && not (Hash_set.mem taken i.name))
+  in
+  let group_width g = List.sum (module Int) g ~f:width + 1 in
+  let per_column = (List.length groups + columns - 1) / columns in
+  let column_width = List.fold groups ~init:0 ~f:(fun m g -> Int.max m (group_width g)) in
+  let place = Queue.create () in
+  let put (i : Instance.t) ~s ~r =
+    let r = row + r in
+    let flipped = Bool.( <> ) (r % 2 = 1) rows.first_flipped in
+    Queue.enqueue
+      place
+      ( t.prefix ^ i.name
+      , rows.x0 +. (Float.of_int (site + s) *. rows.site_width)
+      , rows.y0 +. (Float.of_int r *. rows.row_height)
+      , if flipped then "FS" else "N" )
+  in
+  (* the extras, in rows downwards from the block's first: their row count
+     sets where the block starts *)
+  let total = (columns * column_width) + ((columns - 1) * column_gap) in
+  let extras, extra_rows =
+    List.fold extras ~init:([], 0, 0) ~f:(fun (acc, s, j) i ->
+      let s, j = if s + width i > total && s > 0 then 0, j + 1 else s, j in
+      (i, s, j) :: acc, s + width i, j)
+    |> fun (acc, _, j) -> List.rev acc, if List.is_empty acc then 0 else j + 1
+  in
+  List.iter extras ~f:(fun (i, s, j) -> put i ~s ~r:(extra_rows - 1 - j));
+  List.iteri groups ~f:(fun k g ->
+    let col = k / per_column in
+    let r =
+      extra_rows + (row_pitch * if col % 2 = 0 then k % per_column else per_column - 1 - (k % per_column))
+    in
+    ignore
+      (List.fold g ~init:(col * (column_width + column_gap)) ~f:(fun s i ->
+         put i ~s ~r;
+         s + width i)
+       : int));
+  Queue.to_list place
+  |> List.sort ~compare:(fun (a, _, _, _) (b, _, _, _) -> String.compare a b)
 ;;

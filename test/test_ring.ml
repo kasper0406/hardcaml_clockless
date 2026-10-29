@@ -282,6 +282,7 @@ let%expect_test "cells mode: hand-placed loop, loop-break pin, counters on ring 
          ; nand2 = "sg13cmos5l_nand2_1"
          ; inverter = "sg13cmos5l_inv_1"
          ; mux2 = "sg13cmos5l_mux2_1"
+         ; buffer = "sg13cmos5l_buf_1"
          ; flop = None
          })
       ~enable
@@ -375,25 +376,28 @@ let%expect_test "cells mode: hand-placed loop, loop-break pin, counters on ring 
         wire signal_wire_4;
         wire signal_inst_1;
         (* stable_name=1 *)
+        wire ring_en_iso__X;
+        wire signal_inst_2;
+        (* stable_name=1 *)
         wire ring_node0;
         (* stable_name=1 *)
         wire ring_nand__Y;
-        wire signal_inst_2;
+        wire signal_inst_3;
         (* stable_name=1 *)
         wire ring_node1;
         (* stable_name=1 *)
         wire ring_inv1__Y;
-        wire signal_inst_3;
+        wire signal_inst_4;
         (* stable_name=1 *)
         wire ring_node2;
         (* stable_name=1 *)
         wire ring_inv2__Y;
-        wire signal_inst_4;
+        wire signal_inst_5;
         (* stable_name=1 *)
         wire ring_node3;
         (* stable_name=1 *)
         wire ring_inv3__Y;
-        wire signal_inst_5;
+        wire signal_inst_6;
         (* stable_name=1 *)
         wire ring_node4;
         (* stable_name=1 *)
@@ -517,37 +521,43 @@ let%expect_test "cells mode: hand-placed loop, loop-break pin, counters on ring 
               .X(signal_inst) );
         assign ring_mux0__X = signal_inst;
         assign signal_wire_4 = ring_mux0__X;
+        (* keep=1 *)
+        sg13cmos5l_buf_1
+            ring_en_iso
+            ( .A(enable),
+              .X(signal_inst_1) );
+        assign ring_en_iso__X = signal_inst_1;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_nand2_1
             ring_nand
-            ( .A(enable),
+            ( .A(ring_en_iso__X),
               .B(signal_wire_4),
-              .Y(signal_inst_1) );
-        assign ring_node0 = signal_inst_1;
+              .Y(signal_inst_2) );
+        assign ring_node0 = signal_inst_2;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_inv_1
             ring_inv1
             ( .A(ring_node0),
-              .Y(signal_inst_2) );
-        assign ring_node1 = signal_inst_2;
+              .Y(signal_inst_3) );
+        assign ring_node1 = signal_inst_3;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_inv_1
             ring_inv2
             ( .A(ring_node1),
-              .Y(signal_inst_3) );
-        assign ring_node2 = signal_inst_3;
+              .Y(signal_inst_4) );
+        assign ring_node2 = signal_inst_4;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_inv_1
             ring_inv3
             ( .A(ring_node2),
-              .Y(signal_inst_4) );
-        assign ring_node3 = signal_inst_4;
+              .Y(signal_inst_5) );
+        assign ring_node3 = signal_inst_5;
         (* keep=1,dont_touch=1 *)
         sg13cmos5l_inv_1
             ring_inv4
             ( .A(ring_node3),
-              .Y(signal_inst_5) );
-        assign ring_node4 = signal_inst_5;
+              .Y(signal_inst_6) );
+        assign ring_node4 = signal_inst_6;
         assign signal_cat_10 = { ring_node4,
                                  ring_node3,
                                  ring_node2,
@@ -642,6 +652,7 @@ let%expect_test "Clk_sampler first-stage flop cells keep their instance names" =
          ; nand2 = "sg13cmos5l_nand2_1"
          ; inverter = "sg13cmos5l_inv_1"
          ; mux2 = "sg13cmos5l_mux2_1"
+         ; buffer = "sg13cmos5l_buf_1"
          ; flop = Some dfrbpq
          })
       ~enable

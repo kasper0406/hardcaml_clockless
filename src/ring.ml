@@ -278,6 +278,11 @@ module type S = sig
     ; nand2 : string
     ; inverter : string
     ; mux2 : string
+    ; buffer : string
+    (** [enable] enters through [<name>_en_iso] ({!Cell.isolate}) and, with
+        [flop], fans out to the NAND and the counter resets through a tree
+        of these ([<name>_en_fo_<level>_<j>]) of at most {!Cell.max_fanout}
+        loads per net: OpenROAD never repairs a protected net. *)
     ; flop : flop option
     (** Counter flip-flops as hand-placed cells (named [<name>_cnt_{a,b}_{j,g}<i>];
         counter B is clocked through an inverter [<name>_clkinv_b]). [None]:
@@ -424,6 +429,7 @@ module Make_timed (C : Timed_config) : S = struct
     ; nand2 : string
     ; inverter : string
     ; mux2 : string
+    ; buffer : string
     ; flop : flop option
     }
 
@@ -462,15 +468,31 @@ module Make_timed (C : Timed_config) : S = struct
           ; count_b = encode m.count_b
           }
         , [] )
-      | Cells { library; nand2; inverter; mux2; flop } ->
+      | Cells { library; nand2; inverter; mux2; buffer; flop } ->
         let nand_a, nand_b, nand_y = Cell_pins.nand2 library nand2 in
         let inv_a, inv_y = Cell_pins.inverter library inverter in
         let mux_s, mux_d0, mux_d1, mux_x = Cell_pins.mux2 library mux2 in
         let fb = wire 1 in
         let nand_instance = name ^ "_nand" in
+        (* the NAND, then two counters' resets *)
+        let enables =
+          let iso = Cell.isolate library ~cell:buffer ~instance:(name ^ "_en_iso") enable in
+          match flop with
+          | None -> [| iso |]
+          | Some _ ->
+            Cell.fanout library ~cell:buffer ~name:(name ^ "_en_fo") iso
+              (1 + (2 * Counter.width ~johnson_bits ~gray_width))
+        in
         let node0 =
-          Cell.instantiate library ~cell:nand2 ~instance:nand_instance [ nand_a, enable; nand_b, fb ]
+          Cell.instantiate library ~cell:nand2 ~instance:nand_instance
+            [ nand_a, enables.(0); nand_b, fb ]
             nand_y
+        in
+        let next_enable =
+          let k = ref 0 in
+          fun () ->
+            Int.incr k;
+            enables.(!k)
         in
         let nodes = Array.create ~len:max_length node0 in
         for i = 1 to max_length - 1 do
@@ -518,7 +540,7 @@ module Make_timed (C : Timed_config) : S = struct
             let counter tag clk =
               Counter.create_with ~johnson_bits ~gray_width ~flop:(fun bit d ->
                 Cell.Flop.instantiate library f ~instance:(Printf.sprintf "%s_cnt_%s_%s" name tag bit)
-                  ~clk ~reset_n:enable d)
+                  ~clk ~reset_n:(next_enable ()) d)
             in
             counter "a" node0_buf, counter "b" node0_n
         in

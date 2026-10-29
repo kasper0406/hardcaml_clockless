@@ -730,7 +730,7 @@ let%expect_test "cells mode: module protoemu_pin_capture, stable dont_touch inst
             ; buffer = "sg13cmos5l_buf_1"
             ; mux2 = "sg13cmos5l_mux2_1"
             ; flop = dfrbpq
-            ; delay = "sg13cmos5l_dlygate4sd3_1", 2
+            ; delay = "sg13cmos5l_dlygate4sd3_1", 4
             })
          scope)
   in
@@ -763,7 +763,7 @@ let%expect_test "cells mode: module protoemu_pin_capture, stable dont_touch inst
     module protoemu_pin_capture present: true
       86 sg13cmos5l_buf_1
      225 sg13cmos5l_dfrbpq_1
-       8 sg13cmos5l_dlygate4sd3_1
+      16 sg13cmos5l_dlygate4sd3_1
       19 sg13cmos5l_inv_1
      192 sg13cmos5l_mux2_1
        4 sg13cmos5l_nand2_1

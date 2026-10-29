@@ -40,6 +40,7 @@ let cells library : Vernier.cells =
   ; inverter = inv
   ; mux2 = "sg13cmos5l_mux2_1"
   ; xor2 = "sg13cmos5l_xor2_1"
+  ; buffer = "sg13cmos5l_buf_1"
   ; flop
   }
 ;;

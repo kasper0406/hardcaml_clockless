@@ -26,6 +26,7 @@ let cells lib : Vernier.cells =
   ; inverter = "sg13cmos5l_inv_1"
   ; mux2 = "sg13cmos5l_mux2_1"
   ; xor2 = "sg13cmos5l_xor2_1"
+  ; buffer = "sg13cmos5l_buf_1"
   ; flop = { cell = "sg13cmos5l_dfrbpq_1"; clk = "CLK"; d = "D"; reset_n = "RESET_B"; q = "Q" }
   }
 ;;
