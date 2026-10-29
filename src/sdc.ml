@@ -949,8 +949,37 @@ let check_structure ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(
             err "isolating buffer %s drives %s, not %s" (p name) (net_str o) (net_str expected)
           | None, _ -> err "isolating buffer %s: output not connected" (p name)
           | _ -> ());
-         Option.iter (pin Cell_library.Cell.inputs) ~f:(fun n ->
-           check_source t.nets.(input) ("isolating buffer " ^ p name) n)
+         let what = "isolating buffer " ^ p name in
+         (match pin Cell_library.Cell.inputs with
+          | None -> err "%s: input not connected" what
+          | Some n ->
+            check_source t.nets.(input) what n;
+            (* a source whose circuit names did not survive synthesis:
+               against the reference *)
+            if Option.is_none (by_name t.nets.(input))
+            then (
+              match reference with
+              | None ->
+                (match t.nets.(input).driver with
+                 | Other -> err "%s: cannot verify its source (pass ~reference)" what
+                 | _ -> ())
+              | Some r ->
+                (match
+                   Option.bind (Netlist.find_instance r (p name)) ~f:(fun ri ->
+                     pin_conn ri (List.hd_exn (Cell_library.Cell.inputs c.logic) : Cell_library.Pin.t).name)
+                 with
+                 | None -> err "%s: not in the reference" what
+                 | Some rn ->
+                   let want = Netlist.net_names r rn in
+                   if not
+                        (List.exists (Netlist.net_names nl (root n 0)) ~f:(fun nm ->
+                           List.mem want nm ~equal:String.equal))
+                   then
+                     err
+                       "%s is fed from %s, from %s in the reference"
+                       what
+                       (net_str (root n 0))
+                       (String.concat ~sep:"," want))))
        | _ -> err "isolating buffer %s is %s, not a buffer" (p name) i.cell));
   (* flops synthesised from kept registers, by their D net *)
   let reg_flops = Hashtbl.create (module Int) in
@@ -1232,8 +1261,8 @@ type rows =
     placer spreads out (doubling the period in the gate). Stage [k] and the
     protected loads of its output form a group; groups snake down and up
     [columns] columns so that consecutive stages, and the last and first,
-    are neighbours; the counters and the enable tree go in the rows below.
-    The block's lower-left corner is site [site] of row [row]. Consecutive
+    are neighbours; the counters and the enable tree go in the rows below
+    them. The block's lower-left corner is site [site] of row [row]. Consecutive
     groups are [row_pitch] rows (default 1) and the columns [column_gap]
     sites (default 0) apart: a compact block leaves the nodes far lighter
     than the Liberty "1k" wire load the ring's timing (its counters' L and
@@ -1244,6 +1273,10 @@ type rows =
     towards the block). Cell widths are their Liberty area over the row
     height. *)
 let ring_placement ?(row_pitch = 1) ?(column_gap = 0) t ~name ~(library : Cell_library.t) ~rows ~site ~row ~columns =
+  if columns < 1 || row_pitch < 1 || column_gap < 0 || site < 0 || row < 0
+  then
+    raise_s
+      [%message "Sdc.ring_placement: bad geometry" (columns : int) (row_pitch : int) (column_gap : int) (site : int) (row : int)];
   let width i =
     let c = Cell_library.find_exn library i.Instance.cell in
     Float.to_int (Float.round_up (c.area /. rows.row_height /. rows.site_width -. 1e-6))
@@ -1301,20 +1334,26 @@ let ring_placement ?(row_pitch = 1) ?(column_gap = 0) t ~name ~(library : Cell_l
       , rows.y0 +. (Float.of_int r *. rows.row_height)
       , if flipped then "FS" else "N" )
   in
+  (* the extras, in rows downwards from the block's first: their row count
+     sets where the block starts *)
+  let total = (columns * column_width) + ((columns - 1) * column_gap) in
+  let extras, extra_rows =
+    List.fold extras ~init:([], 0, 0) ~f:(fun (acc, s, j) i ->
+      let s, j = if s + width i > total && s > 0 then 0, j + 1 else s, j in
+      (i, s, j) :: acc, s + width i, j)
+    |> fun (acc, _, j) -> List.rev acc, if List.is_empty acc then 0 else j + 1
+  in
+  List.iter extras ~f:(fun (i, s, j) -> put i ~s ~r:(extra_rows - 1 - j));
   List.iteri groups ~f:(fun k g ->
     let col = k / per_column in
-    let r = row_pitch * if col % 2 = 0 then k % per_column else per_column - 1 - (k % per_column) in
+    let r =
+      extra_rows + (row_pitch * if col % 2 = 0 then k % per_column else per_column - 1 - (k % per_column))
+    in
     ignore
       (List.fold g ~init:(col * (column_width + column_gap)) ~f:(fun s i ->
          put i ~s ~r;
          s + width i)
        : int));
-  let total = (columns * column_width) + ((columns - 1) * column_gap) in
-  ignore
-    (List.fold extras ~init:(0, -1) ~f:(fun (s, r) i ->
-       let s, r = if s + width i > total then 0, r - 1 else s, r in
-       put i ~s ~r;
-       s + width i, r)
-     : int * int);
   Queue.to_list place
+  |> List.sort ~compare:(fun (a, _, _, _) (b, _, _, _) -> String.compare a b)
 ;;

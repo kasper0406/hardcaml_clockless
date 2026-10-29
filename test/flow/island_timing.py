@@ -30,6 +30,7 @@ spans) use the latest. It reports
 """
 import collections
 import json
+import math
 import re
 import statistics
 import sys
@@ -310,7 +311,7 @@ def counter_margins(sdf, loop, flops, frame, n=17, settle=9, earliest=4, periods
         for cnt in [i for i in sdf.celltype if i.startswith(p + f"cnt_{tag}_")]:
             c = clk_at.get((cnt + "/CLK", "r"))
             if c is None:
-                continue
+                raise SystemExit(f"margins: no clock path from node 0 to {cnt}")
             for qe in "rf":
                 cq = sdf.arcs[cnt][("CLK", "Q")][0 if qe == "r" else 1]
                 arr = sdf.propagate(cnt + "/Q", qe, t0=c[1] + cq[1], stop=at_d, within=hand)
@@ -365,6 +366,8 @@ def counter_margins(sdf, loop, flops, frame, n=17, settle=9, earliest=4, periods
         res[tag] = {"safe_from": max(unsafe) + 1 if unsafe else None,
                     "before_stages": round(before / stage, 1), "after_stages": round(after / stage, 1)}
     res["worst_stages"] = min(min(v["before_stages"], v["after_stages"]) for k, v in res.items() if k in "ab")
+    if not all(math.isfinite(v["before_stages"]) and math.isfinite(v["after_stages"]) for k, v in res.items() if k in "ab"):
+        raise SystemExit("margins: no complete period (missing counter paths?)")
     res["stage_ps"] = round(1000 * stage, 1)
     return res
 
@@ -408,26 +411,37 @@ def ring_margins(sdf, loop):
 
 
 def tag_lag(sdf):
-    """Pin_capture: per bank and slot, how much later than every other bit
-    of the slot a tag bit turns fresh after a bank clock edge (the pointer
-    moves, the slot select follows, the tag's select lags), less the tag
-    flops' setup and hold: first tag D minus last other D, each through its
-    mux's select (S -> X -> D), over early and over late delays."""
+    """Pin_capture: per bank and slot, the tag-lag margin as
+    Capture_timing.tag_margins defines it, on static delays: after a bank
+    clock edge (the pointer moves, the slot select follows, the tag's
+    select lags), the earliest tag D (through its mux's select, S -> X ->
+    D) less its hold, minus the latest other D plus its setup, each in its
+    own flop's clock frame (clock arrival after the trunk). Over early and
+    over late delays (one event: not mixed)."""
     pc = "island.pin_capture_"
     res = {}
+    slot_rx = re.compile(r"_[rf]_s\d+_")
     for bank, root in (("r", pc + "clkr/X"), ("f", pc + "clkf/Y")):
         arr = sdf.propagate(root, "r", selects=True,
-                            stop=lambda pin: pin.endswith("/S") or pin.endswith("/D"),
+                            stop=lambda pin: (pin.endswith("/S") or pin.endswith("/D")
+                                              or (pin.endswith("/CLK") and slot_rx.search(pin) is not None)),
                             within=lambda inst: inst.startswith(pc))
 
-        def fresh(f):
+        def at(pin, k):
+            v = [arr[(pin, x)][k] for x in "rf" if (pin, x) in arr]
+            if not v:
+                raise SystemExit(f"tag lag: no path from {root} to {pin}")
+            return min(v) if k == 0 else max(v)
+
+        def fresh(f, k):
             m = f + "_mux"
-            s_at = [arr[(m + "/S", x)] for x in "rf" if (m + "/S", x) in arr]
             sx = sdf.arcs[m][("S", "X")]
             wire = next(d for load, d in sdf.fanout[m + "/X"] if load == f + "/D")
-            lo = min(v[0] for v in s_at) + min(x[0] for x in sx if x) + min(w[0] for w in wire)
-            hi = max(v[1] for v in s_at) + max(x[1] for x in sx if x) + max(w[1] for w in wire)
-            return lo, hi
+            pick = min if k == 0 else max
+            return at(m + "/S", k) + pick(x[k] for x in sx if x) + wire[0][k]
+
+        def check(f, kind):
+            return max(v for key, v in sdf.checks[f].items() if key[0] == kind)
 
         for slot in range(4):
             base = f"{pc}{bank}_s{slot}_"
@@ -436,13 +450,15 @@ def tag_lag(sdf):
                 continue
             tags = [f for f in flops if re.match(re.escape(base) + r"tag\d+$", f)]
             data = [f for f in flops if f not in tags]
-            # one event: compare like with like (early with early, late with
-            # late); mixing them would count the shared clock -> pointer ->
-            # select path's early/late spread twice
-            lag = min(min(fresh(f)[k] for f in tags) - max(fresh(f)[k] for f in data) for k in (0, 1))
-            sh = max(v for f in tags for k, v in sdf.checks[f].items() if k[0] == "SETUP") + max(
-                v for f in tags for k, v in sdf.checks[f].items() if k[0] == "HOLD")
-            res[f"{bank}{slot}"] = round(1000 * (lag - sh), 1)
+            if not tags or not data:
+                raise SystemExit(f"tag lag: slot {base} without tags or data")
+            margin = min(
+                min(fresh(f, k) - at(f + "/CLK", k) - check(f, "HOLD") for f in tags)
+                - max(fresh(f, k) - at(f + "/CLK", k) + check(f, "SETUP") for f in data)
+                for k in (0, 1))
+            res[f"{bank}{slot}"] = round(1000 * margin, 1)
+    if not res:
+        raise SystemExit("tag lag: no capture slots")
     res["worst_ps"] = min(res.values())
     return res
 

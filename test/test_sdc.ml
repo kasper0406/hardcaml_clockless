@@ -720,8 +720,56 @@ let%expect_test "ring_placement: a legal block, consecutive stages adjacent" =
        ~columns:2)
     ~f:(fun (i, x, y, o) -> printf "%-14s %7.2f %7.2f %s\n" i x y o);
   [%expect {|
-    ring_nand         7.68   22.68 FS
     ring_inv1         7.68   26.46 N
     ring_inv2        10.08   26.46 N
+    ring_nand         7.68   22.68 FS
+    |}]
+;;
+
+let%expect_test "check: isolating buffers are connected and fed from their source" =
+  (* the ring enable's isolating buffer, unconnected *)
+  check (edit ~from:"ring_en_iso (.A(en)" ~to_:"ring_en_iso (.A()");
+  (* a select from a register (whose name synthesis drops) through an
+     isolating buffer: only the reference netlist tells its source *)
+  let library = force lib in
+  let open Signal in
+  let clk = input "clk" 1 in
+  let spec = Reg_spec.create ~clock:clk () in
+  let a = input "a" 1 in
+  let b = input "b" 1 in
+  let sel = reg spec (input "s" 1) -- "sel" in
+  let other = reg spec (input "u" 1) -- "other" in
+  let iso = Cell.isolate library ~cell:"sg13cmos5l_buf_1" ~instance:"iso" sel in
+  let m = Cell.instantiate library ~cell:"sg13cmos5l_mux2_1" ~instance:"m" [ "S", iso; "A0", a; "A1", b ] "X" in
+  let t = Sdc.create (Circuit.create_exn ~name:"top" [ output "x" m; output "o" other ]) in
+  let netlist src =
+    Printf.sprintf
+      {|
+module top(clk, s, u, a, b, x, o);
+  input clk; input s; input u; input a; input b; output x; output o;
+  wire _r1_; wire iso__X;
+  sg13cmos5l_dfrbpq_1 _1_ (.CLK(clk), .D(s), .RESET_B(1'b1), .Q(_r1_));
+  sg13cmos5l_dfrbpq_1 _2_ (.CLK(clk), .D(u), .RESET_B(1'b1), .Q(o));
+  sg13cmos5l_buf_1 iso (.A(%s), .X(iso__X));
+  sg13cmos5l_mux2_1 m (.S(iso__X), .A0(a), .A1(b), .X(x));
+endmodule
+|}
+      src
+  in
+  let reference = Netlist.of_string (netlist "_r1_") in
+  let dont_touch = Or_error.ok_exn (Sdc.dont_touch_list t ~library:(force tlib) reference) in
+  let run ?reference text =
+    match Sdc.check t ~dont_touch ?reference ~library:(force tlib) (Netlist.of_string text) with
+    | [] -> print_endline "ok"
+    | errors -> List.iter errors ~f:print_endline
+  in
+  run ~reference (netlist "_r1_");
+  run ~reference (netlist "o");
+  run (netlist "o");
+  [%expect {|
+    isolating buffer ring_en_iso: input not connected
+    ok
+    isolating buffer iso is fed from o, from _r1_ in the reference
+    isolating buffer iso: cannot verify its source (pass ~reference)
     |}]
 ;;
