@@ -3,7 +3,7 @@
 races and Vernier lines, from an SDF written by OpenSTA (sta_island.tcl):
 pre-layout (Liberty "1k" wire load) or routed (SPEF), one corner per file.
 
-    island_timing.py SDF LOOP_SDF [--json OUT] [--spef SPEF]
+    island_timing.py SDF LOOP_SDF [--json OUT] [--spef SPEF] [--names RING,SAMPLER,CAPTURE,VERNIER]
     island_timing.py --summary DIR     (DIR/{pre,post}-{typ,fast,slow}.json)
 
 LOOP_SDF: the same corner with the ring broken elsewhere (the main SDF has
@@ -34,6 +34,20 @@ import math
 import re
 import statistics
 import sys
+
+# Instance name prefixes of the structures (the stub island's by default;
+# --names RING,SAMPLER,CAPTURE,VERNIER for another design, e.g. the v1 chip:
+# capture.capture_ring_,capture.capture_clk_sample_,capture.capture_pc_,protoemu_vernier.vernier_).
+RING = "island.ring_"
+SAMPLER = "island.ring_sample_"
+CAPTURE = "island.pin_capture_"
+VERNIER = "island.vernier_"
+
+
+def hand(inst):
+    """A hand-placed island cell (not synthesised logic)."""
+    return any(inst.startswith(x.split(".")[0] + ".") for x in (RING, SAMPLER, CAPTURE, VERNIER))
+
 
 POS = "pos"
 NEG = "neg"
@@ -174,7 +188,7 @@ class Sdf:
 
 
 def ring(sdf, loop):
-    p = "island.ring_"
+    p = RING
     nand_y = p + "nand/Y"
     # B -> Y of the NAND from the loop SDF (disabled in the main one)
     by = loop.arcs[p + "nand"][("B", "Y")]
@@ -211,7 +225,7 @@ def ring(sdf, loop):
 
 
 def capture(sdf):
-    p = "island.pin_capture_"
+    p = CAPTURE
     res = {}
     for i in range(4):
         # the pin net: the port for pins 2-3, the loopback mux output for 0-1
@@ -257,7 +271,7 @@ def capture(sdf):
 def node_waveform(sdf, loop, n=17):
     """Per ring transition q in [0, 2n) (q = 0 a rise of node 0, node q mod n
     changes): its edge and time at the node, over late delays; the period."""
-    p = "island.ring_"
+    p = RING
     by = loop.arcs[p + "nand"][("B", "Y")]
     stop = lambda pin: pin == p + "nand/B"
     times = []
@@ -281,13 +295,12 @@ def counter_margins(sdf, loop, flops, frame, n=17, settle=9, earliest=4, periods
     [flops] (role -> flop: ("node", k) or ("a"|"b", bit)), with each flop's
     clock arrival [frame(flop)] subtracted. Every counter bit is taken to
     change at every edge (worst case)."""
-    p = "island.ring_"
+    p = RING
     times, period = node_waveform(sdf, loop, n)
 
     def check(f, kind, edge):
         return max(v for (k, ed, pin), v in sdf.checks[f].items() if k == kind and ed == ("posedge" if edge == "r" else "negedge"))
 
-    hand = lambda inst: inst.startswith("island.")  # hand-placed cells only
     # stop at flops, and at the next ring stage (the ring is a loop)
     at_d = lambda pin: (pin.endswith("/D") or pin.endswith("/CLK")
                         or re.match(re.escape(p) + r"(inv\d+/A|nand/B)$", pin) is not None)
@@ -391,15 +404,15 @@ def ring_margins(sdf, loop):
     res = {}
     # the system-clock sampler: first-stage flop cells on clk
     clk = clock_arrival(sdf, "clk")
-    flops = {("node", k): f"island.ring_sample_node{k}" for k in range(17)}
+    flops = {("node", k): f"{SAMPLER}node{k}" for k in range(17)}
     for tag in "ab":
         for i in range(10):
-            f = f"island.ring_sample_count_{tag}_{i}"
+            f = f"{SAMPLER}count_{tag}_{i}"
             if f in sdf.celltype:
                 flops[(tag, i)] = f
     res["clk_sampler"] = counter_margins(sdf, loop, flops, lambda f: clk[f])
     # Pin_capture's slots, per bank and slot, against their own bank clock
-    pc = "island.pin_capture_"
+    pc = CAPTURE
     for bank, root in (("r", pc + "clkr/X"), ("f", pc + "clkf/Y")):
         ck = clock_arrival(sdf, root)
         for slot in range(4):
@@ -426,7 +439,7 @@ def tag_lag(sdf):
     D) less its hold, minus the latest other D plus its setup, each in its
     own flop's clock frame (clock arrival after the trunk). Over early and
     over late delays (one event: not mixed)."""
-    pc = "island.pin_capture_"
+    pc = CAPTURE
     res = {}
     slot_rx = re.compile(r"_[rf]_s\d+_")
     exact = []
@@ -478,7 +491,7 @@ def vernier(sdf):
     res = {}
     for pin in range(2):
         for line in "rf":
-            p = f"island.vernier_p{pin}_{line}_"
+            p = f"{VERNIER}p{pin}_{line}_"
             launch = p + "launch/Q"
             line_res = {}
             for sec, stage_rx, tap0_from in (("coarse", r"c_stage(\d+)_(\d+)$", "launch/Q"), ("fine", r"f_stage(\d+)_(\d+)$", None)):
@@ -510,7 +523,7 @@ def vernier(sdf):
                     "span_fall_ns": round(sum(per_edge["f"]), 3),
                 }
             # launch -> XOR -> output mux: shortest and longest over the taps
-            out = f"island.vernier_p{pin}_out/A0"
+            out = f"{VERNIER}p{pin}_out/A0"
             a = []
             for e in "rf":  # a launch flop toggles both ways
                 arr = sdf.propagate(launch, e, stop=lambda pin: pin.endswith("/S"))
@@ -566,11 +579,11 @@ def spef_caps(path):
 def wire_caps(sdf, spef):
     caps = spef_caps(spef)
     groups = {
-        "ring nodes": [("island.ring_nand/Y", "island.ring_nand__Y")]
-        + [(f"island.ring_inv{k}/Y", f"island.ring_inv{k}__Y") for k in range(1, 17)],
+        "ring nodes": [(RING + "nand/Y", RING + "nand__Y")]
+        + [(f"{RING}inv{k}/Y", f"{RING}inv{k}__Y") for k in range(1, 17)],
         "vernier coarse chain": [(i + "/" + ("Y" if "inv" in sdf.celltype[i] else "X"), i + ("__Y" if "inv" in sdf.celltype[i] else "__X"))
-                                 for i in sorted(sdf.celltype) if re.match(r"island\.vernier_p\d_[rf]_c_stage\d+_\d+$", i)],
-        "vernier fine chain": [(i + "/X", i + "__X") for i in sorted(sdf.celltype) if re.match(r"island\.vernier_p\d_[rf]_f_stage\d+_\d+$", i)],
+                                 for i in sorted(sdf.celltype) if re.match(re.escape(VERNIER) + r"p\d_[rf]_c_stage\d+_\d+$", i)],
+        "vernier fine chain": [(i + "/X", i + "__X") for i in sorted(sdf.celltype) if re.match(re.escape(VERNIER) + r"p\d_[rf]_f_stage\d+_\d+$", i)],
     }
     res = {}
     for g, nets in groups.items():
@@ -644,6 +657,11 @@ def main():
     if "--json" in args:
         k = args.index("--json")
         out = args[k + 1]
+        del args[k:k + 2]
+    if "--names" in args:
+        k = args.index("--names")
+        global RING, SAMPLER, CAPTURE, VERNIER
+        RING, SAMPLER, CAPTURE, VERNIER = args[k + 1].split(",")
         del args[k:k + 2]
     if "--spef" in args:
         k = args.index("--spef")
