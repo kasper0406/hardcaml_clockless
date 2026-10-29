@@ -31,7 +31,12 @@
      wrapper (synthesised or routed; LIST: the resolved names, REFERENCE:
      the synthesised netlist they were resolved from), non-zero exit on any
      violation;
-   - [fields]: the configuration fields, LSB first (name, offset, width).
+   - [fanout NETLIST]: protected nets above Tiny Tapeout's max fanout
+     (Sdc.fanout_violations);
+   - [fields]: the configuration fields, LSB first (name, offset, width);
+   - [placement SITE ROW [ROW_PITCH COLUMN_GAP]]: MACRO_PLACEMENT_CFG lines
+     placing the ring and its node loads as a block at site SITE of row ROW
+     (Sdc.ring_placement, the TT IHP sg13cmos5l rows).
 
    Instance and net names get the prefix ["island."] (the wrapper's instance,
    flattened by yosys). *)
@@ -41,6 +46,11 @@ open Hardcaml
 open Hardcaml_clockless
 
 let prefix = "island."
+
+(* Tiny Tapeout's MAX_FANOUT_CONSTRAINT for sg13cmos5l: what OpenROAD
+   repairs to, and so what a protected net must not exceed. (The trees the
+   library builds use the Liberty default_max_fanout, 8: Cell.max_fanout.) *)
+let max_fanout = 10
 let clock_period_ns = 20.
 
 (* The smallest settle_cycles the host may load (Vernier: 3 before layout,
@@ -95,6 +105,7 @@ let vernier_cells lib : Vernier.cells =
   ; inverter = "sg13cmos5l_inv_1"
   ; mux2 = "sg13cmos5l_mux2_1"
   ; xor2 = "sg13cmos5l_xor2_1"
+  ; buffer = "sg13cmos5l_buf_1"
   ; flop = { cell = flop.cell; clk = flop.clk; d = flop.d; reset_n = flop.reset_n; q = flop.q }
   }
 ;;
@@ -162,6 +173,7 @@ let island lib =
          ; nand2 = "sg13cmos5l_nand2_1"
          ; inverter = "sg13cmos5l_inv_1"
          ; mux2 = "sg13cmos5l_mux2_1"
+         ; buffer = "sg13cmos5l_buf_1"
          ; flop = Some flop
          })
       ~enable:ring_enable
@@ -316,15 +328,11 @@ let () =
       if Array.length argv >= 5 then Stdio.In_channel.read_lines argv.(4) else []
     in
     let reference = if Array.length argv = 6 then Some (Netlist.load argv.(5)) else None in
-    (match Sdc.check ~boundary ~dont_touch ?reference sdc ~library (Netlist.load netlist) with
+    (match
+       Sdc.check ~boundary ~dont_touch ?reference sdc ~library
+         (Netlist.load netlist)
+     with
      | [] ->
-       (match Sdc.boundary_fanouts sdc ~library ~max_fanout:10 (Netlist.load netlist) with
-        | [] -> ()
-        | l ->
-          Stdio.printf
-            "note: %d boundary nets above the max fanout (10), not repairable: %s\n"
-            (List.length l)
-            (String.concat ~sep:" " (List.map l ~f:(fun (n, f) -> Printf.sprintf "%s(%d)" n f))));
        Stdio.printf
          "%s: %d protected instances and %d protected nets intact\n"
          netlist
@@ -334,6 +342,32 @@ let () =
        List.iter errors ~f:Stdio.print_endline;
        Stdio.printf "%s: %d violations\n" netlist (List.length errors);
        Stdlib.exit 1)
+  | ([| _; liberty; "placement"; site; row |] | [| _; liberty; "placement"; site; row; _; _ |]) as argv ->
+    let row_pitch, column_gap =
+      if Array.length argv = 7 then Int.of_string argv.(5), Int.of_string argv.(6) else 1, 0
+    in
+    let lib = Cell_library.load liberty in
+    let _, sdc = constraints lib in
+    List.iter
+      (Sdc.ring_placement
+         ~row_pitch
+         ~column_gap
+         sdc
+         ~name:"ring"
+         ~library:lib
+         ~rows:{ x0 = 2.88; y0 = 3.78; row_height = 3.78; site_width = 0.48; first_flipped = false }
+         ~site:(Int.of_string site)
+         ~row:(Int.of_string row)
+         ~columns:2)
+      ~f:(fun (i, x, y, o) -> Stdio.printf "%s %.2f %.2f %s\n" i x y o)
+  | [| _; liberty; "fanout"; netlist |] ->
+    let library = Timing_library.load liberty in
+    let _, sdc = constraints library.library in
+    (match Sdc.fanout_violations sdc ~library ~max_fanout (Netlist.load netlist) with
+     | [] -> Stdio.printf "no protected net above %d loads\n" max_fanout
+     | l ->
+       List.iter l ~f:(fun (n, f) ->
+         Stdio.printf "net %s has %d loads (max %d): OpenROAD repairs no protected net\n" n f max_fanout))
   | [| _; _; "fields" |] ->
     ignore
       (List.fold fields ~init:0 ~f:(fun lo (name, w) ->
@@ -342,6 +376,6 @@ let () =
        : int)
   | _ ->
     Stdio.eprintf
-      "usage: gen_stub LIBERTY verilog|rx|sdc pnr|sdc signoff|dont-touch NL|rx-of LIST|check NL [LIST [REF]]|fields\n";
+      "usage: gen_stub LIBERTY verilog|rx|sdc pnr|sdc signoff|dont-touch NL|rx-of LIST|check NL [LIST [REF]]|fanout NL|fields|placement SITE ROW [ROW_PITCH COLUMN_GAP]\n";
     Stdlib.exit 2
 ;;

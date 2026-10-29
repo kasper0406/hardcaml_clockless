@@ -39,8 +39,11 @@ NEG = "neg"
 NON = "non"
 
 
-def unateness(celltype, inp, out):
+def unateness(celltype, inp, out, selects=False):
     c = celltype.replace("sg13cmos5l_", "")
+    if c.startswith("dfrbpq_"):
+        # Q after the rising clock edge (only), either way
+        return NON if (selects and inp == "CLK") else None
     if re.match(r"(inv|nand\d|nor\d)_", c):
         return NEG
     if re.match(r"(buf|dlygate\w*)_", c):
@@ -48,7 +51,9 @@ def unateness(celltype, inp, out):
     if c.startswith("xor2_") or c.startswith("xnor2_"):
         return NON
     if c.startswith("mux2_"):
-        return POS if inp in ("A0", "A1") else None  # selects are static
+        if inp in ("A0", "A1"):
+            return POS
+        return NON if selects else None  # selects are static, unless asked
     return None  # anything else: not followed
 
 
@@ -123,7 +128,7 @@ class Sdf:
     def outputs(self, inst, inp):
         return [(o, d) for (i, o), d in self.arcs.get(inst, {}).items() if i == inp]
 
-    def propagate(self, start, edge, t0=0.0, stop=lambda pin: False):
+    def propagate(self, start, edge, t0=0.0, stop=lambda pin: False, selects=False, within=None):
         """Arrival (earliest, latest) per (pin, edge) from [start] (an output
         pin or port) switching with [edge] ('r' or 'f') at t0: the earliest
         over early (SDF min) delays, the latest over late (max) delays."""
@@ -147,9 +152,13 @@ class Sdf:
                 if not note(load, e, tl) or stop(load) or "/" not in load:
                     continue
                 inst, ipin = load.split("/")
+                if within is not None and not within(inst):
+                    continue
                 ct = self.celltype.get(inst, "")
                 for opin, (orise, ofall) in self.outputs(inst, ipin):
-                    u = unateness(ct, ipin, opin)
+                    if ipin == "CLK" and e != "r":
+                        continue
+                    u = unateness(ct, ipin, opin, selects)
                     if u is None:
                         continue
                     outs = {POS: [e], NEG: ["f" if e == "r" else "r"], NON: ["r", "f"]}[u]
@@ -241,6 +250,200 @@ def capture(sdf):
     delayed = [v["delayed_margin_ps"] for o in res.values() for v in o.values() if v["delayed_margin_ps"] is not None]
     res["snapshot_margin_min_ps"] = min(margins) if margins else None
     res["delayed_margin_min_ps"] = min(delayed) if delayed else None
+    return res
+
+
+def node_waveform(sdf, loop, n=17):
+    """Per ring transition q in [0, 2n) (q = 0 a rise of node 0, node q mod n
+    changes): its edge and time at the node, over late delays; the period."""
+    p = "island.ring_"
+    by = loop.arcs[p + "nand"][("B", "Y")]
+    stop = lambda pin: pin == p + "nand/B"
+    times = []
+    t0 = 0.0
+    for e in "rf":
+        arr = sdf.propagate(p + "nand/Y", e, t0=t0, stop=stop)
+        times.append((p + "nand/Y", e, t0))
+        ek = e
+        for k in range(1, n):
+            ek = "f" if ek == "r" else "r"
+            times.append((p + f"inv{k}/Y", ek, arr[(p + f"inv{k}/Y", ek)][1]))
+        tb = arr[(p + "nand/B", ek)][1]
+        back = by[0] if ek == "f" else by[1]  # B falls -> Y rises
+        t0 = tb + back[1]
+    return times, t0
+
+
+def counter_margins(sdf, loop, flops, frame, n=17, settle=9, earliest=4, periods=6):
+    """Ring_margins.counter (test/ring_margins.ml) on static delays: the
+    counter-selection margins, in stages, of a sampler whose flops are
+    [flops] (role -> flop: ("node", k) or ("a"|"b", bit)), with each flop's
+    clock arrival [frame(flop)] subtracted. Every counter bit is taken to
+    change at every edge (worst case)."""
+    p = "island.ring_"
+    times, period = node_waveform(sdf, loop, n)
+
+    def check(f, kind, edge):
+        return max(v for (k, ed, pin), v in sdf.checks[f].items() if k == kind and ed == ("posedge" if edge == "r" else "negedge"))
+
+    hand = lambda inst: inst.startswith("island.")  # hand-placed cells only
+    # stop at flops, and at the next ring stage (the ring is a loop)
+    at_d = lambda pin: (pin.endswith("/D") or pin.endswith("/CLK")
+                        or re.match(re.escape(p) + r"(inv\d+/A|nand/B)$", pin) is not None)
+    # node transitions as the flops see them (one period, then shifted)
+    one = []
+    for q, (src, e, t) in enumerate(times):
+        f = flops[("node", q % n)]
+        arr = sdf.propagate(src, e, t0=t, stop=at_d, within=hand)
+        d = {x: arr[(f + "/D", x)][1] for x in "rf" if (f + "/D", x) in arr}
+        if not d:
+            raise SystemExit(f"margins: no path from {src} to {f}/D")
+        x = max(d, key=d.get)
+        one.append(dict(time=d[x] - frame(f), setup=check(f, "SETUP", x), hold=check(f, "HOLD", x)))
+    tr = [dict(c, time=c["time"] + j * period) for j in range(periods) for c in one]
+    # counter changes: each counter flop's clock from node 0, clk->Q, to the flops
+    changes = {"a": [], "b": []}
+    for tag, first in (("a", 0), ("b", n)):
+        src, e, t = times[first]
+        clk_at = sdf.propagate(src, e, t0=t, stop=at_d, within=hand)
+        once = []
+        for cnt in [i for i in sdf.celltype if i.startswith(p + f"cnt_{tag}_")]:
+            c = clk_at.get((cnt + "/CLK", "r"))
+            if c is None:
+                continue
+            for qe in "rf":
+                cq = sdf.arcs[cnt][("CLK", "Q")][0 if qe == "r" else 1]
+                arr = sdf.propagate(cnt + "/Q", qe, t0=c[1] + cq[1], stop=at_d, within=hand)
+                arr_lo = c[0] + cq[0]
+                for (role, bit), f in flops.items():
+                    if role != tag:
+                        continue
+                    for x in "rf":
+                        if (f + "/D", x) in arr:
+                            lo, hi = arr[(f + "/D", x)]
+                            once.append(dict(time=hi - frame(f), lo=lo - (c[1] + cq[1]) + arr_lo - frame(f),
+                                             setup=check(f, "SETUP", x), hold=check(f, "HOLD", x)))
+        changes[tag] = [dict(c, time=c["time"] + j * period, lo=c["lo"] + j * period) for j in range(periods) for c in once]
+    seen = [x["time"] + x["setup"] for x in tr]
+    bins = [seen[q + 1] - seen[q] for q in range(2 * n * (periods - 1))]
+    inner = [b for q, b in enumerate(bins) if q % n != n - 1]
+    stage = sum(inner) / len(inner)
+
+    def med3(f, i):
+        return sorted([f(i - 1), f(i), f(i + 1)])[1]
+
+    can_new = lambda i: tr[i]["time"] - tr[i]["hold"]
+    can_old = lambda i: tr[i]["time"] + tr[i]["setup"]
+    r_lo = lambda q: max(med3(can_new, q), med3(can_new, q - 1))
+    r_hi = lambda q: min(med3(can_old, q + 1), med3(can_old, q + 2))
+    s = (n + settle + earliest + 1) // 2
+    res = {}
+    for tag, first in (("a", 0), ("b", n)):
+        edges = [first + 2 * n * j for j in range(periods)]
+        unstable = {}
+        for c in changes[tag]:
+            j = max(i for i, q in enumerate(edges) if tr[q]["time"] <= c["lo"] + 1e-9) if any(tr[q]["time"] <= c["lo"] + 1e-9 for q in edges) else None
+            if j is None:
+                continue
+            lo, hi = c["lo"] - c["hold"], c["time"] + c["setup"]
+            a, b = unstable.get(j, (lo, hi))
+            unstable[j] = (min(a, lo), max(b, hi))
+        before = after = float("inf")
+        unsafe = []
+        for j in range(1, periods - 2):
+            if j not in unstable or j + 1 not in unstable:
+                continue
+            lo, hi = unstable[j]
+            lo_next = unstable[j + 1][0]
+            for d in range(-n, n):
+                q = edges[j] + d
+                if r_lo(q) < hi and r_hi(q) > lo:
+                    unsafe.append(d)
+            for q in range(edges[j] + s, edges[j] + s + n):
+                before = min(before, r_lo(q) - hi)
+                after = min(after, lo_next - r_hi(q))
+        res[tag] = {"safe_from": max(unsafe) + 1 if unsafe else None,
+                    "before_stages": round(before / stage, 1), "after_stages": round(after / stage, 1)}
+    res["worst_stages"] = min(min(v["before_stages"], v["after_stages"]) for k, v in res.items() if k in "ab")
+    res["stage_ps"] = round(1000 * stage, 1)
+    return res
+
+
+def clock_arrival(sdf, root, edge="r"):
+    """Arrival of [root]'s edge at every flop clock pin it reaches."""
+    # the clock tree: CTS buffers and hand-placed cells, not synthesised logic
+    arr = sdf.propagate(root, edge, stop=lambda pin: pin.endswith("/CLK"),
+                        within=lambda inst: not re.match(r"_\d+_$", inst))
+    return {pin[: -len("/CLK")]: v[1] for (pin, e), v in arr.items() if pin.endswith("/CLK") and e == "r"}
+
+
+def ring_margins(sdf, loop):
+    res = {}
+    # the system-clock sampler: first-stage flop cells on clk
+    clk = clock_arrival(sdf, "clk")
+    flops = {("node", k): f"island.ring_sample_node{k}" for k in range(17)}
+    for tag in "ab":
+        for i in range(10):
+            f = f"island.ring_sample_count_{tag}_{i}"
+            if f in sdf.celltype:
+                flops[(tag, i)] = f
+    res["clk_sampler"] = counter_margins(sdf, loop, flops, lambda f: clk[f])
+    # Pin_capture's slots, per bank and slot, against their own bank clock
+    pc = "island.pin_capture_"
+    for bank, root in (("r", pc + "clkr/X"), ("f", pc + "clkf/Y")):
+        ck = clock_arrival(sdf, root)
+        for slot in range(4):
+            base = f"{pc}{bank}_s{slot}_"
+            if base + "nodes0" not in sdf.celltype:
+                continue
+            flops = {("node", k): f"{base}nodes{k}" for k in range(17)}
+            for tag, nm in (("a", "count_a"), ("b", "count_b")):
+                for i in range(10):
+                    f = f"{base}{nm}{i}"
+                    if f in sdf.celltype:
+                        flops[(tag, i)] = f
+            res[f"capture_{bank}{slot}"] = counter_margins(sdf, loop, flops, lambda f, ck=ck: ck[f])
+    res["worst_stages"] = min(v["worst_stages"] for v in res.values())
+    return res
+
+
+def tag_lag(sdf):
+    """Pin_capture: per bank and slot, how much later than every other bit
+    of the slot a tag bit turns fresh after a bank clock edge (the pointer
+    moves, the slot select follows, the tag's select lags), less the tag
+    flops' setup and hold: first tag D minus last other D, each through its
+    mux's select (S -> X -> D), over early and over late delays."""
+    pc = "island.pin_capture_"
+    res = {}
+    for bank, root in (("r", pc + "clkr/X"), ("f", pc + "clkf/Y")):
+        arr = sdf.propagate(root, "r", selects=True,
+                            stop=lambda pin: pin.endswith("/S") or pin.endswith("/D"),
+                            within=lambda inst: inst.startswith(pc))
+
+        def fresh(f):
+            m = f + "_mux"
+            s_at = [arr[(m + "/S", x)] for x in "rf" if (m + "/S", x) in arr]
+            sx = sdf.arcs[m][("S", "X")]
+            wire = next(d for load, d in sdf.fanout[m + "/X"] if load == f + "/D")
+            lo = min(v[0] for v in s_at) + min(x[0] for x in sx if x) + min(w[0] for w in wire)
+            hi = max(v[1] for v in s_at) + max(x[1] for x in sx if x) + max(w[1] for w in wire)
+            return lo, hi
+
+        for slot in range(4):
+            base = f"{pc}{bank}_s{slot}_"
+            flops = [i[: -len("_mux")] for i in sdf.celltype if i.startswith(base) and i.endswith("_mux")]
+            if not flops:
+                continue
+            tags = [f for f in flops if re.match(re.escape(base) + r"tag\d+$", f)]
+            data = [f for f in flops if f not in tags]
+            # one event: compare like with like (early with early, late with
+            # late); mixing them would count the shared clock -> pointer ->
+            # select path's early/late spread twice
+            lag = min(min(fresh(f)[k] for f in tags) - max(fresh(f)[k] for f in data) for k in (0, 1))
+            sh = max(v for f in tags for k, v in sdf.checks[f].items() if k[0] == "SETUP") + max(
+                v for f in tags for k, v in sdf.checks[f].items() if k[0] == "HOLD")
+            res[f"{bank}{slot}"] = round(1000 * (lag - sh), 1)
+    res["worst_ps"] = min(res.values())
     return res
 
 
@@ -378,6 +581,8 @@ def summary(d):
             max(v["fine"]["step_max_ps"] for v in r["vernier"].values()))),
         ("vernier fine span (ns)", lambda r: "{:.2f}".format(
             min(min(v["fine"]["span_rise_ns"], v["fine"]["span_fall_ns"]) for v in r["vernier"].values()))),
+        ("counter selection margin (stages)", lambda r: f"{r['ring_margins']['worst_stages']:.1f}"),
+        ("tag lag over setup + hold (ps)", lambda r: f"{r['tag_lag']['worst_ps']:.0f}"),
         ("vernier launch->out max (ns)", lambda r: "{:.2f}".format(
             max(v["launch_to_out_ns"]["max"] for v in r["vernier"].values()))),
     ]
@@ -421,7 +626,8 @@ def main():
     if len(args) != 2:
         raise SystemExit(__doc__)
     loop = Sdf(args[1])
-    res = {"ring": ring(sdf, loop), "capture": capture(sdf), "vernier": vernier(sdf)}
+    res = {"ring": ring(sdf, loop), "capture": capture(sdf), "vernier": vernier(sdf),
+           "ring_margins": ring_margins(sdf, loop), "tag_lag": tag_lag(sdf)}
     if spef:
         res["wire_caps"] = wire_caps(sdf, spef)
     if out:
@@ -438,6 +644,10 @@ def main():
               f"span {cs.get('span_rise_ns')}/{cs.get('span_fall_ns')} ns; fine step {fs.get('step_mean_ps')} ps "
               f"({fs.get('step_min_ps')}-{fs.get('step_max_ps')}), span {fs.get('span_rise_ns')}/{fs.get('span_fall_ns')} ns; "
               f"launch->out {v.get('launch_to_out_ns')}")
+    rm = res["ring_margins"]
+    print(f"counter selection (L/E) margins: worst {rm['worst_stages']} stages; "
+          + ", ".join(f"{k} {v['worst_stages']}" for k, v in rm.items() if k != "worst_stages"))
+    print(f"tag lag over setup + hold: worst {res['tag_lag']['worst_ps']} ps")
     for g, v in res.get("wire_caps", {}).items():
         print(f"wire cap, {g} ({v['nets']} nets): extracted {v['spef_ff_mean']} fF mean ({v['spef_ff_max']} max), "
               f"Liberty 1k {v['wl1k_ff_mean']} fF mean; ratio {v['ratio_mean']}")

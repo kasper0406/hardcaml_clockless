@@ -1,2 +1,3 @@
 _build
 *.install
+__pycache__/
