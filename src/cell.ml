@@ -30,6 +30,7 @@ let stable_name = Rtl_attribute.create ~value:(Bool true) "stable_name"
     underscore keeps it apart from names a caller gives the same net (e.g.
     [<instance>_q]): Hardcaml's name mangler is case-insensitive. *)
 let instantiate
+  ?(attributes = attributes)
   (lib : Cell_library.t)
   ~cell
   ~instance
@@ -66,6 +67,56 @@ let buffer lib ~cell ~instance a =
   let input = (List.hd_exn (Cell_library.Cell.inputs c)).name in
   let output = (List.hd_exn (Cell_library.Cell.outputs c)).name in
   instantiate lib ~cell ~instance [ input, a ] output
+;;
+
+(** The fanout a hand-placed cell may drive: the Liberty [default_max_fanout]
+    of sg13cmos5l (8; Tiny Tapeout's MAX_FANOUT_CONSTRAINT is 10). OpenROAD
+    never repairs a protected net ({!Sdc}), so a net that feeds hand-placed
+    cells must be built within it. *)
+let max_fanout = 8
+
+(** [isolate lib ~cell ~instance a]: [a] through a buffer that synthesis
+    keeps but that is not protected ([keep] without [dont_touch]). A net
+    feeding protected cells cannot be repaired by OpenROAD (it cannot buffer
+    a net with a dont-touch load), so when synthesised logic shares it, it
+    keeps whatever fanout synthesis gave it. Behind this buffer the shared
+    net has an ordinary load, and the protected cells hang off a net of
+    their own. *)
+let isolate lib ~cell ~instance a =
+  let c = Cell_library.find_exn lib cell in
+  if not (Cell_library.Cell.is_buffer c)
+  then raise_s [%message "not a buffer/delay cell" (cell : string)];
+  let input = (List.hd_exn (Cell_library.Cell.inputs c)).name in
+  let output = (List.hd_exn (Cell_library.Cell.outputs c)).name in
+  instantiate
+    ~attributes:[ Rtl_attribute.create ~value:(Bool true) "keep" ]
+    lib
+    ~cell
+    ~instance
+    [ input, a ]
+    output
+;;
+
+(** [fanout lib ~cell ~name ?max_fanout a n]: [n] signals carrying [a], each
+    from a net with at most [max_fanout] (default {!max_fanout}) loads: [a]
+    itself if [n] is small enough, else the leaves of a tree of [cell]
+    buffers ([<name>_<level>_<j>], level 0 driving the loads). Load [i]
+    takes element [i]. *)
+let fanout ?(max_fanout = max_fanout) lib ~cell ~name a n =
+  if max_fanout < 2 then raise_s [%message "Cell.fanout: max_fanout < 2" (max_fanout : int)];
+  let rec go level a n =
+    if n <= max_fanout
+    then Array.create ~len:n a
+    else (
+      let k = (n + max_fanout - 1) / max_fanout in
+      let drivers = go (level + 1) a k in
+      let bufs =
+        Array.mapi drivers ~f:(fun j d ->
+          buffer lib ~cell ~instance:(Printf.sprintf "%s_%d_%d" name level j) d)
+      in
+      Array.init n ~f:(fun i -> bufs.(i / max_fanout)))
+  in
+  go 0 a n
 ;;
 
 (** A flip-flop cell with an active-low asynchronous reset, by pin names. *)

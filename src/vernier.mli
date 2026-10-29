@@ -280,6 +280,13 @@ type cells =
   ; inverter : string
   ; mux2 : string
   ; xor2 : string
+  ; buffer : string
+  (** for the controls into the cells: every select and the launch/level
+      flop reset enters through an isolating buffer
+      ([<line>_sel_{cm<l>,fm<l>,cbyp,fbyp}_iso], [<pin>_sel_out_iso],
+      [<name>_reset_iso]; {!Cell.isolate}) and fans out within
+      {!Cell.max_fanout} through a tree of these ([..._fo_<level>_<j>]):
+      OpenROAD never repairs a protected net *)
   ; flop : flop (** launch and level flops *)
   }
 

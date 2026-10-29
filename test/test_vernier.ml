@@ -481,6 +481,7 @@ let cells () : Vernier.cells =
   ; inverter = "sg13cmos5l_inv_1"
   ; mux2 = "sg13cmos5l_mux2_1"
   ; xor2 = "sg13cmos5l_xor2_1"
+  ; buffer = "sg13cmos5l_buf_1"
   ; flop = { cell = "sg13cmos5l_dfrbpq_1"; clk = "CLK"; d = "D"; reset_n = "RESET_B"; q = "Q" }
   }
 ;;
@@ -505,7 +506,7 @@ let%expect_test "netlist: hand-placed cells per pin, stable names" =
     ; "vernier_p0_out" ]
     ~f:(fun n -> if not (List.mem names n ~equal:String.equal) then printf "missing %s\n" n);
   [%expect {|
-    sg13cmos5l_buf_1             60
+    sg13cmos5l_buf_1             80
     sg13cmos5l_dfrbpq_1           6
     sg13cmos5l_dlygate4sd3_1    312
     sg13cmos5l_inv_1            320
@@ -561,7 +562,7 @@ let%expect_test "Sdc.vernier: lines cut from registers and ports, select and dra
     set_max_delay 20.0000 -to [get_pins ... (58 S pins, first vernier_p1_r_cm1_0/S)
     set_max_delay 20.0000 -to [get_pins ... (58 S pins, first vernier_p1_f_cm1_0/S)
     set_max_delay 80.0000 -from [get_cells {vernier_p1_r_launch vernier_p1_f_launch}] -to [get_pins {vernier_p1_out/A0}]
-    protected nets: 982, e.g. vernier_p0_r_cm6_0__X
+    protected nets: 1013, e.g. vernier_p0_r_cm6_0__X
     drain: from vernier_p0_r_launch vernier_p0_f_launch to vernier_p0_out/A0 (driven by the XOR)
     drain: from vernier_p1_r_launch vernier_p1_f_launch to vernier_p1_out/A0 (driven by the XOR)
     select bound covers exactly the S pin of every mux but the output muxes (232): true
@@ -603,5 +604,36 @@ let%expect_test "configuration errors" =
      (module_name v))
     ("delay line stage inverts"
      (stage (sg13cmos5l_dlygate4sd3_1 sg13cmos5l_inv_1)))
+    |}]
+;;
+
+let%expect_test "no protected net drives more than Cell.max_fanout cells; controls isolated" =
+  let sdc = Sdc.create (circuit ()) in
+  let worst =
+    List.fold (Sdc.protected_nets sdc) ~init:("", 0) ~f:(fun (n, m) (net : Sdc.Net.t) ->
+      let k = List.length net.sinks in
+      if k > m then String.concat ~sep:"," net.names, k else n, m)
+  in
+  print_s [%sexp (worst : string * int)];
+  (* every select and the reset come from synthesised logic through an
+     isolating buffer, so the nets into the cells are boundary nets of their
+     own; the rest are the launch and level flops' D, one load each *)
+  let boundary = List.filter (Sdc.protected_nets sdc) ~f:(fun n -> n.boundary) in
+  let iso, other =
+    List.partition_tf boundary ~f:(fun n ->
+      List.exists n.names ~f:(fun nm -> String.is_suffix nm ~suffix:"_iso__X"))
+  in
+  printf "boundary nets: %d from isolating buffers, %d others\n" (List.length iso) (List.length other);
+  List.iter other ~f:(fun n ->
+    print_s [%message "" ~sinks:(List.map n.sinks ~f:Sdc.Endpoint.to_string : string list)]);
+  [%expect {|
+    (vernier_p0_r_sel_fm1_iso__X 8)
+    boundary nets: 51 from isolating buffers, 6 others
+    (sinks (vernier_p0_r_launch/D))
+    (sinks (vernier_p0_f_launch/D))
+    (sinks (vernier_p0_level/D))
+    (sinks (vernier_p1_r_launch/D))
+    (sinks (vernier_p1_f_launch/D))
+    (sinks (vernier_p1_level/D))
     |}]
 ;;

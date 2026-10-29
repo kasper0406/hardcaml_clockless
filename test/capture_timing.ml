@@ -74,6 +74,7 @@ struct
            ; nand2 = "sg13cmos5l_nand2_1"
            ; inverter = "sg13cmos5l_inv_1"
            ; mux2 = "sg13cmos5l_mux2_1"
+           ; buffer = "sg13cmos5l_buf_1"
            ; flop = Some dfrbpq
            })
         ~enable

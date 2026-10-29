@@ -61,6 +61,7 @@ type cells =
   ; inverter : string
   ; mux2 : string
   ; xor2 : string
+  ; buffer : string
   ; flop : flop
   }
 
@@ -80,12 +81,21 @@ let raise_config msg = raise_s [%message "Vernier: bad configuration" (msg : str
    pairs the nodes of level [l - 1] under select bit [l - 1]; an unpaired
    last node feeds both inputs of its mux, so every path has the same number
    of muxes and select values past the end alias to the last input. *)
-let mux_tree (c : cells) ~name ~sel inputs =
+(* A select (or reset) into [n] cells: isolated from the synthesised logic
+   that drives it and fanned out within Cell.max_fanout (see Cell.isolate). *)
+let control (c : cells) ~name x n =
+  Cell.fanout c.library ~cell:c.buffer ~name:(name ^ "_fo")
+    (Cell.isolate c.library ~cell:c.buffer ~instance:(name ^ "_iso") x)
+    n
+;;
+
+let mux_tree (c : cells) ~name ~ctl ~sel inputs =
   let s_pin, d0_pin, d1_pin, out_pin = Cell_pins.mux2 c.library c.mux2 in
   let rec level l nodes =
     match nodes with
     | [ x ] -> x
     | _ ->
+      let sels = control c ~name:(Printf.sprintf "%s%d" ctl l) sel.:(l - 1) ((List.length nodes + 1) / 2) in
       let rec pair j = function
         | [] -> []
         | a :: rest ->
@@ -98,7 +108,7 @@ let mux_tree (c : cells) ~name ~sel inputs =
             c.library
             ~cell:c.mux2
             ~instance:(Printf.sprintf "%s%d_%d" name l j)
-            [ s_pin, sel.:(l - 1); d0_pin, a; d1_pin, b ]
+            [ s_pin, sels.(j); d0_pin, a; d1_pin, b ]
             out_pin
           :: pair (j + 1) rest
       in
@@ -373,13 +383,13 @@ module Make (Config : Config) : S = struct
       ; model_ticks : Signal.t * Signal.t
       }
 
-    let cell_line (c : cells) ~name ~clock ~reset_n (s : Signal.t Line_select.t) =
+    let cell_line (c : cells) ~name ~clock ~(reset_n : unit -> Signal.t) (s : Signal.t Line_select.t) =
       let launch =
         Cell.instantiate
           c.library
           ~cell:c.flop.cell
           ~instance:(name ^ "_launch")
-          [ c.flop.clk, clock; c.flop.d, s.launch; c.flop.reset_n, reset_n ]
+          [ c.flop.clk, clock; c.flop.d, s.launch; c.flop.reset_n, reset_n () ]
           c.flop.q
       in
       let inv_a, inv_y = Cell_pins.inverter c.library c.inverter in
@@ -397,14 +407,14 @@ module Make (Config : Config) : S = struct
           launch
       in
       let ctree =
-        mux_tree c ~name:(name ^ "_cm") ~sel:s.coarse (launch :: Array.to_list coarse.taps)
+        mux_tree c ~name:(name ^ "_cm") ~ctl:(name ^ "_sel_cm") ~sel:s.coarse (launch :: Array.to_list coarse.taps)
       in
       (* One inversion in either coarse path: in full mode half the muxes see
          each transition direction (see the module doc). *)
       let cbyp =
         mux
           (name ^ "_cbyp")
-          ~s:s.coarse_bypass
+          ~s:(control c ~name:(name ^ "_sel_cbyp") s.coarse_bypass 1).(0)
           ~d0:(inv (name ^ "_cinv") ctree)
           ~d1:(inv (name ^ "_cbinv") launch)
       in
@@ -416,8 +426,8 @@ module Make (Config : Config) : S = struct
           ~length:(fine_taps - 1)
           cbyp
       in
-      let ftree = mux_tree c ~name:(name ^ "_fm") ~sel:s.fine (cbyp :: Array.to_list fine.taps) in
-      mux (name ^ "_fbyp") ~s:s.fine_bypass ~d0:ftree ~d1:cbyp
+      let ftree = mux_tree c ~name:(name ^ "_fm") ~ctl:(name ^ "_sel_fm") ~sel:s.fine (cbyp :: Array.to_list fine.taps) in
+      mux (name ^ "_fbyp") ~s:(control c ~name:(name ^ "_sel_fbyp") s.fine_bypass 1).(0) ~d0:ftree ~d1:cbyp
     ;;
 
     let cell_pin (c : cells) ~name ~clock ~reset_n (p : pin) =
@@ -430,7 +440,7 @@ module Make (Config : Config) : S = struct
           c.library
           ~cell:c.flop.cell
           ~instance:(name ^ "_level")
-          [ c.flop.clk, clock; c.flop.d, p.level; c.flop.reset_n, reset_n ]
+          [ c.flop.clk, clock; c.flop.d, p.level; c.flop.reset_n, reset_n () ]
           c.flop.q
       in
       let s_pin, d0_pin, d1_pin, out_pin = Cell_pins.mux2 c.library c.mux2 in
@@ -439,7 +449,7 @@ module Make (Config : Config) : S = struct
           c.library
           ~cell:c.mux2
           ~instance:(name ^ "_out")
-          [ s_pin, p.bypass; d0_pin, x; d1_pin, level ]
+          [ s_pin, (control c ~name:(name ^ "_sel_out") p.bypass 1).(0); d0_pin, x; d1_pin, level ]
           out_pin
       in
       let z = zero model_ticks_bits in
@@ -487,12 +497,23 @@ module Make (Config : Config) : S = struct
     ;;
 
     let create ~name implementation ~clock ~clear pins =
+      (* every pin's two launch flops and level flop *)
+      let reset_n =
+        match implementation with
+        | Model _ -> fun () -> ~:clear
+        | Cells c ->
+          let r = control c ~name:(name ^ "_reset") ~:clear (3 * List.length pins) in
+          let k = ref (-1) in
+          fun () ->
+            Int.incr k;
+            r.(!k)
+      in
       List.mapi pins ~f:(fun i (p : pin) ->
         Line_select.Of_signal.assert_widths p.rise;
         Line_select.Of_signal.assert_widths p.fall;
         let name = Printf.sprintf "%s_p%d" name i in
         match implementation with
-        | Cells c -> cell_pin c ~name ~clock ~reset_n:~:clear p
+        | Cells c -> cell_pin c ~name ~clock ~reset_n p
         | Model m -> model_pin m ~clock ~clear p)
     ;;
   end

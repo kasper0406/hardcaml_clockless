@@ -36,6 +36,7 @@ let island () =
          ; nand2 = "sg13cmos5l_nand2_1"
          ; inverter = "sg13cmos5l_inv_1"
          ; mux2 = "sg13cmos5l_mux2_1"
+         ; buffer = "sg13cmos5l_buf_1"
          ; flop = None
          })
       ~enable:en
@@ -77,6 +78,7 @@ module top(clk, en, hit, x, node0, sampled, y);
   output node0;
   output [2:0] sampled;
   output y;
+  wire ring_en_iso__X;
   wire ring_nand__Y;
   wire ring_inv1__Y;
   wire ring_inv2__Y;
@@ -87,7 +89,8 @@ module top(clk, en, hit, x, node0, sampled, y);
   wire tdc_sample2;
   wire _1_;
   wire _2_;
-  sg13cmos5l_nand2_1 ring_nand (.A(en), .B(ring_inv2__Y), .Y(ring_nand__Y));
+  sg13cmos5l_buf_1 ring_en_iso (.A(en), .X(ring_en_iso__X));
+  sg13cmos5l_nand2_1 ring_nand (.A(ring_en_iso__X), .B(ring_inv2__Y), .Y(ring_nand__Y));
   sg13cmos5l_inv_1 ring_inv1 (.A(ring_nand__Y), .Y(ring_inv1__Y));
   sg13cmos5l_inv_1 ring_inv2 (.A(ring_inv1__Y), .Y(ring_inv2__Y));
   sg13cmos5l_buf_1 tdc_stage0 (.A(hit), .X(tdc_stage0__X));
@@ -161,7 +164,7 @@ let%expect_test "constraints: dont-touch regex and SDC fragments" =
   print_endline (Sdc.rsz_dont_touch_rx (one_buffer ~prefix:"u.top."));
   [%expect
     {|
-    ^(?:gate(?:__Y)?|hit|node0|ring_(?:inv(?:1(?:__Y)?|2(?:__Y)?)|n(?:and(?:__Y)?|ode(?:0|1|2)))|sampled\\?\[(?:0\\?\]|1\\?\]|2\\?\])|tdc_s(?:ample(?:0|1|2)|tage(?:0(?:__X)?|1(?:__X)?))|y)$
+    ^(?:gate(?:__Y)?|hit|node0|ring_(?:en_iso__X|inv(?:1(?:__Y)?|2(?:__Y)?)|n(?:and(?:__Y)?|ode(?:0|1|2)))|sampled\\?\[(?:0\\?\]|1\\?\]|2\\?\])|tdc_s(?:ample(?:0|1|2)|tage(?:0(?:__X)?|1(?:__X)?))|y)$
     # hardcaml_clockless islands (PnR): append after the system clock is created.
     set_disable_timing [get_pins {ring_nand/B}]
     set_false_path -through [get_pins {tdc_stage0/A}]
@@ -190,10 +193,10 @@ let%expect_test "check: an intact netlist passes; dont_touch list resolved from 
   [%expect {|
     ok
     (Ok
-     (_10_ _11_ _12_ gate hit node0 ring_inv1 ring_inv1__Y ring_inv2 ring_inv2__Y
-      ring_nand ring_nand__Y sampled[0] sampled[1] sampled[2] tdc_sample0
-      tdc_sample1 tdc_sample2 tdc_stage0 tdc_stage0__X tdc_stage1 tdc_stage1__X
-      y))
+     (_10_ _11_ _12_ gate hit node0 ring_en_iso__X ring_inv1 ring_inv1__Y
+      ring_inv2 ring_inv2__Y ring_nand ring_nand__Y sampled[0] sampled[1]
+      sampled[2] tdc_sample0 tdc_sample1 tdc_sample2 tdc_stage0 tdc_stage0__X
+      tdc_stage1 tdc_stage1__X y))
     (Error
      ("Sdc.dont_touch_list: not in the netlist"
       ("instance ring_inv2" "net ring_inv2__Y")))
@@ -249,10 +252,16 @@ let%expect_test "check: buffers" =
   (* on the ring enable, an ordinary input: allowed *)
   check
     (edit
-       ~from:"sg13cmos5l_nand2_1 ring_nand (.A(en)"
-       ~to_:"sg13cmos5l_buf_1 _97_ (.A(en), .X(_4_));\n  sg13cmos5l_nand2_1 ring_nand (.A(_4_)");
+       ~from:"sg13cmos5l_buf_1 ring_en_iso (.A(en)"
+       ~to_:"sg13cmos5l_buf_1 _97_ (.A(en), .X(_4_));\n  sg13cmos5l_buf_1 ring_en_iso (.A(_4_)");
   (* ... but not from another source *)
-  check (edit ~from:"ring_nand (.A(en)" ~to_:"ring_nand (.A(x)");
+  check (edit ~from:"ring_en_iso (.A(en)" ~to_:"ring_en_iso (.A(x)");
+  (* ... and nothing between the isolating buffer and the ring (it is
+     protected) *)
+  check
+    (edit
+       ~from:"sg13cmos5l_nand2_1 ring_nand (.A(ring_en_iso__X)"
+       ~to_:"sg13cmos5l_buf_1 _97_ (.A(ring_en_iso__X), .X(_4_));\n  sg13cmos5l_nand2_1 ring_nand (.A(_4_)");
   (* a load on node 0, which otherwise only drives an output; the output lost *)
   check
     (edit
@@ -264,7 +273,9 @@ let%expect_test "check: buffers" =
     kept register tdc_sample0: D is on hit, expected _4_
     net hit is named _4_ in the netlist: the dont-touch names do not match it
     ok
-    ring_nand/A is driven from x, not from en
+    isolating buffer ring_en_iso is driven from x, not from en
+    isolating buffer ring_en_iso drives ring_en_iso__X, not _4_
+    net ring_en_iso__X is named _4_ in the netlist: the dont-touch names do not match it
     net node0 has an extra load _98_/A (sg13cmos5l_inv_1)
     net node0 no longer drives output node0
     |}]
@@ -656,5 +667,61 @@ let%expect_test "a protected cell clocking only a kept register keeps its net pr
   [%expect {|
     (n.names (kept q))
     (n.names (ckinv__Y))
+    |}]
+;;
+
+let%expect_test "Cell.fanout: trees of at most max_fanout loads per net" =
+  let library = force lib in
+  let x = Signal.input "x" 1 in
+  let show n =
+    let leaves = Cell.fanout library ~cell:"sg13cmos5l_buf_1" ~name:"t" ~max_fanout:4 x n in
+    let names =
+      Array.to_list leaves
+      |> List.map ~f:(fun s -> List.hd (Signal.names s) |> Option.value ~default:"x")
+    in
+    let per = List.sort_and_group names ~compare:String.compare in
+    printf
+      "%2d loads: %s\n"
+      n
+      (String.concat ~sep:" " (List.map per ~f:(fun g -> Printf.sprintf "%s*%d" (List.hd_exn g) (List.length g))))
+  in
+  List.iter [ 3; 4; 5; 17 ] ~f:show;
+  [%expect {|
+     3 loads: x*3
+     4 loads: x*4
+     5 loads: t_0_0__X*4 t_0_1__X*1
+    17 loads: t_0_0__X*4 t_0_1__X*4 t_0_2__X*4 t_0_3__X*4 t_0_4__X*1
+    |}]
+;;
+
+let%expect_test "fanout_violations: protected nets above a fanout" =
+  let t = boundary () in
+  let nl = Netlist.of_string boundary_good in
+  print_s [%sexp (Sdc.fanout_violations t ~library:(force tlib) ~max_fanout:1 nl : (string * int) list)];
+  print_s
+    [%sexp
+      (Sdc.check t ~dont_touch:[ "signal_reg_7" ] ~max_fanout:1 ~library:(force tlib) nl : string list)];
+  [%expect {|
+    ((signal_reg_7 2))
+    ("net signal_reg_7 has 2 loads (max 1): OpenROAD repairs no protected net")
+    |}]
+;;
+
+let%expect_test "ring_placement: a legal block, consecutive stages adjacent" =
+  let t = island () in
+  List.iter
+    (Sdc.ring_placement
+       t
+       ~name:"ring"
+       ~library:(force lib)
+       ~rows:{ x0 = 2.88; y0 = 3.78; row_height = 3.78; site_width = 0.48; first_flipped = false }
+       ~site:10
+       ~row:5
+       ~columns:2)
+    ~f:(fun (i, x, y, o) -> printf "%-14s %7.2f %7.2f %s\n" i x y o);
+  [%expect {|
+    ring_nand         7.68   22.68 FS
+    ring_inv1         7.68   26.46 N
+    ring_inv2        10.08   26.46 N
     |}]
 ;;

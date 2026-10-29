@@ -90,6 +90,7 @@ module Measure (Config : Ring.Timed_config) = struct
            ; nand2 = "sg13cmos5l_nand2_1"
            ; inverter = "sg13cmos5l_inv_1"
            ; mux2 = "sg13cmos5l_mux2_1"
+           ; buffer = "sg13cmos5l_buf_1"
            ; flop = Some dfrbpq
            })
         ~enable
@@ -374,13 +375,13 @@ let%expect_test "after code-density calibration, held-out clock intervals measur
   List.iter corners ~f:(fun (corner, path) -> Fixed.calibrated ~wire_load ~corner ~path ~n:17);
   [%expect {|
     selectable length (mux in the loop):
-    typ  n=17: period 2360.0 ps | bins 40..345 ps | 992 held-out intervals: error rms 90.5 ps, worst 384.3 ps
-    slow n=17: period 3814.2 ps | bins 63..566 ps | 992 held-out intervals: error rms 127.9 ps, worst 380.0 ps
-    fast n=17: period 1534.8 ps | bins 15..229 ps | 992 held-out intervals: error rms 55.2 ps, worst 149.5 ps
+    typ  n=17: period 2360.0 ps | bins 41..349 ps | 992 held-out intervals: error rms 91.2 ps, worst 389.6 ps
+    slow n=17: period 3814.2 ps | bins 61..563 ps | 992 held-out intervals: error rms 126.6 ps, worst 410.7 ps
+    fast n=17: period 1534.8 ps | bins 21..229 ps | 992 held-out intervals: error rms 57.3 ps, worst 188.1 ps
     fixed length:
-    typ  n=17: period 1835.5 ps | bins 39..131 ps | 992 held-out intervals: error rms 44.0 ps, worst 132.5 ps
-    slow n=17: period 2974.4 ps | bins 64..207 ps | 992 held-out intervals: error rms 83.7 ps, worst 229.1 ps
-    fast n=17: period 1196.8 ps | bins 23..81 ps | 992 held-out intervals: error rms 29.2 ps, worst 104.8 ps
+    typ  n=17: period 1835.5 ps | bins 41..134 ps | 992 held-out intervals: error rms 46.6 ps, worst 131.2 ps
+    slow n=17: period 2974.4 ps | bins 67..203 ps | 992 held-out intervals: error rms 82.5 ps, worst 278.4 ps
+    fast n=17: period 1196.8 ps | bins 19..78 ps | 992 held-out intervals: error rms 29.2 ps, worst 89.8 ps
     |}]
 ;;
 
@@ -418,9 +419,9 @@ let%expect_test "regression, flat 1 fF wires: margins and calibration" =
     fast n=21 period 1204 ps, stage 24.0 ps | safe phases A [12, 42+7) B [11, 42+6) | s=20 margins A  9.2/12.3 B  8.6/11.9 stages
          bins: NAND 117/128 ps, after node 0 13/34, others 12..42 | 393 samples, 42/42 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     every margin >= 4 stages: true
-    typ  n=17: period 1726.3 ps | bins 25..290 ps | 992 held-out intervals: error rms 63.5 ps, worst 210.3 ps
-    slow n=17: period 2755.7 ps | bins 41..444 ps | 992 held-out intervals: error rms 121.4 ps, worst 342.8 ps
-    fast n=17: period 1152.2 ps | bins 18..193 ps | 992 held-out intervals: error rms 43.5 ps, worst 159.7 ps
+    typ  n=17: period 1726.4 ps | bins 28..287 ps | 992 held-out intervals: error rms 62.9 ps, worst 223.8 ps
+    slow n=17: period 2755.7 ps | bins 39..466 ps | 992 held-out intervals: error rms 121.2 ps, worst 383.2 ps
+    fast n=17: period 1152.2 ps | bins 17..192 ps | 992 held-out intervals: error rms 42.7 ps, worst 160.0 ps
     fixed length:
     typ  n=17 period 1267 ps, stage 34.4 ps | safe phases A [12, 34+7) B [11, 34+6) | s=18 margins A  8.4/ 6.5 B  7.1/ 5.8 stages
          bins: NAND  94/ 72 ps, after node 0 30/40, others 29..40 | 393 samples, 34/34 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
@@ -429,8 +430,8 @@ let%expect_test "regression, flat 1 fF wires: margins and calibration" =
     fast n=17 period  855 ps, stage 23.3 ps | safe phases A [12, 34+7) B [11, 34+6) | s=18 margins A  8.7/ 6.6 B  7.2/ 5.7 stages
          bins: NAND  56/ 54 ps, after node 0 13/34, others 12..34 | 393 samples, 34/34 phases: X 0, pattern errors 0, outside model 0, time wrong 0, selected counter caught 0, counter metastable 0
     every margin >= 4 stages: true
-    typ  n=17: period 1266.8 ps | bins 27..78 ps | 992 held-out intervals: error rms 42.4 ps, worst 119.8 ps
-    slow n=17: period 2017.8 ps | bins 46..114 ps | 992 held-out intervals: error rms 67.5 ps, worst 190.4 ps
-    fast n=17: period 854.7 ps | bins 16..51 ps | 992 held-out intervals: error rms 28.1 ps, worst 78.2 ps
+    typ  n=17: period 1266.9 ps | bins 29..74 ps | 992 held-out intervals: error rms 39.0 ps, worst 124.5 ps
+    slow n=17: period 2017.8 ps | bins 44..132 ps | 992 held-out intervals: error rms 72.5 ps, worst 197.3 ps
+    fast n=17: period 854.7 ps | bins 19..53 ps | 992 held-out intervals: error rms 26.8 ps, worst 78.9 ps
     |}]
 ;;
