@@ -916,7 +916,14 @@ let check_structure ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(
     | [] -> "<unnamed>"
   in
   (* nets entering the island: [n] must come from the same source as [net] *)
-  let check_source (net : Net.t) what n =
+  (* the reference netlist's net on an endpoint, traced through buffers *)
+  let reference_root rn = root_in (Option.value_exn reference_drivers) rn 0 in
+  let reference_pin_of instance pin =
+    Option.bind reference ~f:(fun r ->
+      Option.bind (Netlist.find_instance r instance) ~f:(fun i -> pin_conn i pin))
+  in
+  let reference_pin (e : Endpoint.t) = reference_pin_of (p e.instance) e.pin in
+  let check_source ?ref_net ?(unverifiable_other = false) (net : Net.t) what n =
     match net.driver with
     | Constant b ->
       (match tie_value (root n 0) with
@@ -927,16 +934,38 @@ let check_structure ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(
        | Some m, _ ->
          if root m 0 <> root n 0
          then err "%s is driven from %s, not from %s" what (net_str (root n 0)) (net_str m)
-       | None, Input when not (List.is_empty net.names) ->
-         err
-           "%s: cannot verify its source, none of %s survives (pass ~boundary)"
-           what
-           (String.concat ~sep:"," (List.map net.names ~f:p))
-       | None, _ ->
-         (* a boundary net: synthesis may rename it (yosys prefers generated
-            whole-wire names to bits of a named bus); it is checked as one
-            protected net *)
-         ())
+       | None, driver ->
+         (* names gone (flattening names a hierarchy's inputs after the
+            parent's nets; yosys prefers generated whole-wire names to bits
+            of a named bus): against the reference, on the same endpoint *)
+         (match reference, ref_net with
+          | Some r, Some rn ->
+            (* the same net: every name of it that the reference knows is
+               one of the reference net's (an alias shared with the
+               reference net does not excuse another name of a different
+               reference net), and at least one is *)
+            let want = Netlist.net_names r (reference_root rn) in
+            let known =
+              List.filter (Netlist.net_names nl (root n 0)) ~f:(fun nm ->
+                Option.is_some (Netlist.find_net r nm))
+            in
+            if List.is_empty known
+               || not (List.for_all known ~f:(fun nm -> List.mem want nm ~equal:String.equal))
+            then
+              err "%s is fed from %s, from %s in the reference" what (net_str (root n 0))
+                (String.concat ~sep:"," want)
+          | _ ->
+            (match driver with
+             | Input when not (List.is_empty net.names) ->
+               err
+                 "%s: cannot verify its source, none of %s survives (pass ~boundary or ~reference)"
+                 what
+                 (String.concat ~sep:"," (List.map net.names ~f:p))
+             | Other when unverifiable_other ->
+               err "%s: cannot verify its source (pass ~reference)" what
+             | _ ->
+               (* a boundary net, checked as one protected net *)
+               ())))
   in
   (* isolating buffers: present, between their two nets (the input may be
      rebuffered and the buffer resized: it is the resizer's) *)
@@ -956,35 +985,15 @@ let check_structure ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(
          (match pin Cell_library.Cell.inputs with
           | None -> err "%s: input not connected" what
           | Some n ->
-            check_source t.nets.(input) what n;
-            (* a source whose circuit names did not survive synthesis:
-               against the reference *)
-            if Option.is_none (by_name t.nets.(input))
-            then (
-              match reference with
-              | None ->
-                (match t.nets.(input).driver with
-                 | Other -> err "%s: cannot verify its source (pass ~reference)" what
-                 | _ -> ())
-              | Some r ->
-                (match
-                   Option.bind (Netlist.find_instance r (p name)) ~f:(fun ri ->
-                     pin_conn ri (List.hd_exn (Cell_library.Cell.inputs c.logic) : Cell_library.Pin.t).name)
-                 with
-                 | None -> err "%s: not in the reference" what
-                 | Some rn ->
-                   let want =
-                     Netlist.net_names r (root_in (Option.value_exn reference_drivers) rn 0)
-                   in
-                   if not
-                        (List.exists (Netlist.net_names nl (root n 0)) ~f:(fun nm ->
-                           List.mem want nm ~equal:String.equal))
-                   then
-                     err
-                       "%s is fed from %s, from %s in the reference"
-                       what
-                       (net_str (root n 0))
-                       (String.concat ~sep:"," want))))
+            let ref_net =
+              reference_pin
+                { Endpoint.instance = name
+                ; pin = (List.hd_exn (Cell_library.Cell.inputs c.logic) : Cell_library.Pin.t).name
+                }
+            in
+            (match reference, ref_net with
+             | Some _, None -> err "%s: not in the reference" what
+             | _ -> check_source ?ref_net ~unverifiable_other:true t.nets.(input) what n))
        | _ -> err "isolating buffer %s is %s, not a buffer" (p name) i.cell));
   (* flops synthesised from kept registers, by their D net *)
   let reg_flops = Hashtbl.create (module Int) in
@@ -1007,11 +1016,17 @@ let check_structure ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(
                    | Some expected when Net.is_protected t.nets.(r.d) ->
                      if dn <> expected
                      then err "%s: D is on %s, expected %s" what (net_str dn) (net_str expected)
-                   | _ -> check_source t.nets.(r.d) (what ^ " D") dn));
+                   | _ ->
+                     check_source
+                       ?ref_net:(reference_pin_of i.name dpin)
+                       t.nets.(r.d)
+                       (what ^ " D")
+                       dn));
                if Bool.( <> ) rising r.rising then err "%s: flop %s has the wrong clock edge" what i.name;
                (match pin_conn i cpin with
                 | None -> err "%s: clock pin %s/%s is not connected" what i.name cpin
-                | Some cn -> check_source t.nets.(r.clock) (what ^ " clock") cn);
+                | Some cn ->
+                  check_source ?ref_net:(reference_pin_of i.name cpin) t.nets.(r.clock) (what ^ " clock") cn);
                if not r.has_reset
                then
                  (* asynchronous clear/preset must be tied inactive *)
@@ -1089,7 +1104,8 @@ let check_structure ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(
                (String.concat ~sep:", " (List.map ds ~f:(fun (i, pin) -> i.name ^ "/" ^ pin))));
           (* a fork fed from outside keeps its source *)
           (match net.driver with
-           | Input | Other | Constant _ -> check_source net ("net " ^ label net) n
+           | Input | Other | Constant _ ->
+             check_source ?ref_net:(Option.bind (List.hd net.sinks) ~f:reference_pin) net ("net " ^ label net) n
            | Cell _ | Register _ -> ());
           (* circuit outputs (top level only: in a flattened hierarchy they are
              the parent's logic) *)
@@ -1129,7 +1145,8 @@ let check_structure ?passive ?(boundary = []) ?(dont_touch = []) ?reference t ~(
     else
       (* inputs from outside the island: sinks may be rebuffered, but must
          keep a common source; constants may become tie cells *)
-      List.iter mapped ~f:(fun (e, n) -> check_source net (p (Endpoint.to_string e)) n));
+      List.iter mapped ~f:(fun (e, n) ->
+        check_source ?ref_net:(reference_pin e) net (p (Endpoint.to_string e)) n));
   Queue.to_list errors
 ;;
 

@@ -318,10 +318,31 @@ let%expect_test "check: names, registers and constants" =
     |}]
 ;;
 
+let%expect_test "check: kept registers whose clock lost its name (reference netlist)" =
+  let renamed = String.substr_replace_all good ~pattern:"clk" ~with_:"sysclk" in
+  let run netlist =
+    match
+      Sdc.check
+        (island ())
+        ~reference:(Netlist.of_string renamed)
+        ~library:(force tlib)
+        (Netlist.of_string netlist)
+    with
+    | [] -> print_endline "ok"
+    | errors -> List.iter errors ~f:print_endline
+  in
+  run renamed;
+  run (String.substr_replace_first renamed ~pattern:"_11_ (.CLK(sysclk)" ~with_:"_11_ (.CLK(x)");
+  [%expect {|
+    ok
+    kept register tdc_sample1 clock is fed from x, from sysclk in the reference
+    |}]
+;;
+
 let%expect_test "check: prefix" =
   let t = one_buffer ~prefix:"u_island." in
-  let run ?boundary text =
-    match Sdc.check t ?boundary ~library:(force tlib) (Netlist.of_string text) with
+  let run ?boundary ?reference text =
+    match Sdc.check t ?boundary ?reference ~library:(force tlib) (Netlist.of_string text) with
     | [] -> print_endline "ok"
     | errors -> List.iter errors ~f:print_endline
   in
@@ -340,11 +361,30 @@ let%expect_test "check: prefix" =
   in
   run moved;
   run ~boundary:[ "i", "i" ] moved;
+  (* ... or against the netlist the names were resolved from *)
+  let intact = String.substr_replace_first moved ~pattern:".A(x)" ~with_:".A(i)" in
+  run ~reference:(Netlist.of_string intact) intact;
+  run ~reference:(Netlist.of_string intact) moved;
+  (* an alias the reference net also has does not excuse another source *)
+  let aliased =
+    {|module top(i, x, o); input i; input x; output o; wire feed; wire \u_island.b__X ;
+      assign feed = i;
+      sg13cmos5l_buf_1 \u_island.b  (.A(feed), .X(\u_island.b__X ));
+      assign o = \u_island.b__X ; endmodule|}
+  in
+  run ~reference:(Netlist.of_string aliased) aliased;
+  run
+    ~reference:(Netlist.of_string aliased)
+    (String.substr_replace_first aliased ~pattern:"feed = i" ~with_:"feed = x");
   [%expect {|
     ok
     missing instance u_island.b (sg13cmos5l_buf_1)
-    u_island.b/A: cannot verify its source, none of u_island.i survives (pass ~boundary)
+    u_island.b/A: cannot verify its source, none of u_island.i survives (pass ~boundary or ~reference)
     u_island.b/A is driven from x, not from i
+    ok
+    u_island.b/A is fed from x, from i in the reference
+    ok
+    u_island.b/A is fed from feed,x, from feed,i in the reference
     |}]
 ;;
 
@@ -651,7 +691,9 @@ endmodule
     ok
     ok
     net sel_a is signal_reg_2 in the netlist, signal_reg_1 in the reference
+    net sel_a is fed from signal_reg_2, from signal_reg_1 in the reference
     net sel_b is signal_reg_1 in the netlist, signal_reg_2 in the reference
+    net sel_b is fed from signal_reg_1, from signal_reg_2 in the reference
     |}]
 ;;
 

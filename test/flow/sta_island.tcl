@@ -14,7 +14,15 @@
 #   PERIOD, SETTLE   system clock period (ns) and the smallest settle_cycles
 #                    the host loads, as given to Sdc.vernier
 source $::env(STA_ENV)
-set p island.
+# instance name prefixes (the stub island's by default; the v1 chip:
+# RING=capture.capture_ring_ CAPTURE=capture.capture_pc_
+# VERNIER=protoemu_vernier.vernier_)
+proc env_or {name default} { if {[info exists ::env($name)]} { return $::env($name) } else { return $default } }
+set ring [env_or RING island.ring_]
+set capture [env_or CAPTURE island.pin_capture_]
+set vernier [env_or VERNIER island.vernier_]
+# clock names: the prefix after the hierarchy (Sdc names clocks <name>_...)
+proc local {prefix} { return [lindex [split $prefix .] end] }
 foreach lib $::env(LIBS) { read_liberty $lib }
 read_verilog $::env(NETLIST)
 link_design tt_um_kasper0406_protoemu
@@ -26,11 +34,11 @@ if { [info exists ::env(SPEF)] } {
 source $::env(SDC)
 
 write_sdf -divider . -digits 4 $::env(SDF)
-set_disable_timing [get_cells ${p}ring_inv8]
-unset_disable_timing [get_pins ${p}ring_nand/B]
+set_disable_timing [get_cells ${ring}inv8]
+unset_disable_timing [get_pins ${ring}nand/B]
 write_sdf -divider . -digits 4 $::env(LOOP_SDF)
-unset_disable_timing [get_cells ${p}ring_inv8]
-set_disable_timing [get_pins ${p}ring_nand/B]
+unset_disable_timing [get_cells ${ring}inv8]
+set_disable_timing [get_pins ${ring}nand/B]
 if { [info exists ::env(SDF_ONLY)] } { exit }
 
 proc header {s} { puts "\n== $s" }
@@ -56,7 +64,7 @@ header "island clocks: setup/hold, all paths ending at their registers (worst 5)
 report_checks -to [get_clocks $island_clocks] -path_delay max -group_path_count 5 -format end
 report_checks -to [get_clocks $island_clocks] -path_delay min -group_path_count 5 -format end
 header "worst ring-clock and bank-clock paths in full"
-foreach n {ring_a pin_capture_clkr} {
+foreach n [list [local $ring]a [local $capture]clkr] {
   report_checks -to [get_clocks $n] -path_delay max -format full_clock_expanded -fields {slew cap fanout}
 }
 header "island clock skew"
@@ -67,21 +75,21 @@ report_check_types -min_pulse_width -recovery -removal -violators
 # --- vernier bounds (Sdc.vernier)
 header "vernier select bound (one period), worst per line"
 foreach l {p0_r p0_f p1_r p1_f} {
-  report_checks -to [pins ${p}vernier_${l}_*/S] -format end
+  report_checks -to [pins ${vernier}${l}_*/S] -format end
 }
 header "vernier drain bound ($::env(SETTLE) periods), worst per pin"
 foreach i {0 1} {
-  report_checks -from [get_cells "${p}vernier_p${i}_r_launch ${p}vernier_p${i}_f_launch"] \
-    -to [pins ${p}vernier_p${i}_out/A0] -format end
-  report_checks -from [get_cells "${p}vernier_p${i}_r_launch ${p}vernier_p${i}_f_launch"] \
-    -to [pins ${p}vernier_p${i}_out/A0] -path_delay min -unconstrained -format end
+  report_checks -from [get_cells "${vernier}p${i}_r_launch ${vernier}p${i}_f_launch"] \
+    -to [pins ${vernier}p${i}_out/A0] -format end
+  report_checks -from [get_cells "${vernier}p${i}_r_launch ${vernier}p${i}_f_launch"] \
+    -to [pins ${vernier}p${i}_out/A0] -path_delay min -unconstrained -format end
 }
 header "vernier bypass: level flop -> output mux -> pin (timed)"
 foreach i {0 1} {
-  report_checks -from [get_cells ${p}vernier_p${i}_level] -to [get_ports "uo_out\[[expr 6 + $i]\]"] -fields {slew cap}
+  report_checks -from [get_cells ${vernier}p${i}_level] -to [all_outputs] -fields {slew cap}
 }
 header "vernier: launch flops to pins/registers (expected cut)"
-report_checks -from [get_cells ${p}vernier_p0_r_launch] -to [get_ports {uo_out[6]}] -unconstrained -format end
+report_checks -from [get_cells ${vernier}p0_r_launch] -to [all_outputs] -unconstrained -format end
 
 # --- the rest of the design
 header "system clock: worst setup and hold"
