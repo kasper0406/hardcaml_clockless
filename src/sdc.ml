@@ -1289,7 +1289,9 @@ type rows =
     samplers' count flops, a capture's count buffers), so that the
     counters' paths to their samplers are fixed too: the samplers'
     counter-selection margin moved from 1.8 to 3.7 stages between runs
-    with them left to the placer. The block's lower-left corner is site [site] of row [row]. Consecutive
+    with them left to the placer. Each call places what its own ring
+    drives: with several rings, a cell driven by two rings' counters would
+    be placed by both calls (combine their placements with care). The block's lower-left corner is site [site] of row [row]. Consecutive
     groups are [row_pitch] rows (default 1) and the columns [column_gap]
     sites (default 0) apart. The coordinates are deterministic; the wire
     load they give is a measured result for a geometry, not a guarantee: in
