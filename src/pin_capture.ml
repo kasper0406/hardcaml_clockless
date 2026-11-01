@@ -474,7 +474,18 @@ module Make (C : Config) (R : Ring.S) = struct
         Cell.instantiate lib ~cell:c.mux2 ~instance [ mux_s, s; mux_a0, a0; mux_a1, a1 ] mux_x
       in
       let flop instance ~clk ~reset_n d = Cell.Flop.instantiate lib c.flop ~instance ~clk ~reset_n d in
-      let pin i = pin_bus.:(i) in
+      (* Each pin enters through an isolating buffer (Cell.isolate): the
+         net from the pad logic to it is an ordinary net the flow buffers
+         and sizes, so the protected fork behind it (merge NAND, snapshot
+         buffer, recent-edge delay line, edge counter clocks) is short and
+         driven by one cell. Without it the pad's driver sat up to a few
+         hundred µm away on a net no tool may repair: 4 ns of slew in the
+         routed chip, and with it the edge counters' minimum pulse width and
+         the recent-edge delay margin gone. *)
+      let isolated =
+        Array.init pins ~f:(fun i -> Cell.isolate lib ~cell:c.buffer ~instance:(n "pin%d_iso" i) pin_bus.:(i))
+      in
+      let pin i = isolated.(i) in
       (* Merge. *)
       let gated =
         List.init pins ~f:(fun i ->
@@ -506,7 +517,7 @@ module Make (C : Config) (R : Ring.S) = struct
         { Record.nodes = dbuf "dnode" ring.nodes
         ; count_a = dbuf "dcnta" ring.count_a
         ; count_b = dbuf "dcntb" ring.count_b
-        ; pins = dbuf "dpin" pin_bus
+        ; pins = dbuf "dpin" (concat_lsb (Array.to_list isolated))
         ; delayed =
             (let cell, count = c.delay in
              concat_lsb
@@ -637,7 +648,7 @@ module Make (C : Config) (R : Ring.S) = struct
         |> List.concat
         |> concat_lsb
       in
-      { Front.ptr_r; ptr_f; slots_r; slots_f; edges; levels = pin_bus; merged }
+      { Front.ptr_r; ptr_f; slots_r; slots_f; edges; levels = concat_lsb (Array.to_list isolated); merged }
     ;;
   end
 
