@@ -1285,7 +1285,11 @@ type rows =
     [columns] columns (up the first, down the next...) so that consecutive
     stages are neighbours, and with two columns the last and first too;
     the counters and the enable tree go in the rows below
-    them. The block's lower-left corner is site [site] of row [row]. Consecutive
+    them, each cell followed by the protected cells its output drives (the
+    samplers' count flops, a capture's count buffers), so that the
+    counters' paths to their samplers are fixed too: the samplers'
+    counter-selection margin moved from 1.8 to 3.7 stages between runs
+    with them left to the placer. The block's lower-left corner is site [site] of row [row]. Consecutive
     groups are [row_pitch] rows (default 1) and the columns [column_gap]
     sites (default 0) apart. The coordinates are deterministic; the wire
     load they give is a measured result for a geometry, not a guarantee: in
@@ -1345,6 +1349,35 @@ let ring_placement ?(row_pitch = 1) ?(column_gap = 0) t ~name ~(library : Cell_l
   let extras =
     List.filter t.instances ~f:(fun i ->
       String.is_prefix i.name ~prefix:(name ^ "_") && not (Hash_set.mem taken i.name))
+  in
+  List.iter extras ~f:(fun i -> Hash_set.add taken i.name);
+  (* each extra (counter flop, clock inverter, enable buffer) followed by
+     the protected cells its output drives (a sampler's count flops, a
+     capture's count buffers): the counters' paths to their samplers then
+     have the same geometry in every run, like the nodes' *)
+  let extras =
+    List.concat_map extras ~f:(fun (i : Instance.t) ->
+      let loads =
+        match
+          List.filter i.pins ~f:(fun (_, n) ->
+            match t.nets.(n).driver with
+            | Cell e -> String.equal e.instance i.name
+            | _ -> false)
+        with
+        | [ (_, n) ] ->
+          List.filter_map t.nets.(n).sinks ~f:(fun e ->
+            if is_stage e.instance || Hash_set.mem taken e.instance
+            then None
+            else (
+              match find_instance t e.instance with
+              | None -> None
+              | Some l ->
+                Hash_set.add taken l.name;
+                Some l))
+          |> List.dedup_and_sort ~compare:(fun (a : Instance.t) b -> String.compare a.name b.name)
+        | _ -> []
+      in
+      i :: loads)
   in
   let group_width g = List.sum (module Int) g ~f:width + 1 in
   let per_column = (List.length groups + columns - 1) / columns in

@@ -768,6 +768,63 @@ let%expect_test "ring_placement: a legal block, consecutive stages adjacent" =
     |}]
 ;;
 
+let%expect_test "ring_placement: a counter's protected loads follow it" =
+  (* a counter flop clocked by node 0 through an inverter (the counter is
+     an extra, named from the ring) and a sampler flop on its output: the
+     sampler is placed right after the counter *)
+  let library = force lib in
+  let open Signal in
+  let clk = input "clk" 1 in
+  let en = input "en" 1 in
+  let state, _ =
+    R.Analog.create
+      ~name:"ring"
+      (Cells
+         { library
+         ; nand2 = "sg13cmos5l_nand2_1"
+         ; inverter = "sg13cmos5l_inv_1"
+         ; mux2 = "sg13cmos5l_mux2_1"
+         ; buffer = "sg13cmos5l_buf_1"
+         ; flop = None
+         })
+      ~enable:en
+      ~length_sel:gnd
+  in
+  let flop instance ~clock d =
+    Cell.instantiate
+      library
+      ~cell:"sg13cmos5l_dfrbpq_1"
+      ~instance
+      [ "CLK", clock; "D", d; "RESET_B", vdd ]
+      "Q"
+  in
+  let cnt = wire 1 in
+  let clkinv =
+    Cell.instantiate library ~cell:"sg13cmos5l_inv_1" ~instance:"ring_clkinv_a" [ "A", state.nodes.:(0) ] "Y"
+  in
+  Signal.assign cnt (flop "ring_cnt_a_j0" ~clock:clkinv ~:cnt);
+  let sampled = flop "smp_count_a_0" ~clock:clk cnt in
+  let t = Sdc.create (Circuit.create_exn ~name:"top" [ output "s" sampled ]) in
+  List.iter
+    (Sdc.ring_placement
+       t
+       ~name:"ring"
+       ~library
+       ~rows:{ x0 = 2.88; y0 = 3.78; row_height = 3.78; site_width = 0.48; first_flipped = false }
+       ~site:10
+       ~row:5
+       ~columns:2)
+    ~f:(fun (i, x, y, o) -> printf "%-14s %7.2f %7.2f %s\n" i x y o);
+  [%expect {|
+    ring_clkinv_a     9.60   30.24 FS
+    ring_cnt_a_j0     7.68   26.46 N
+    ring_inv1         7.68   34.02 N
+    ring_inv2        11.52   34.02 N
+    ring_nand         7.68   30.24 FS
+    smp_count_a_0     7.68   22.68 FS
+    |}]
+;;
+
 let%expect_test "check: isolating buffers are connected and fed from their source" =
   (* the ring enable's isolating buffer, unconnected *)
   check (edit ~from:"ring_en_iso (.A(en)" ~to_:"ring_en_iso (.A()");
