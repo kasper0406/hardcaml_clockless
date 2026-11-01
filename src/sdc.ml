@@ -1285,9 +1285,9 @@ type rows =
     [columns] columns (up the first, down the next...) so that consecutive
     stages are neighbours, and with two columns the last and first too;
     the counters and the enable tree go in the rows below
-    them, each cell followed by the protected cells its output drives (the
-    samplers' count flops, a capture's count buffers), so that the
-    counters' paths to their samplers are fixed too: the samplers'
+    them, each cell followed by the protected flops its output drives (the
+    samplers' count flops), so that the counters' paths to those samplers
+    are fixed too: the samplers'
     counter-selection margin moved from 1.8 to 3.7 stages between runs
     with them left to the placer. Each call places what its own ring
     drives: with several rings, a cell driven by two rings' counters would
@@ -1354,9 +1354,11 @@ let ring_placement ?(row_pitch = 1) ?(column_gap = 0) t ~name ~(library : Cell_l
   in
   List.iter extras ~f:(fun i -> Hash_set.add taken i.name);
   (* each extra (counter flop, clock inverter, enable buffer) followed by
-     the protected cells its output drives (a sampler's count flops, a
-     capture's count buffers): the counters' paths to their samplers then
-     have the same geometry in every run, like the nodes' *)
+     the protected flops its output drives (a sampler's count flops): the
+     counters' paths to those samplers then have the same geometry in every
+     run, like the nodes' to the node samplers. Not buffers: a capture's
+     count buffers stay with their slot flops (moved into the block, they
+     cut the slots' margin by a stage) *)
   let extras =
     List.concat_map extras ~f:(fun (i : Instance.t) ->
       let loads =
@@ -1372,10 +1374,13 @@ let ring_placement ?(row_pitch = 1) ?(column_gap = 0) t ~name ~(library : Cell_l
             then None
             else (
               match find_instance t e.instance with
-              | None -> None
-              | Some l ->
+              | Some l
+                when Cell_library.Kind.equal
+                       (Cell_library.find_exn library l.cell).kind
+                       Flop ->
                 Hash_set.add taken l.name;
-                Some l))
+                Some l
+              | _ -> None))
           |> List.dedup_and_sort ~compare:(fun (a : Instance.t) b -> String.compare a.name b.name)
         | _ -> []
       in
