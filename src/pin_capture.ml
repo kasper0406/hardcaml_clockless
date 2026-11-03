@@ -886,6 +886,10 @@ module Make (C : Config) (R : Ring.S) = struct
       ; ptr_reset : 'a (** the front's write pointers are being reset *)
       ; enabled : 'a [@bits pins] (** enables applied to the front *)
       ; guarded : 'a [@bits pins]
+      ; edges : 'a [@bits 2 * pins]
+      (** the per-pin edge counters, synchronised: per pin a Gray pair
+          (rising-edge flop, falling-edge flop), for diagnostics *)
+      ; levels : 'a [@bits pins] (** the pins' levels, synchronised *)
       }
     [@@deriving hardcaml]
   end
@@ -1392,6 +1396,8 @@ module Make (C : Config) (R : Ring.S) = struct
         ; ptr_reset
         ; enabled = en
         ; guarded = guard
+        ; edges = ec
+        ; levels = lv
         }
       in
       let event =
