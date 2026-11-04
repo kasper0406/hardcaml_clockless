@@ -455,10 +455,11 @@ module Make (C : Config) (R : Ring.S) = struct
       [<n>_{r,f}_s<slot>_<field><bit>] (slot flops) and [..._mux],
       [<n>_ec{r,f}<i>] (edge counter flops). *)
   module Front_cells = struct
-    let create ~name (c : cells) ~pins:pin_bus ~enable ~ptr_reset_n ~edge_reset_n
+    let create ?data_buffer ~name (c : cells) ~pins:pin_bus ~enable ~ptr_reset_n ~edge_reset_n
       ~(ring : Signal.t R.State.t)
       =
       let lib = c.library in
+      let data_buffer = Option.value data_buffer ~default:c.buffer in
       let n fmt = Printf.ksprintf (fun s -> name ^ "_" ^ s) fmt in
       let inv_a, inv_y = Cell_pins.inverter lib c.inverter in
       let buf_a, buf_x = Cell_pins.buffer lib c.buffer in
@@ -512,11 +513,15 @@ module Make (C : Config) (R : Ring.S) = struct
       let merged = tree gated -- n "merged" in
       (* Data buffers: every ring node and counter bit carries one more,
          uniform, load. *)
-      let dbuf tag x = concat_lsb (List.mapi (bits_lsb x) ~f:(fun i b -> buf (n "%s%d" tag i) b)) in
+      let dbuf ?(cell = c.buffer) tag x =
+        let a, y = Cell_pins.buffer lib cell in
+        concat_lsb
+          (List.mapi (bits_lsb x) ~f:(fun i b -> Cell.instantiate lib ~cell ~instance:(n "%s%d" tag i) [ a, b ] y))
+      in
       let fresh =
-        { Record.nodes = dbuf "dnode" ring.nodes
-        ; count_a = dbuf "dcnta" ring.count_a
-        ; count_b = dbuf "dcntb" ring.count_b
+        { Record.nodes = dbuf ~cell:data_buffer "dnode" ring.nodes
+        ; count_a = dbuf ~cell:data_buffer "dcnta" ring.count_a
+        ; count_b = dbuf ~cell:data_buffer "dcntb" ring.count_b
         ; pins = dbuf "dpin" (concat_lsb (Array.to_list isolated))
         ; delayed =
             (let cell, count = c.delay in
@@ -1438,8 +1443,14 @@ module Make (C : Config) (R : Ring.S) = struct
   (** [create ?first_stage ?name implementation scope i]. [name] (default
       ["pin_capture"]) prefixes every instance. [first_stage]: build the
       synchronisers' first stage from flop cells instead of kept Hardcaml
-      registers. *)
-  let create ?first_stage ?(name = "pin_capture") implementation scope (i : Signal.t I.t) =
+      registers. [data_buffer] (default the [buffer] cell): the cell of
+      the ring node and counter data buffers ([<n>_d{node,cnta,cntb}<i>]).
+      Each drives one bit to every slot over the routed distance from the
+      ring, so its delay is its drive times a wire load the router decides;
+      a stronger cell keeps the nodes' and counters' arrivals at the slots
+      together (the counter selection margin, the tag lag) whatever the
+      routing. *)
+  let create ?first_stage ?data_buffer ?(name = "pin_capture") implementation scope (i : Signal.t I.t) =
     I.Of_signal.assert_widths i;
     let enable = wire pins in
     let ptr_reset_n = wire 1 in
@@ -1448,7 +1459,7 @@ module Make (C : Config) (R : Ring.S) = struct
     let front =
       match implementation with
       | Cells c ->
-        Front_cells.create ~name c ~pins:i.pins ~enable ~ptr_reset_n ~edge_reset_n ~ring:i.ring
+        Front_cells.create ?data_buffer ~name c ~pins:i.pins ~enable ~ptr_reset_n ~edge_reset_n ~ring:i.ring
       | Model s -> Front_model.create ~clock:i.clock ~ptr_reset s
     in
     let o, (ctl : Drain.controls) =
@@ -1476,7 +1487,7 @@ module Make (C : Config) (R : Ring.S) = struct
   (** As [create], as a separate module called [module_name] (the caller's
       prefix included, e.g. ["protoemu_pin_capture"]) unless the scope
       flattens the design. [Model] needs a flattened scope. *)
-  let hierarchical ?first_stage ?name ~module_name implementation scope =
+  let hierarchical ?first_stage ?data_buffer ?name ~module_name implementation scope =
     (match implementation with
      | Model _ when not (Scope.flatten_design scope) ->
        raise_s
@@ -1485,6 +1496,6 @@ module Make (C : Config) (R : Ring.S) = struct
              (module_name : string)]
      | Model _ | Cells _ -> ());
     let module H = Hierarchy.In_scope (I) (O) in
-    H.hierarchical ~scope ~name:module_name (create ?first_stage ?name implementation)
+    H.hierarchical ~scope ~name:module_name (create ?first_stage ?data_buffer ?name implementation)
   ;;
 end
