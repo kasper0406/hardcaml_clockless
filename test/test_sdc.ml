@@ -768,6 +768,55 @@ let%expect_test "ring_placement: a legal block, consecutive stages adjacent" =
     |}]
 ;;
 
+let%expect_test "island_placement: the rest of the island beside the ring, legal and deterministic" =
+  let t = island () in
+  let library = force lib in
+  let rows = { Sdc.x0 = 2.88; y0 = 3.78; row_height = 3.78; site_width = 0.48; first_flipped = false } in
+  let ring = Sdc.ring_placement t ~name:"ring" ~library ~rows ~site:10 ~row:5 ~columns:2 in
+  let place () =
+    Sdc.island_placement
+      t
+      ~library
+      ~rows
+      ~site:40
+      ~row:5
+      ~width:30
+      ~density:0.5
+      ~placed:(List.map ring ~f:(fun (i, _, _, _) -> i))
+      ~roots:[ "tdc_stage0" ]
+      ~from_right:true
+  in
+  let p = place () in
+  List.iter p ~f:(fun (i, x, y, o) -> printf "%-14s %7.2f %7.2f %s\n" i x y o);
+  (* the same coordinates every time; no cell of the ring placed twice;
+     no two cells of a row overlap *)
+  printf "deterministic %b\n" (Poly.equal p (place ()));
+  printf
+    "ring cells re-placed %d\n"
+    (List.count p ~f:(fun (i, _, _, _) -> List.exists ring ~f:(fun (j, _, _, _) -> String.equal i j)));
+  let cells = Hashtbl.of_alist_exn (module String) (List.map t.Sdc.instances ~f:(fun i -> i.name, i.cell)) in
+  List.iter t.isolator_cells ~f:(fun (n, c) -> Hashtbl.set cells ~key:n ~data:c);
+  let extent (i, x, y, _) =
+    let c = Cell_library.find_exn library (Hashtbl.find_exn cells i) in
+    y, x, x +. (c.area /. rows.row_height)
+  in
+  let spans = List.map p ~f:extent |> List.sort ~compare:Poly.compare in
+  let overlaps =
+    List.zip_exn (List.drop_last_exn spans) (List.tl_exn spans)
+    |> List.count ~f:(fun ((y1, _, r1), (y2, l2, _)) -> Float.(y1 = y2 && l2 < r1 -. 1e-6))
+  in
+  printf "overlaps %d\n" overlaps;
+  [%expect {|
+    tdc_stage0       34.56   22.68 FS
+    tdc_stage1       30.72   22.68 FS
+    gate             26.88   22.68 FS
+    ring_en_iso      23.04   22.68 FS
+    deterministic true
+    ring cells re-placed 0
+    overlaps 0
+    |}]
+;;
+
 let%expect_test "check: isolating buffers are connected and fed from their source" =
   (* the ring enable's isolating buffer, unconnected *)
   check (edit ~from:"ring_en_iso (.A(en)" ~to_:"ring_en_iso (.A()");
