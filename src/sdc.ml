@@ -178,6 +178,7 @@ type t =
   ; registers : Register.t list
   ; isolators : (string * int * int) list
   (** {!Cell.isolate} buffers: instance, input net, output net *)
+  ; isolator_cells : (string * string) list (** isolating buffer -> its cell *)
   ; nets : Net.t array
   ; loop_breaks : Endpoint.t list
   ; clocks : Clock.t list
@@ -285,6 +286,7 @@ let create ?(prefix = "") (circuit : Circuit.t) =
   let instances = Queue.create () in
   let registers = Queue.create () in
   let isolators = Queue.create () in
+  let isolator_cells = Queue.create () in
   List.iter signals ~f:(fun s ->
     match s with
     | Signal.Type.Wire _ | Select _ | Cat _ | Empty -> ()
@@ -307,11 +309,12 @@ let create ?(prefix = "") (circuit : Circuit.t) =
       Queue.enqueue
         instances
         { Instance.name = inst.instance_label; cell = inst.circuit_name; pins }
-    | Inst { instantiation = { inputs = [ i ]; outputs = [ o ]; instance_label; _ }; _ }
+    | Inst { instantiation = { inputs = [ i ]; outputs = [ o ]; instance_label; circuit_name; _ }; _ }
       when has_attribute s "keep" ->
       (* an isolating buffer (Cell.isolate): synthesised logic to the
          resizer, but checked to sit between its two nets *)
       Queue.enqueue isolators (instance_label, net i.input_signal 0, net s o.output_low_index);
+      Queue.enqueue isolator_cells (instance_label, circuit_name);
       mark_logic i.input_signal
     | Reg { d; register = r; _ } when is_dont_touch s ->
       let name =
@@ -362,6 +365,7 @@ let create ?(prefix = "") (circuit : Circuit.t) =
   ; instances = Queue.to_list instances |> List.sort ~compare:(fun a b -> String.compare a.name b.name)
   ; registers = Queue.to_list registers
   ; isolators = Queue.to_list isolators
+  ; isolator_cells = Queue.to_list isolator_cells
   ; nets
   ; loop_breaks = []
   ; clocks = []
@@ -1382,4 +1386,99 @@ let ring_placement ?(row_pitch = 1) ?(column_gap = 0) t ~name ~(library : Cell_l
        : int));
   Queue.to_list place
   |> List.sort ~compare:(fun (a, _, _, _) (b, _, _, _) -> String.compare a b)
+;;
+
+(** [island_placement t ~library ~rows ~site ~row ~width ~density ~placed
+    ~roots] places every protected cell of [t] and its isolating buffers
+    that [placed] (instance names as {!ring_placement} returns them, with
+    the prefix: the ring block) does not, as one fixed block (D-23): rows from row
+    [row] upwards, [width] sites wide from site [site], each cell followed
+    by [1 / density - 1] times its width of space (whitespace for the
+    unconstrained logic and the routing), rows filled alternately left to
+    right and right to left (the first from the right with [from_right],
+    next to a block on that side). The order is a depth-first walk from [roots]
+    (names without the prefix) along driver-to-load connections between
+    protected cells (through [placed] cells, which are not placed again),
+    loads by name, so a cell
+    sits next to its driver and its first loads: a clock leaf before its
+    flops, a delay line stage before the next. Cells the walk does not
+    reach follow by name. Only instantiated cells ({!Cell.instantiate},
+    {!Cell.isolate}) are placed: kept Hardcaml registers get their
+    instance names from synthesis and stay with the placer. A cell wider
+    than [width] raises. Deterministic: the same coordinates in every run,
+    so the island's internal wire lengths, and the margins that depend on
+    them, are a property of the geometry. *)
+let island_placement ?(from_right = false) t ~(library : Cell_library.t) ~rows ~site ~row ~width ~density ~placed ~roots =
+  if Float.(density <= 0. || density > 1.) || width < 1
+  then raise_s [%message "Sdc.island_placement: bad geometry" (width : int) (density : float)];
+  let cell_of = Hashtbl.create (module String) in
+  List.iter t.instances ~f:(fun (i : Instance.t) -> Hashtbl.set cell_of ~key:i.name ~data:i.cell);
+  List.iter t.isolator_cells ~f:(fun (n, c) -> Hashtbl.set cell_of ~key:n ~data:c);
+  let width_of name =
+    let c = Cell_library.find_exn library (Hashtbl.find_exn cell_of name) in
+    Float.to_int (Float.round_up (c.area /. rows.row_height /. rows.site_width -. 1e-6))
+  in
+  (* loads of each cell's outputs, among protected cells and isolators *)
+  let loads = Hashtbl.create (module String) in
+  let add_loads name n =
+    let ls =
+      List.filter_map t.nets.(n).sinks ~f:(fun e ->
+        if Hashtbl.mem cell_of e.instance then Some e.instance else None)
+    in
+    Hashtbl.update loads name ~f:(fun o -> Option.value o ~default:[] @ ls)
+  in
+  List.iter t.instances ~f:(fun (i : Instance.t) ->
+    List.iter i.pins ~f:(fun (_, n) ->
+      match t.nets.(n).driver with
+      | Cell e when String.equal e.instance i.name -> add_loads i.name n
+      | _ -> ()));
+  List.iter t.isolators ~f:(fun (name, _, output) -> add_loads name output);
+  (* an isolating buffer is a load of its input's driver (a protected cell
+     or another isolating buffer); the nets' sinks do not list it *)
+  let iso_of_output = Hashtbl.create (module Int) in
+  List.iter t.isolators ~f:(fun (name, _, output) -> Hashtbl.set iso_of_output ~key:output ~data:name);
+  List.iter t.isolators ~f:(fun (name, input, _) ->
+    let driver =
+      match Hashtbl.find iso_of_output input, t.nets.(input).driver with
+      | Some d, _ -> Some d
+      | None, Cell e when Hashtbl.mem cell_of e.instance -> Some e.instance
+      | None, _ -> None
+    in
+    Option.iter driver ~f:(fun d -> Hashtbl.update loads d ~f:(fun o -> Option.value o ~default:[] @ [ name ])));
+  let is_placed = Hash_set.of_list (module String) placed in
+  let seen = Hash_set.create (module String) in
+  let order = Queue.create () in
+  let rec visit name =
+    if (not (Hash_set.mem seen name)) && Hashtbl.mem cell_of name
+    then (
+      Hash_set.add seen name;
+      if not (Hash_set.mem is_placed (t.prefix ^ name)) then Queue.enqueue order name;
+      List.iter
+        (Hashtbl.find loads name |> Option.value ~default:[] |> List.dedup_and_sort ~compare:String.compare)
+        ~f:visit)
+  in
+  List.iter roots ~f:visit;
+  Hashtbl.keys cell_of |> List.sort ~compare:String.compare |> List.iter ~f:visit;
+  let out = Queue.create () in
+  let r = ref 0
+  and pos = ref 0 in
+  Queue.iter order ~f:(fun name ->
+    let w = width_of name in
+    if w > width then raise_s [%message "Sdc.island_placement: cell wider than the block" name (w : int) (width : int)];
+    let gap = Float.to_int (Float.round_nearest (Float.of_int w *. ((1. /. density) -. 1.))) in
+    if !pos + w > width
+    then (
+      Int.incr r;
+      pos := 0);
+    let s = if Bool.( <> ) (!r % 2 = 0) from_right then !pos else width - !pos - w in
+    let rr = row + !r in
+    let flipped = Bool.( <> ) (rr % 2 = 1) rows.first_flipped in
+    Queue.enqueue
+      out
+      ( t.prefix ^ name
+      , rows.x0 +. (Float.of_int (site + s) *. rows.site_width)
+      , rows.y0 +. (Float.of_int rr *. rows.row_height)
+      , if flipped then "FS" else "N" );
+    pos := !pos + w + gap);
+  Queue.to_list out
 ;;
