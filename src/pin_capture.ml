@@ -449,17 +449,21 @@ module Make (C : Config) (R : Ring.S) = struct
     | Model of Signal.t Model_stimulus.t
 
   (** The hand-placed front. Instance names, with [n = name]:
-      [<n>_gate<i>] (NAND), [<n>_xor<k>], [<n>_clk{r,f}] (trunks),
+      [<n>_gate<i>] (NAND), [<n>_xor<k>], [<n>_clkdly<m>] (the trunks'
+      common delay, if any), [<n>_clk{r,f}] (trunks),
       [<n>_clk{r,f}_leaf<k>], [<n>_d{node,cnta,cntb,pin}<i>] (data buffers),
       [<n>_{r,f}_ptr<k>] (pointer flops), [<n>_{r,f}_sel<k>[_buf<m>]],
       [<n>_{r,f}_s<slot>_<field><bit>] (slot flops) and [..._mux],
       [<n>_ec{r,f}<i>] (edge counter flops). *)
   module Front_cells = struct
-    let create ?data_buffer ~name (c : cells) ~pins:pin_bus ~enable ~ptr_reset_n ~edge_reset_n
-      ~(ring : Signal.t R.State.t)
+    let create ?data_buffer ?clock_leaf_buffer ?(clock_trunk_delay = 0) ~name (c : cells) ~pins:pin_bus
+      ~enable ~ptr_reset_n ~edge_reset_n ~(ring : Signal.t R.State.t)
       =
+      if clock_trunk_delay < 0
+      then raise_s [%message "Pin_capture: clock_trunk_delay >= 0" (clock_trunk_delay : int)];
       let lib = c.library in
       let data_buffer = Option.value data_buffer ~default:c.buffer in
+      let clock_leaf_buffer = Option.value clock_leaf_buffer ~default:c.buffer in
       let n fmt = Printf.ksprintf (fun s -> name ^ "_" ^ s) fmt in
       let inv_a, inv_y = Cell_pins.inverter lib c.inverter in
       let buf_a, buf_x = Cell_pins.buffer lib c.buffer in
@@ -542,7 +546,11 @@ module Make (C : Config) (R : Ring.S) = struct
       let flops_per_bank = (slots * record_width) + ptr_bits in
       let leaves = (flops_per_bank + clock_leaf_fanout - 1) / clock_leaf_fanout in
       let bank tag trunk =
-        let leaf = Array.init leaves ~f:(fun k -> buf (n "clk%s_leaf%d" tag k) trunk) in
+        let leaf =
+          let a, x = Cell_pins.buffer lib clock_leaf_buffer in
+          Array.init leaves ~f:(fun k ->
+            Cell.instantiate lib ~cell:clock_leaf_buffer ~instance:(n "clk%s_leaf%d" tag k) [ a, trunk ] x)
+        in
         let next_leaf =
           let k = ref 0 in
           fun () ->
@@ -634,8 +642,13 @@ module Make (C : Config) (R : Ring.S) = struct
         in
         q, slot_records
       in
-      let trunk_r = buf (n "clkr") merged in
-      let trunk_f = inv (n "clkf") merged in
+      (* The trunks' common delay: latency for both banks alike (the
+         snapshot race), no skew between leaves. *)
+      let trunk_in =
+        List.fold (List.init clock_trunk_delay ~f:Fn.id) ~init:merged ~f:(fun x m -> buf (n "clkdly%d" m) x)
+      in
+      let trunk_r = buf (n "clkr") trunk_in in
+      let trunk_f = inv (n "clkf") trunk_in in
       let ptr_r, slots_r = bank "r" trunk_r in
       let ptr_f, slots_f = bank "f" trunk_f in
       (* Edge counters. *)
@@ -1449,8 +1462,30 @@ module Make (C : Config) (R : Ring.S) = struct
       ring, so its delay is its drive times a wire load the router decides;
       a stronger cell keeps the nodes' and counters' arrivals at the slots
       together (the counter selection margin, the tag lag) whatever the
-      routing. *)
-  let create ?first_stage ?data_buffer ?(name = "pin_capture") implementation scope (i : Signal.t I.t) =
+      routing. [clock_leaf_buffer] (default the [buffer] cell): the cell
+      of the bank clock leaves ([<n>_clk{r,f}_leaf<k>]). A leaf clocks
+      [clock_leaf_fanout] flops wherever the placement puts them, so with
+      a weak cell its delay follows its routed load (80-129 fF and 407-542
+      ps over the leaves of one bank in a routed chip with the 1x buffer,
+      272 ps before layout): skew between the flops of a slot, which the
+      tag lag and the recent-edge delay margin pay for and which moves the
+      counters' arrivals against the nodes'. A 4x buffer's delay moves a
+      quarter as much with the load. [clock_trunk_delay] (default 0): that
+      many [buffer] cells in series between the merged net and both bank
+      trunks ([<n>_clkdly<m>]). A stronger leaf is also faster, and the
+      snapshot race (pin -> D before pin -> bank clock) needs the bank
+      clocks' latency: this gives it back in the part of the clock path
+      that every leaf of both banks shares. *)
+  let create
+    ?first_stage
+    ?data_buffer
+    ?clock_leaf_buffer
+    ?clock_trunk_delay
+    ?(name = "pin_capture")
+    implementation
+    scope
+    (i : Signal.t I.t)
+    =
     I.Of_signal.assert_widths i;
     let enable = wire pins in
     let ptr_reset_n = wire 1 in
@@ -1459,7 +1494,17 @@ module Make (C : Config) (R : Ring.S) = struct
     let front =
       match implementation with
       | Cells c ->
-        Front_cells.create ?data_buffer ~name c ~pins:i.pins ~enable ~ptr_reset_n ~edge_reset_n ~ring:i.ring
+        Front_cells.create
+          ?data_buffer
+          ?clock_leaf_buffer
+          ?clock_trunk_delay
+          ~name
+          c
+          ~pins:i.pins
+          ~enable
+          ~ptr_reset_n
+          ~edge_reset_n
+          ~ring:i.ring
       | Model s -> Front_model.create ~clock:i.clock ~ptr_reset s
     in
     let o, (ctl : Drain.controls) =
@@ -1487,7 +1532,16 @@ module Make (C : Config) (R : Ring.S) = struct
   (** As [create], as a separate module called [module_name] (the caller's
       prefix included, e.g. ["protoemu_pin_capture"]) unless the scope
       flattens the design. [Model] needs a flattened scope. *)
-  let hierarchical ?first_stage ?data_buffer ?name ~module_name implementation scope =
+  let hierarchical
+    ?first_stage
+    ?data_buffer
+    ?clock_leaf_buffer
+    ?clock_trunk_delay
+    ?name
+    ~module_name
+    implementation
+    scope
+    =
     (match implementation with
      | Model _ when not (Scope.flatten_design scope) ->
        raise_s
@@ -1496,6 +1550,9 @@ module Make (C : Config) (R : Ring.S) = struct
              (module_name : string)]
      | Model _ | Cells _ -> ());
     let module H = Hierarchy.In_scope (I) (O) in
-    H.hierarchical ~scope ~name:module_name (create ?first_stage ?data_buffer ?name implementation)
+    H.hierarchical
+      ~scope
+      ~name:module_name
+      (create ?first_stage ?data_buffer ?clock_leaf_buffer ?clock_trunk_delay ?name implementation)
   ;;
 end

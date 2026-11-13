@@ -830,6 +830,62 @@ let%expect_test "cells mode: data_buffer picks the node and counter data buffers
     |}]
 ;;
 
+let%expect_test "cells mode: clock_leaf_buffer picks the bank clock leaves' cell, clock_trunk_delay adds the trunks' common delay" =
+  let library = Cell_library.load "data/sg13cmos5l_excerpt.lib" in
+  let dfrbpq : R.flop =
+    { cell = "sg13cmos5l_dfrbpq_1"; clk = "CLK"; d = "D"; reset_n = "RESET_B"; q = "Q" }
+  in
+  let scope = Scope.create ~flatten_design:false () in
+  let module C = Circuit.With_interface (Cap.I) (Cap.O) in
+  let circuit =
+    C.create_exn
+      ~name:"top"
+      (Cap.hierarchical
+         ~name:"cap"
+         ~first_stage:(library, dfrbpq)
+         ~clock_leaf_buffer:"sg13cmos5l_buf_4"
+         ~clock_trunk_delay:2
+         ~module_name:"protoemu_pin_capture"
+         (Cells
+            { library
+            ; nand2 = "sg13cmos5l_nand2_1"
+            ; xor2 = "sg13cmos5l_xor2_1"
+            ; inverter = "sg13cmos5l_inv_1"
+            ; buffer = "sg13cmos5l_buf_1"
+            ; mux2 = "sg13cmos5l_mux2_1"
+            ; flop = dfrbpq
+            ; delay = "sg13cmos5l_dlygate4sd3_1", 4
+            })
+         scope)
+  in
+  let lines =
+    Rtl.create ~database:(Scope.circuit_database scope) Verilog [ circuit ]
+    |> Rtl.full_hierarchy |> Rope.to_string |> String.split_lines |> List.map ~f:String.strip
+  in
+  (* each instance's cell, and the net on its input pin A *)
+  List.iter
+    [ "cap_clkdly0"; "cap_clkdly1"; "cap_clkdly2"; "cap_clkr"; "cap_clkf"; "cap_clkr_leaf0"; "cap_clkf_leaf8"; "cap_dnode0" ]
+    ~f:(fun inst ->
+      match List.findi lines ~f:(fun _ l -> String.equal l inst) with
+      | Some (k, _) ->
+        let a =
+          List.find (List.drop lines (k + 1)) ~f:(fun l -> String.is_substring l ~substring:".A(")
+          |> Option.value ~default:"?"
+        in
+        printf "%-15s %-18s %s\n" inst (List.nth_exn lines (k - 1)) a
+      | None -> printf "%-15s missing\n" inst);
+  [%expect {|
+    cap_clkdly0     sg13cmos5l_buf_1   ( .A(cap_merged),
+    cap_clkdly1     sg13cmos5l_buf_1   ( .A(cap_clkdly0__X),
+    cap_clkdly2     missing
+    cap_clkr        sg13cmos5l_buf_1   ( .A(cap_clkdly1__X),
+    cap_clkf        sg13cmos5l_inv_1   ( .A(cap_clkdly1__X),
+    cap_clkr_leaf0  sg13cmos5l_buf_4   ( .A(cap_clkr__X),
+    cap_clkf_leaf8  sg13cmos5l_buf_4   ( .A(cap_clkf__Y),
+    cap_dnode0      sg13cmos5l_buf_1   ( .A(signal_select_86),
+    |}]
+;;
+
 (* --- 8. Pins high at reset ----------------------------------------------- *)
 
 let%expect_test "pins high at reset: edges counted forward, no false lost_edge" =
