@@ -418,16 +418,31 @@ let%expect_test "clock_leaf_buffer and clock_trunk_delay: 4x leaves behind one t
     let data_buffer = Some "sg13cmos5l_buf_4"
     let clock_leaf_buffer = None
     let clock_trunk_delay = 0
+    let tag_lag_buffers = None
   end);
   run "4x leaves" (module struct
     let data_buffer = Some "sg13cmos5l_buf_4"
     let clock_leaf_buffer = Some "sg13cmos5l_buf_4"
     let clock_trunk_delay = 0
+    let tag_lag_buffers = None
   end);
   run "4x leaves, 1 delay" (module struct
     let data_buffer = Some "sg13cmos5l_buf_4"
     let clock_leaf_buffer = Some "sg13cmos5l_buf_4"
     let clock_trunk_delay = 1
+    let tag_lag_buffers = None
+  end);
+  run "4x, 1 delay, 5 tag" (module struct
+    let data_buffer = Some "sg13cmos5l_buf_4"
+    let clock_leaf_buffer = Some "sg13cmos5l_buf_4"
+    let clock_trunk_delay = 1
+    let tag_lag_buffers = Some 5
+  end);
+  run "4x, 1 delay, 6 tag" (module struct
+    let data_buffer = Some "sg13cmos5l_buf_4"
+    let clock_leaf_buffer = Some "sg13cmos5l_buf_4"
+    let clock_trunk_delay = 1
+    let tag_lag_buffers = Some 6
   end);
   [%expect {|
     1x leaves              typ  unflagged lost 0 phantom 0; snapshot race min 432 ps; counter selection >= 7.1 stages (ok true); tag lag over setup + hold >= 227 ps
@@ -439,6 +454,12 @@ let%expect_test "clock_leaf_buffer and clock_trunk_delay: 4x leaves behind one t
     4x leaves, 1 delay     typ  unflagged lost 0 phantom 0; snapshot race min 472 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 213 ps
     4x leaves, 1 delay     slow unflagged lost 0 phantom 0; snapshot race min 745 ps; counter selection >= 7.1 stages (ok true); tag lag over setup + hold >= 359 ps
     4x leaves, 1 delay     fast unflagged lost 0 phantom 0; snapshot race min 313 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 157 ps
+    4x, 1 delay, 5 tag     typ  unflagged lost 0 phantom 0; snapshot race min 472 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 340 ps
+    4x, 1 delay, 5 tag     slow unflagged lost 0 phantom 0; snapshot race min 745 ps; counter selection >= 7.1 stages (ok true); tag lag over setup + hold >= 560 ps
+    4x, 1 delay, 5 tag     fast unflagged lost 0 phantom 0; snapshot race min 313 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 241 ps
+    4x, 1 delay, 6 tag     typ  unflagged lost 0 phantom 0; snapshot race min 472 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 403 ps
+    4x, 1 delay, 6 tag     slow unflagged lost 0 phantom 0; snapshot race min 745 ps; counter selection >= 7.1 stages (ok true); tag lag over setup + hold >= 660 ps
+    4x, 1 delay, 6 tag     fast unflagged lost 0 phantom 0; snapshot race min 313 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 283 ps
     |}]
 ;;
 

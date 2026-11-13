@@ -41,12 +41,14 @@ module type Cells = sig
   val data_buffer : string option
   val clock_leaf_buffer : string option
   val clock_trunk_delay : int
+  val tag_lag_buffers : int option
 end
 
 module Default_cells = struct
   let data_buffer = None
   let clock_leaf_buffer = None
   let clock_trunk_delay = 0
+  let tag_lag_buffers = None
 end
 
 module Make_with
@@ -110,6 +112,7 @@ struct
         ?data_buffer:Cells.data_buffer
         ?clock_leaf_buffer:Cells.clock_leaf_buffer
         ~clock_trunk_delay:Cells.clock_trunk_delay
+        ?tag_lag_buffers:Cells.tag_lag_buffers
         ~name
         (Cells
            { library

@@ -369,8 +369,9 @@ module Make (C : Config) (R : Ring.S) = struct
   let slot_width = Int.max 1 (num_bits_to_represent (slots - 1))
   let capture_count_width = num_bits_to_represent model_captures
 
-  (* Buffers between a slot's select net and its tag muxes (Front_cells). *)
-  let tag_lag_buffers = 3
+  (* Buffers between a slot's select net and its tag muxes (Front_cells),
+     unless [create]'s [tag_lag_buffers] says otherwise. *)
+  let default_tag_lag_buffers = 3
 
   (* Record tags are stored XOR-ed with this, so that the pointer reset,
      which clears them, leaves an invalid pointer code (no record tag
@@ -456,11 +457,14 @@ module Make (C : Config) (R : Ring.S) = struct
       [<n>_{r,f}_s<slot>_<field><bit>] (slot flops) and [..._mux],
       [<n>_ec{r,f}<i>] (edge counter flops). *)
   module Front_cells = struct
-    let create ?data_buffer ?clock_leaf_buffer ?(clock_trunk_delay = 0) ~name (c : cells) ~pins:pin_bus
-      ~enable ~ptr_reset_n ~edge_reset_n ~(ring : Signal.t R.State.t)
+    let create ?data_buffer ?clock_leaf_buffer ?(clock_trunk_delay = 0)
+      ?(tag_lag_buffers = default_tag_lag_buffers) ~name (c : cells) ~pins:pin_bus ~enable ~ptr_reset_n
+      ~edge_reset_n ~(ring : Signal.t R.State.t)
       =
       if clock_trunk_delay < 0
       then raise_s [%message "Pin_capture: clock_trunk_delay >= 0" (clock_trunk_delay : int)];
+      if tag_lag_buffers < 1
+      then raise_s [%message "Pin_capture: tag_lag_buffers >= 1" (tag_lag_buffers : int)];
       let lib = c.library in
       let data_buffer = Option.value data_buffer ~default:c.buffer in
       let clock_leaf_buffer = Option.value clock_leaf_buffer ~default:c.buffer in
@@ -1475,12 +1479,21 @@ module Make (C : Config) (R : Ring.S) = struct
       trunks ([<n>_clkdly<m>]). A stronger leaf is also faster, and the
       snapshot race (pin -> D before pin -> bank clock) needs the bank
       clocks' latency: this gives it back in the part of the clock path
-      that every leaf of both banks shares. *)
+      that every leaf of both banks shares. [tag_lag_buffers] (default 3):
+      the [buffer] cells between a slot's select and its tag muxes
+      ([<n>_{r,f}_tagsel<k>_buf<m>]), the tag lag before layout. Routing
+      takes from it: the skew between the bank clock leaves of a slot's
+      tag and data flops and the spread of the data selects' wires (142 ps
+      before layout at fast became 32 and -9 ps in two routed chips with
+      1x leaves). Each buffer adds one buffer delay to the lag and to the
+      window in which a second write to a bank also flags the record
+      before it. *)
   let create
     ?first_stage
     ?data_buffer
     ?clock_leaf_buffer
     ?clock_trunk_delay
+    ?tag_lag_buffers
     ?(name = "pin_capture")
     implementation
     scope
@@ -1498,6 +1511,7 @@ module Make (C : Config) (R : Ring.S) = struct
           ?data_buffer
           ?clock_leaf_buffer
           ?clock_trunk_delay
+          ?tag_lag_buffers
           ~name
           c
           ~pins:i.pins
@@ -1537,6 +1551,7 @@ module Make (C : Config) (R : Ring.S) = struct
     ?data_buffer
     ?clock_leaf_buffer
     ?clock_trunk_delay
+    ?tag_lag_buffers
     ?name
     ~module_name
     implementation
@@ -1553,6 +1568,6 @@ module Make (C : Config) (R : Ring.S) = struct
     H.hierarchical
       ~scope
       ~name:module_name
-      (create ?first_stage ?data_buffer ?clock_leaf_buffer ?clock_trunk_delay ?name implementation)
+      (create ?first_stage ?data_buffer ?clock_leaf_buffer ?clock_trunk_delay ?tag_lag_buffers ?name implementation)
   ;;
 end
