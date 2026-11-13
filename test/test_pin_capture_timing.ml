@@ -378,6 +378,91 @@ let%expect_test "slots = 3 and 4 per bank (random edges at typ, counter selectio
     |}]
 ;;
 
+(* The clock tree options, with the bitbanger chip's 4x data buffers: 1x
+   leaves and no trunk delay (the default), 4x leaves, and 4x leaves behind
+   one trunk delay buffer. Before layout every leaf carries the same light
+   wire load, so the skew the stronger leaves remove does not show here,
+   and they are hardly faster than the 1x ones (the trunk pays for their
+   input capacitance): the snapshot race loses 10-24 ps to them and gains
+   28-73 ps with the delay buffer. What these runs establish is that the
+   accounting, the counter selection and the tag lag hold with either
+   option. The options are for the routed chip, where the leaves carry
+   110-160 fF: there (janestreet-bitbanger's 8x4 run a2, the leaf and
+   trunk arcs of its SDF rescaled with the Liberty tables at the extracted
+   loads) leaf delay spreads over 135 ps between the leaves of a bank with
+   1x cells and 33 ps with 4x, the 4x leaves are 160-265 ps faster, and one
+   delay buffer returns 70-140 ps (fast-slow) of it to the snapshot race. *)
+let%expect_test "clock_leaf_buffer and clock_trunk_delay: 4x leaves behind one trunk delay buffer (three corners, Liberty 1k wire load)" =
+  let run label (module C : Capture_timing.Cells) =
+    let module T = Capture_timing.Make_with (struct let slots = 2 end) (C) in
+    List.iter Capture_timing.corners ~f:(fun (corner, path) ->
+      let edges =
+        T.random_edges ~min_same_pin_ns:5. ~quiet_every:50 ~seed:11 ~count:600 ~start_ns:800.
+          ~mean_gap_ns:60. ~near:0.1 ()
+      in
+      let cycles = (List.last_exn edges |> fst) / T.clock_period + 450 in
+      let race = ref None in
+      let r = T.simulate ~path ~edges ~cycles ~setup:(fun sim -> race := Some (T.watch_race sim)) () in
+      let t = T.analyse r ~edges in
+      let m = T.race_margins ~ptr_resets:r.ptr_resets (Option.value_exn !race) ~edges |> List.map ~f:Event_sim.to_ps in
+      let ms = T.sampler_margins ~path () in
+      let tags = T.tag_margins ~path () in
+      printf "%-22s %-4s unflagged lost %d phantom %d; snapshot race min %.0f ps; counter selection >= %.1f stages (ok %b); tag lag over setup + hold >= %.0f ps\n"
+        label corner t.summary.unflagged_lost t.summary.unflagged_phantom
+        (List.fold m ~init:Float.infinity ~f:Float.min)
+        (List.fold ms ~init:Float.infinity ~f:(fun a m -> Float.min a (Ring_margins.worst m.a m.b)))
+        (T.samplers_ok ~min_stages:min_margin_stages ms)
+        (List.fold tags ~init:Float.infinity ~f:(fun a m -> Float.min a (Float.min m.on_ps m.off_ps))))
+  in
+  run "1x leaves" (module struct
+    let data_buffer = Some "sg13cmos5l_buf_4"
+    let clock_leaf_buffer = None
+    let clock_trunk_delay = 0
+    let tag_lag_buffers = None
+  end);
+  run "4x leaves" (module struct
+    let data_buffer = Some "sg13cmos5l_buf_4"
+    let clock_leaf_buffer = Some "sg13cmos5l_buf_4"
+    let clock_trunk_delay = 0
+    let tag_lag_buffers = None
+  end);
+  run "4x leaves, 1 delay" (module struct
+    let data_buffer = Some "sg13cmos5l_buf_4"
+    let clock_leaf_buffer = Some "sg13cmos5l_buf_4"
+    let clock_trunk_delay = 1
+    let tag_lag_buffers = None
+  end);
+  run "4x, 1 delay, 5 tag" (module struct
+    let data_buffer = Some "sg13cmos5l_buf_4"
+    let clock_leaf_buffer = Some "sg13cmos5l_buf_4"
+    let clock_trunk_delay = 1
+    let tag_lag_buffers = Some 5
+  end);
+  run "4x, 1 delay, 6 tag" (module struct
+    let data_buffer = Some "sg13cmos5l_buf_4"
+    let clock_leaf_buffer = Some "sg13cmos5l_buf_4"
+    let clock_trunk_delay = 1
+    let tag_lag_buffers = Some 6
+  end);
+  [%expect {|
+    1x leaves              typ  unflagged lost 0 phantom 0; snapshot race min 432 ps; counter selection >= 7.1 stages (ok true); tag lag over setup + hold >= 227 ps
+    1x leaves              slow unflagged lost 0 phantom 0; snapshot race min 672 ps; counter selection >= 6.9 stages (ok true); tag lag over setup + hold >= 339 ps
+    1x leaves              fast unflagged lost 0 phantom 0; snapshot race min 285 ps; counter selection >= 7.1 stages (ok true); tag lag over setup + hold >= 152 ps
+    4x leaves              typ  unflagged lost 0 phantom 0; snapshot race min 413 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 216 ps
+    4x leaves              slow unflagged lost 0 phantom 0; snapshot race min 648 ps; counter selection >= 7.1 stages (ok true); tag lag over setup + hold >= 350 ps
+    4x leaves              fast unflagged lost 0 phantom 0; snapshot race min 275 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 157 ps
+    4x leaves, 1 delay     typ  unflagged lost 0 phantom 0; snapshot race min 472 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 213 ps
+    4x leaves, 1 delay     slow unflagged lost 0 phantom 0; snapshot race min 745 ps; counter selection >= 7.1 stages (ok true); tag lag over setup + hold >= 359 ps
+    4x leaves, 1 delay     fast unflagged lost 0 phantom 0; snapshot race min 313 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 157 ps
+    4x, 1 delay, 5 tag     typ  unflagged lost 0 phantom 0; snapshot race min 472 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 340 ps
+    4x, 1 delay, 5 tag     slow unflagged lost 0 phantom 0; snapshot race min 745 ps; counter selection >= 7.1 stages (ok true); tag lag over setup + hold >= 560 ps
+    4x, 1 delay, 5 tag     fast unflagged lost 0 phantom 0; snapshot race min 313 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 241 ps
+    4x, 1 delay, 6 tag     typ  unflagged lost 0 phantom 0; snapshot race min 472 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 403 ps
+    4x, 1 delay, 6 tag     slow unflagged lost 0 phantom 0; snapshot race min 745 ps; counter selection >= 7.1 stages (ok true); tag lag over setup + hold >= 660 ps
+    4x, 1 delay, 6 tag     fast unflagged lost 0 phantom 0; snapshot race min 313 ps; counter selection >= 7.2 stages (ok true); tag lag over setup + hold >= 283 ps
+    |}]
+;;
+
 let%expect_test "pins high at reset: no false lost_edge with the real edge counters (typ, Liberty 1k wire load)" =
   (* Pins 0 and 2 start high; each pin toggles 3 times, 200 ns apart. *)
   let initial = 0b0101 in

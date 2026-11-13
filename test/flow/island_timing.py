@@ -452,8 +452,10 @@ def tag_lag(sdf):
     clock edge (the pointer moves, the slot select follows, the tag's
     select lags), the earliest tag D (through its mux's select, S -> X ->
     D) less its hold, minus the latest other D plus its setup, each in its
-    own flop's clock frame (clock arrival after the trunk). Over early and
-    over late delays (one event: not mixed)."""
+    own flop's clock frame (clock arrival after the trunk). Per select
+    edge (rising: the slot turns fresh; falling: it turns stale; a slot's
+    tag and data selects are buffers of one net, so they move the same
+    way), over early and over late delays (one event: not mixed)."""
     pc = CAPTURE
     res = {}
     slot_rx = re.compile(r"_[rf]_s\d+_")
@@ -464,18 +466,18 @@ def tag_lag(sdf):
                                               or (pin.endswith("/CLK") and slot_rx.search(pin) is not None)),
                             within=lambda inst: inst.startswith(pc))
 
-        def at(pin, k):
-            v = [arr[(pin, x)][k] for x in "rf" if (pin, x) in arr]
+        def at(pin, k, edges="rf"):
+            v = [arr[(pin, x)][k] for x in edges if (pin, x) in arr]
             if not v:
                 raise SystemExit(f"tag lag: no path from {root} to {pin}")
             return min(v) if k == 0 else max(v)
 
-        def fresh(f, k):
+        def fresh(f, k, edge):
             m = f + "_mux"
             sx = sdf.arcs[m][("S", "X")]
             wire = next(d for load, d in sdf.fanout[m + "/X"] if load == f + "/D")
             pick = min if k == 0 else max
-            return at(m + "/S", k) + pick(x[k] for x in sx if x) + wire[0][k]
+            return at(m + "/S", k, edge) + pick(x[k] for x in sx if x) + wire[0][k]
 
         def check(f, kind):
             return max(v for key, v in sdf.checks[f].items() if key[0] == kind)
@@ -489,10 +491,13 @@ def tag_lag(sdf):
             data = [f for f in flops if f not in tags]
             if not tags or not data:
                 raise SystemExit(f"tag lag: slot {base} without tags or data")
+            edges = [e for e in "rf" if all((f + "_mux/S", e) in arr for f in flops)]
+            if not edges:
+                raise SystemExit(f"tag lag: slot {base}: no select edge reaches every mux")
             margin = min(
-                min(fresh(f, k) - at(f + "/CLK", k) - check(f, "HOLD") for f in tags)
-                - max(fresh(f, k) - at(f + "/CLK", k) + check(f, "SETUP") for f in data)
-                for k in (0, 1))
+                min(fresh(f, k, e) - at(f + "/CLK", k) - check(f, "HOLD") for f in tags)
+                - max(fresh(f, k, e) - at(f + "/CLK", k) + check(f, "SETUP") for f in data)
+                for e in edges for k in (0, 1))
             res[f"{bank}{slot}"] = round(1000 * margin, 1)
             exact.append(1000 * margin)
     if not res:

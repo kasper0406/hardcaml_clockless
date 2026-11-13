@@ -19,6 +19,7 @@ let%expect_test "cells, kinds and pins" =
     sg13cmos5l_stdcell_typ_1p20V_25C
     sg13cmos5l_inv_1           Combinational    5.44  in:A  out:Y
     sg13cmos5l_buf_1           Combinational    7.26  in:A  out:X
+    sg13cmos5l_buf_4           Combinational   14.52  in:A  out:X
     sg13cmos5l_nand2_1         Combinational    7.26  in:A,B  out:Y
     sg13cmos5l_nor2_1          Combinational    7.26  in:A,B  out:Y
     sg13cmos5l_o21ai_1         Combinational    9.07  in:A1,A2,B1  out:Y

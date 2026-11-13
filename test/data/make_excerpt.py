@@ -11,7 +11,7 @@ next to this script were made.
 import re
 import sys
 
-CELLS = """inv_1 buf_1 nand2_1 nor2_1 o21ai_1 a21oi_1 xor2_1 mux2_1 dlygate4sd1_1
+CELLS = """inv_1 buf_1 buf_4 nand2_1 nor2_1 o21ai_1 a21oi_1 xor2_1 mux2_1 dlygate4sd1_1
 dlygate4sd3_1 dlhq_1 dfrbpq_1 ebufn_2 tiehi fill_1""".split()
 CELLS = ["sg13cmos5l_" + c for c in CELLS]
 DROP_TOP = {"operating_conditions", "lu_table_template", "power_lut_template"}

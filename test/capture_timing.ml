@@ -35,9 +35,27 @@ module R = Ring.Make_timed (struct
     let counter_earliest_change_stages = 4
   end)
 
-module Make (Slots : sig
-    val slots : int
-  end) =
+(* Pin_capture's cell options ([Cap.create]): [Default_cells] is the
+   configuration every reported number uses unless it says otherwise. *)
+module type Cells = sig
+  val data_buffer : string option
+  val clock_leaf_buffer : string option
+  val clock_trunk_delay : int
+  val tag_lag_buffers : int option
+end
+
+module Default_cells = struct
+  let data_buffer = None
+  let clock_leaf_buffer = None
+  let clock_trunk_delay = 0
+  let tag_lag_buffers = None
+end
+
+module Make_with
+    (Slots : sig
+       val slots : int
+     end)
+    (Cells : Cells) =
 struct
   module Cfg = struct
     let pins = 4
@@ -91,6 +109,10 @@ struct
     let o =
       Cap.create
         ~first_stage:(library, dfrbpq)
+        ?data_buffer:Cells.data_buffer
+        ?clock_leaf_buffer:Cells.clock_leaf_buffer
+        ~clock_trunk_delay:Cells.clock_trunk_delay
+        ?tag_lag_buffers:Cells.tag_lag_buffers
         ~name
         (Cells
            { library
@@ -1395,6 +1417,11 @@ struct
       (List.fold slots ~init:0. ~f:(fun a m -> Float.max a m.skew_jitter_ps))
   ;;
 end
+
+module Make (Slots : sig
+    val slots : int
+  end) =
+  Make_with (Slots) (Default_cells)
 
 include Make (struct
     let slots = 2
