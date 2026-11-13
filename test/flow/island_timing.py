@@ -4,6 +4,7 @@ races and Vernier lines, from an SDF written by OpenSTA (sta_island.tcl):
 pre-layout (Liberty "1k" wire load) or routed (SPEF), one corner per file.
 
     island_timing.py SDF LOOP_SDF [--json OUT] [--spef SPEF] [--names RING,SAMPLER,CAPTURE,VERNIER]
+                     [--counter-stages L,E]
     island_timing.py --summary DIR     (DIR/{pre,post}-{typ,fast,slow}.json)
 
 LOOP_SDF: the same corner with the ring broken elsewhere (the main SDF has
@@ -34,6 +35,11 @@ import math
 import re
 import statistics
 import sys
+
+# The ring's counter_settle_stages and counter_earliest_change_stages (L, E:
+# Ring.Timed), which set the sampler's selection threshold: the stub
+# island's by default, --counter-stages L,E for another design.
+COUNTER_STAGES = (9, 4)
 
 # Instance name prefixes of the structures (the stub island's by default;
 # --names RING,SAMPLER,CAPTURE,VERNIER for another design, e.g. the v1 chip:
@@ -295,13 +301,16 @@ def node_waveform(sdf, loop, n=17):
     return times, t0
 
 
-def counter_margins(sdf, loop, flops, frame, n=17, settle=9, earliest=4, periods=6):
+def counter_margins(sdf, loop, flops, frame, n=17, settle=None, earliest=None, periods=6):
     """Ring_margins.counter (test/ring_margins.ml) on static delays: the
     counter-selection margins, in stages, of a sampler whose flops are
     [flops] (role -> flop: ("node", k) or ("a"|"b", bit)), with each flop's
     clock arrival [frame(flop)] subtracted. Every counter bit is taken to
-    change at every edge (worst case)."""
+    change at every edge (worst case). [settle] and [earliest] default to
+    COUNTER_STAGES."""
     p = RING
+    settle = COUNTER_STAGES[0] if settle is None else settle
+    earliest = COUNTER_STAGES[1] if earliest is None else earliest
     times, period = node_waveform(sdf, loop, n)
 
     def check(f, kind, edge):
@@ -668,6 +677,13 @@ def main():
         k = args.index("--names")
         global RING, SAMPLER, CAPTURE, VERNIER
         RING, SAMPLER, CAPTURE, VERNIER = args[k + 1].split(",")
+        del args[k:k + 2]
+    if "--counter-stages" in args:
+        k = args.index("--counter-stages")
+        global COUNTER_STAGES
+        COUNTER_STAGES = tuple(int(x) for x in args[k + 1].split(","))
+        if len(COUNTER_STAGES) != 2:
+            raise SystemExit("--counter-stages L,E")
         del args[k:k + 2]
     if "--spef" in args:
         k = args.index("--spef")
